@@ -23,6 +23,7 @@ import { escapeHtml } from '../format/html.js'
 import type { ActivityStatusEvent } from '../hooks/claude-events.js'
 import {
   buildActivityDetail,
+  maskSecrets,
   renderActivityBlock,
   type ActivityCall,
   type ActivitySnapshot,
@@ -376,14 +377,19 @@ export class StatusManager {
       case 'tool_end': {
         entry.activityPhase = 'reasoning'
         // For Agent PostToolUse, attach a short done summary to the matching
-        // line — capped at 30 chars + masked. PLAN §3 T3 / §6 final bullet.
+        // line — capped at 30 chars + masked AT STORE TIME (review §7).
+        // Pre-fix the raw tool_result lived in the buffer until render; an
+        // in-memory leak (debug dump, future log sink, serializer) would
+        // surface raw tokens. Masking here means the buffer never holds an
+        // unmasked secret-shaped string.
         if (event.toolName === 'Agent' && event.toolResult !== undefined) {
           const idx = entry.toolUseIndex.get(event.toolUseId)
           if (idx !== undefined && idx >= 0 && idx < entry.activityCalls.length) {
-            const summary =
+            const rawSummary =
               typeof event.toolResult === 'string'
                 ? event.toolResult.slice(0, 30)
                 : ''
+            const summary = rawSummary ? maskSecrets(rawSummary) : ''
             if (summary) {
               const prev = entry.activityCalls[idx]
               if (prev) {

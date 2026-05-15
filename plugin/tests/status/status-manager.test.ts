@@ -594,4 +594,40 @@ describe('StatusManager.recordActivityByChatId', () => {
     expect(mgr.isActive('164795011')).toBe(false)
     api.api.sendMessage = origSend
   })
+
+  test('Agent tool_result is masked at store time (regression §7)', async () => {
+    // The activity buffer must never hold an unmasked secret-shaped string.
+    // Pre-fix: raw tool_result lived in `activityCalls[idx].detail` until
+    // render. Verify by triggering tool_end with a long token in toolResult
+    // and inspecting the subsequent edit text — the masked summary must
+    // appear in the very next render (proving the buffer already held it).
+    const { mgr, clock, api } = makeManager()
+    await mgr.start('164795011', undefined)
+
+    // Pair: PreToolUse with toolUseId → PostToolUse with same id.
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_start',
+      toolName: 'Agent',
+      toolInput: { subagent_type: 'researcher' },
+      toolUseId: 'agent-1',
+    })
+
+    const longToken = `abcd${'x'.repeat(20)}wxyz` // matches generic-long rule
+    clock.advance(100)
+    const editsBefore = api.calls.filter((c) => c.kind === 'edit').length
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_end',
+      toolName: 'Agent',
+      toolInput: { subagent_type: 'researcher' },
+      toolUseId: 'agent-1',
+      toolResult: longToken,
+    })
+    const editsAfter = api.calls.filter((c) => c.kind === 'edit')
+    expect(editsAfter.length).toBeGreaterThan(editsBefore)
+    const lastEdit = editsAfter[editsAfter.length - 1]!
+    // Token must not appear anywhere in the rendered text; the masked
+    // form (abcd***wxyz) confirms maskSecrets ran before store.
+    expect(lastEdit.text).not.toContain(longToken)
+    expect(lastEdit.text).toContain('abcd***wxyz')
+  })
 })
