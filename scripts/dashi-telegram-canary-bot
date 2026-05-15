@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""Telegram canary smoke bot for the Dashi tmux migration."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, TextIO
+
+
+CANARY_AGENT = "canary"
+DEFAULT_RUNTIME_ROOT = "~/.claude-lab/shared/channel-runtime"
+DEFAULT_POLL_TIMEOUT = 20
+DEFAULT_IDLE_SLEEP = 1.0
+
+
+class CanaryBotError(Exception):
+    pass
+
+
+class TelegramAPIError(CanaryBotError):
+    def __init__(self, status_code: int, description: str):
+        super().__init__(description)
+        self.status_code = status_code
+        self.description = description
+
+
+class ConfigError(CanaryBotError):
+    pass
+
+
+@dataclass(frozen=True)
+class CanaryBotConfig:
+    runtime_root: Path
+    token_path: Path
+    offset_path: Path
+
+    @classmethod
+    def from_runtime_root(cls, runtime_root: str | Path) -> "CanaryBotConfig":
+        root = Path(runtime_root).expanduser()
+        agent_root = root / CANARY_AGENT
+        return cls(
+            runtime_root=root,
+            token_path=agent_root / "secrets" / "telegram-bot-token",
+            offset_path=agent_root / "queue" / "telegram-offset.json",
+        )
+
+
+class TelegramClient:
+    def __init__(self, token: str):
+        self.base_url = f"https://api.telegram.org/bot{token}"
+
+    def call(self, method: str, payload: dict[str, object]) -> dict[str, object]:
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.base_url}/{method}",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=DEFAULT_POLL_TIMEOUT + 10) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            description = exc.reason
+            try:
+                data = json.loads(exc.read().decode("utf-8"))
+                description = str(data.get("description", description))
+            except (json.JSONDecodeError, OSError):
+                pass
+            raise TelegramAPIError(exc.code, description) from exc
+        except urllib.error.URLError as exc:
+            raise TelegramAPIError(0, str(exc.reason)) from exc
+
+        if not data.get("ok"):
+            raise TelegramAPIError(int(data.get("error_code", 0)), str(data.get("description", "Telegram API error")))
+        return data
+
+    def get_updates(self, offset: int | None, timeout: int) -> list[dict[str, object]]:
+        payload: dict[str, object] = {
+            "timeout": timeout,
+            "allowed_updates": ["message"],
+        }
+        if offset is not None:
+            payload["offset"] = offset
+        data = self.call("getUpdates", payload)
+        result = data.get("result", [])
+        if not isinstance(result, list):
+            raise TelegramAPIError(0, "Telegram getUpdates returned a non-list result")
+        return result
+
+    def send_message(self, chat_id: int, text: str) -> None:
+        self.call(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": True,
+            },
+        )
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def runtime_root_from_env(env: dict[str, str]) -> Path:
+    return Path(env.get("DASHI_CHANNEL_RUNTIME_ROOT", DEFAULT_RUNTIME_ROOT)).expanduser()
+
+
+def load_token(config: CanaryBotConfig) -> str:
+    if not config.token_path.exists():
+        raise ConfigError("canary_token_missing")
+    token = config.token_path.read_text(encoding="utf-8").strip()
+    if not token:
+        raise ConfigError("canary_token_empty")
+    return token
+
+
+def read_last_update_id(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    value = path.read_text(encoding="utf-8").strip()
+    if not value:
+        return None
+    return int(value)
+
+
+def write_last_update_id(path: Path, update_id: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(f"{update_id}\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def update_chat_id(update: dict[str, object]) -> int | None:
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return None
+    chat = message.get("chat")
+    if not isinstance(chat, dict):
+        return None
+    chat_id = chat.get("id")
+    return chat_id if isinstance(chat_id, int) else None
+
+
+def build_ack_text() -> str:
+    return f"dashi canary ack: message received at {utc_now()}"
+
+
+def write_json_line(stdout: TextIO, payload: dict[str, object]) -> None:
+    stdout.write(json.dumps(payload, sort_keys=True) + "\n")
+    stdout.flush()
+
+
+def write_error(stderr: TextIO, reason: str, message: str) -> None:
+    stderr.write(f"{reason}: {message}\n")
+    stderr.flush()
+
+
+def run_once(
+    config: CanaryBotConfig,
+    client: TelegramClient,
+    poll_timeout: int,
+    stdout: TextIO = sys.stdout,
+    stderr: TextIO = sys.stderr,
+) -> int:
+    try:
+        last_update_id = read_last_update_id(config.offset_path)
+        offset = last_update_id + 1 if last_update_id is not None else None
+        updates = client.get_updates(offset=offset, timeout=poll_timeout)
+    except TelegramAPIError as exc:
+        if exc.status_code == 409:
+            write_error(stderr, "telegram_getupdates_conflict", "another consumer is already polling this bot token")
+            return 4
+        write_error(stderr, "telegram_api_error", f"status={exc.status_code} {exc.description}")
+        return 5
+    except OSError as exc:
+        write_error(stderr, "canary_state_error", str(exc))
+        return 5
+
+    processed = 0
+    max_update_id = last_update_id
+    for update in updates:
+        update_id = update.get("update_id")
+        if isinstance(update_id, int):
+            max_update_id = update_id if max_update_id is None else max(max_update_id, update_id)
+        chat_id = update_chat_id(update)
+        if chat_id is None:
+            continue
+        try:
+            client.send_message(chat_id, build_ack_text())
+            processed += 1
+        except TelegramAPIError as exc:
+            write_error(stderr, "telegram_send_error", f"status={exc.status_code} {exc.description}")
+            return 5
+
+    if max_update_id is not None:
+        write_last_update_id(config.offset_path, max_update_id)
+
+    write_json_line(
+        stdout,
+        {
+            "agent": CANARY_AGENT,
+            "processed": processed,
+            "status": "ok",
+            "updates": len(updates),
+        },
+    )
+    return 0
+
+
+def run_forever(
+    config: CanaryBotConfig,
+    client: TelegramClient,
+    poll_timeout: int,
+    idle_sleep: float,
+    stdout: TextIO = sys.stdout,
+    stderr: TextIO = sys.stderr,
+) -> int:
+    write_json_line(stdout, {"agent": CANARY_AGENT, "status": "running", "started_at": utc_now()})
+    while True:
+        code = run_once(config, client, poll_timeout, stdout, stderr)
+        if code in (4, 5):
+            return code
+        time.sleep(idle_sleep)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="dashi-telegram-canary-bot",
+        description="Run a canary-only Telegram polling smoke bot for Dashi migration testing.",
+    )
+    parser.add_argument("--runtime-root", default=None)
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--poll-timeout", type=int, default=DEFAULT_POLL_TIMEOUT)
+    parser.add_argument("--idle-sleep", type=float, default=DEFAULT_IDLE_SLEEP)
+    return parser
+
+
+def main(
+    argv: Iterable[str] | None = None,
+    env: dict[str, str] | None = None,
+    stdout: TextIO = sys.stdout,
+    stderr: TextIO = sys.stderr,
+    client_factory=TelegramClient,
+) -> int:
+    args = build_parser().parse_args(list(argv) if argv is not None else None)
+    effective_env = dict(os.environ if env is None else env)
+    root = Path(args.runtime_root).expanduser() if args.runtime_root else runtime_root_from_env(effective_env)
+    config = CanaryBotConfig.from_runtime_root(root)
+
+    try:
+        token = load_token(config)
+    except ConfigError as exc:
+        write_error(stderr, str(exc), "canary token file is missing or empty")
+        return 3
+
+    client = client_factory(token)
+    if args.once:
+        return run_once(config, client, args.poll_timeout, stdout, stderr)
+    try:
+        return run_forever(config, client, args.poll_timeout, args.idle_sleep, stdout, stderr)
+    except KeyboardInterrupt:
+        write_json_line(stdout, {"agent": CANARY_AGENT, "status": "stopped"})
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

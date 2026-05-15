@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""Canary-only tmux supervisor scaffold for Dashi Telegram channels."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import threading
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, TextIO
+
+
+CANARY_AGENT = "canary"
+CANARY_SESSION = "orgrimmar-canary"
+CANARY_CHANNEL = "dashi-telegram-canary"
+LIVE_START_ENABLED = False
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+
+
+class SubprocessRunner:
+    def run(self, command: list[str], capture: bool = True) -> CommandResult:
+        try:
+            if capture:
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            else:
+                completed = subprocess.run(command, check=False)
+            return CommandResult(
+                completed.returncode,
+                getattr(completed, "stdout", "") or "",
+                getattr(completed, "stderr", "") or "",
+            )
+        except FileNotFoundError as exc:
+            return CommandResult(127, "", str(exc))
+
+
+@dataclass(frozen=True)
+class CanaryProfile:
+    agent: str
+    session: str
+    channel: str
+    root: Path
+    agent_root: Path
+    token_path: Path
+    log_dir: Path
+    queue_dir: Path
+    metadata_path: Path
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def runtime_root(env: dict[str, str]) -> Path:
+    configured = env.get("DASHI_CHANNEL_RUNTIME_ROOT", "~/.claude-lab/shared/channel-runtime")
+    return Path(configured).expanduser()
+
+
+def canary_profile(env: dict[str, str]) -> CanaryProfile:
+    root = runtime_root(env)
+    agent_root = root / CANARY_AGENT
+    return CanaryProfile(
+        agent=CANARY_AGENT,
+        session=CANARY_SESSION,
+        channel=CANARY_CHANNEL,
+        root=root,
+        agent_root=agent_root,
+        token_path=agent_root / "secrets" / "telegram-bot-token",
+        log_dir=agent_root / "logs",
+        queue_dir=agent_root / "queue",
+        metadata_path=agent_root / "metadata.json",
+    )
+
+
+def default_metadata(profile: CanaryProfile) -> dict[str, object]:
+    return {
+        "agent": profile.agent,
+        "session": profile.session,
+        "channel": profile.channel,
+        "production_token": False,
+        "token_source": "canary-secret-file",
+        "workspace": None,
+        "plugin": None,
+        "started_at": None,
+        "last_restart_reason": None,
+        "created_at": utc_now(),
+    }
+
+
+def atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def ensure_canary_layout(profile: CanaryProfile) -> None:
+    profile.agent_root.mkdir(parents=True, exist_ok=True)
+    profile.log_dir.mkdir(parents=True, exist_ok=True)
+    profile.queue_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("stdout.log", "stderr.log", "supervisor.log"):
+        (profile.log_dir / name).touch(exist_ok=True)
+    if not profile.metadata_path.exists():
+        atomic_write_json(profile.metadata_path, default_metadata(profile))
+
+
+def read_metadata(profile: CanaryProfile) -> dict[str, object]:
+    if not profile.metadata_path.exists():
+        return default_metadata(profile)
+    try:
+        return json.loads(profile.metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        metadata = default_metadata(profile)
+        metadata["metadata_error"] = "invalid_json"
+        return metadata
+
+
+def append_supervisor_log(profile: CanaryProfile, message: str) -> None:
+    ensure_canary_layout(profile)
+    line = f"{utc_now()} {message}\n"
+    with (profile.log_dir / "supervisor.log").open("a", encoding="utf-8") as handle:
+        handle.write(line)
+
+
+def log_paths(profile: CanaryProfile) -> dict[str, str]:
+    return {
+        "stdout": str(profile.log_dir / "stdout.log"),
+        "stderr": str(profile.log_dir / "stderr.log"),
+        "supervisor": str(profile.log_dir / "supervisor.log"),
+    }
+
+
+def tmux_session_exists(profile: CanaryProfile, runner: SubprocessRunner) -> tuple[bool, str | None]:
+    result = runner.run(["tmux", "has-session", "-t", profile.session])
+    if result.returncode == 0:
+        return True, None
+    if result.returncode == 127:
+        return False, result.stderr or "tmux command not found"
+    return False, None
+
+
+def channel_cli_confirmed(runner: SubprocessRunner) -> tuple[bool, str]:
+    result = runner.run(["claude", "--help"])
+    help_text = f"{result.stdout}\n{result.stderr}".lower()
+    markers = ("--channels", "dangerously-load-development-channels", "claude/channel")
+    return result.returncode == 0 and any(marker in help_text for marker in markers), help_text
+
+
+def blocked_payload(reason: str, message: str) -> dict[str, str]:
+    return {"status": "blocked", "reason": reason, "message": message}
+
+
+def write_payload(payload: dict[str, object], as_json: bool, stdout: TextIO, stderr: TextIO) -> None:
+    if as_json:
+        stdout.write(json.dumps(payload, sort_keys=True) + "\n")
+    else:
+        status = payload.get("status", "status")
+        reason = payload.get("reason")
+        message = payload.get("message")
+        if reason:
+            stderr.write(f"{status}: {reason}: {message}\n")
+        else:
+            stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def validate_canary(agent: str, as_json: bool, stdout: TextIO, stderr: TextIO) -> bool:
+    if agent == CANARY_AGENT:
+        return True
+    write_payload(
+        blocked_payload(
+            "canary_only",
+            "This scaffold only supports the canary profile; production agents remain disabled.",
+        ),
+        as_json,
+        stdout,
+        stderr,
+    )
+    return False
+
+
+def handle_status(args: argparse.Namespace, env: dict[str, str], runner: SubprocessRunner, stdout: TextIO, stderr: TextIO) -> int:
+    if not validate_canary(args.agent, args.json, stdout, stderr):
+        return 2
+    profile = canary_profile(env)
+    ensure_canary_layout(profile)
+    exists, tmux_error = tmux_session_exists(profile, runner)
+    state = "ready" if exists else "missing"
+    if tmux_error:
+        state = "error"
+    payload: dict[str, object] = {
+        "agent": profile.agent,
+        "session": profile.session,
+        "state": state,
+        "tmux": {"exists": exists, "error": tmux_error},
+        "channel": {"name": profile.channel, "healthy": None},
+        "queue": {"path": str(profile.queue_dir), "pending": None},
+        "logs": log_paths(profile),
+        "metadata": read_metadata(profile),
+    }
+    write_payload(payload, args.json, stdout, stderr)
+    return 0
+
+
+def handle_logs(args: argparse.Namespace, env: dict[str, str], runner: SubprocessRunner, stdout: TextIO, stderr: TextIO) -> int:
+    del runner
+    if not validate_canary(args.agent, args.json, stdout, stderr):
+        return 2
+    profile = canary_profile(env)
+    ensure_canary_layout(profile)
+    paths = log_paths(profile)
+    if args.json:
+        write_payload({"agent": profile.agent, "logs": paths}, True, stdout, stderr)
+        return 0
+    for key in ("stdout", "stderr", "supervisor"):
+        stdout.write(f"{key}: {paths[key]}\n")
+    return 0
+
+
+def handle_attach(args: argparse.Namespace, env: dict[str, str], runner: SubprocessRunner, stdout: TextIO, stderr: TextIO) -> int:
+    if not validate_canary(args.agent, args.json, stdout, stderr):
+        return 2
+    profile = canary_profile(env)
+    ensure_canary_layout(profile)
+    exists, tmux_error = tmux_session_exists(profile, runner)
+    if not exists:
+        detail = f": {tmux_error}" if tmux_error else ""
+        stderr.write(f"tmux session {profile.session} does not exist{detail}\n")
+        return 2
+    stdout.write("Detach with Ctrl-b d\n")
+    stdout.flush()
+    result = runner.run(["tmux", "attach-session", "-t", profile.session], capture=False)
+    return result.returncode
+
+
+def handle_start(args: argparse.Namespace, env: dict[str, str], runner: SubprocessRunner, stdout: TextIO, stderr: TextIO) -> int:
+    if not validate_canary(args.agent, args.json, stdout, stderr):
+        return 2
+    profile = canary_profile(env)
+    ensure_canary_layout(profile)
+    if not profile.token_path.exists():
+        payload = blocked_payload(
+            "canary_token_missing",
+            "Canary token file is missing. Token contents are never read or printed by this command.",
+        )
+        append_supervisor_log(profile, "start blocked: canary token file missing")
+        write_payload(payload, args.json, stdout, stderr)
+        return 3
+
+    confirmed, _help_text = channel_cli_confirmed(runner)
+    if not confirmed:
+        payload = blocked_payload(
+            "channel_cli_unconfirmed",
+            "Refusing start: channel CLI syntax is not confirmed, so no Telegram getUpdates or Claude channel process was started.",
+        )
+        append_supervisor_log(profile, "start blocked: channel CLI syntax unconfirmed")
+        write_payload(payload, args.json, stdout, stderr)
+        return 3
+
+    if not LIVE_START_ENABLED:
+        payload = blocked_payload(
+            "live_start_disabled",
+            "Channel CLI syntax is visible, but live canary start is disabled in this scaffold.",
+        )
+        append_supervisor_log(profile, "start blocked: live start disabled in scaffold")
+        write_payload(payload, args.json, stdout, stderr)
+        return 3
+
+    payload = blocked_payload("not_reachable", "Live start is intentionally unavailable in this scaffold.")
+    write_payload(payload, args.json, stdout, stderr)
+    return 3
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="dashi-channel-supervisor",
+        description="Canary-only tmux supervisor scaffold for Dashi Telegram channels.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    for name, handler in (
+        ("status", handle_status),
+        ("logs", handle_logs),
+        ("attach", handle_attach),
+        ("start", handle_start),
+    ):
+        subparser = subparsers.add_parser(name)
+        subparser.add_argument("agent")
+        subparser.add_argument("--json", action="store_true")
+        subparser.set_defaults(handler=handler)
+
+    return parser
+
+
+def normalize_env(env: dict[str, str] | None) -> dict[str, str]:
+    if env is None:
+        return dict(os.environ)
+    return dict(env)
+
+
+def main(
+    argv: Iterable[str] | None = None,
+    env: dict[str, str] | None = None,
+    runner: SubprocessRunner | None = None,
+    stdout: TextIO = sys.stdout,
+    stderr: TextIO = sys.stderr,
+) -> int:
+    parser = build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    command_runner = runner or SubprocessRunner()
+    return args.handler(args, normalize_env(env), command_runner, stdout, stderr)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

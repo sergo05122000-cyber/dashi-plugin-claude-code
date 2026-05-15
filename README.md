@@ -20,6 +20,10 @@ Custom Claude Code **channel plugin** для Telegram — миграция Orgri
 | [docs/04-codex-review.md](docs/04-codex-review.md) | Codex GPT-5.5 ревью: 6 правок до старта |
 | [docs/05-success-criteria.md](docs/05-success-criteria.md) | 8 чеков перед D-day + rollback strategy |
 | [docs/06-tmux-migration-goal-plan.md](docs/06-tmux-migration-goal-plan.md) | **TMUX-first goal plan**: supervisor, channel plugin, parity matrix, phased cutover |
+| [docs/07-runtime-baseline-and-canary-runbook.md](docs/07-runtime-baseline-and-canary-runbook.md) | Local runtime baseline + safe tmux/channel canary gates |
+| [docs/08-dashi-channel-supervisor-spec.md](docs/08-dashi-channel-supervisor-spec.md) | `dashi-channel-supervisor` command contract, state layout, and safety gates |
+| [docs/09-canary-supervisor-execution-log.md](docs/09-canary-supervisor-execution-log.md) | Canary-only supervisor scaffold execution log and safe verification commands |
+| [docs/10-canary-telegram-smoke-bot.md](docs/10-canary-telegram-smoke-bot.md) | Live canary Telegram smoke bot status, tmux session, and remaining production gates |
 
 ## Презентации (HTML)
 
@@ -58,7 +62,7 @@ Custom Claude Code **channel plugin** для Telegram — миграция Orgri
 
 ## Status
 
-**WIP** — Pre-flight + Phase 0 canary запланированы. Старт по сигналу принца. Месяц до D-day.
+**WIP, 2026-05-14 PDT:** tmux-first supervisor scaffold implemented; separate canary Telegram smoke bot is running in `orgrimmar-canary` for token/polling/sendMessage testing. Production cutover is not done: Claude Code channel CLI syntax, billing classification, permission relay, parity, rollback, and operator sign-off remain gated.
 
 ## Related repos
 
