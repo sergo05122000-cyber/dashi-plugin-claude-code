@@ -631,6 +631,39 @@ describe('POST /hooks/agent — Claude hook payload branch', () => {
     expect(resp.status).toBe(200)
   })
 
+  test('config.status.enabled=false → hook payload accepted but no dispatch', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    // Override status.enabled to false on top of webhook-enabled config.
+    const cfg: AppConfig = {
+      ...enabledConfig(),
+      status: { ...baseConfig.status, enabled: false },
+    }
+    const { handle: h, status, mcp } = await startEnabledWithStatus(cfg)
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'PreToolUse',
+        session_id: 's1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+        tool_name: 'Read',
+        tool_use_id: 'u1',
+        tool_input: { file_path: '/x/y.ts' },
+      }),
+    })
+    expect(resp.status).toBe(200)
+    const body = (await resp.json()) as Record<string, unknown>
+    expect(body.status).toBe('accepted')
+    expect(body.note).toBe('status_disabled')
+    expect(status.calls.length).toBe(0)
+    expect(mcp.calls.length).toBe(0)
+  })
+
   test('message payload path is unchanged when statusManager is wired', async () => {
     process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
     const { handle: h, mcp, status } = await startEnabledWithStatus(enabledConfig())

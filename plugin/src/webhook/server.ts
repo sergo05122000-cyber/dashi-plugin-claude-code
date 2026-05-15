@@ -260,7 +260,11 @@ async function handleRequest(
   // Branch on payload variant. Discriminator was set by the Zod transform
   // so we don't have to re-sniff fields here.
   if (payload.kind === 'claude_hook') {
-    if (statusManager) {
+    // PLAN.md:173 — when config.status.enabled=false the hook path must
+    // be a no-op. We accept the request (200) so Claude hooks don't
+    // back-pressure on a disabled visibility surface, but skip dispatch
+    // entirely (no statusManager call, no lazy status open).
+    if (config.status.enabled === true && statusManager) {
       try {
         await statusManager.recordActivityByChatId(
           payload.chatId,
@@ -274,12 +278,24 @@ async function handleRequest(
           error: err instanceof Error ? err.message : String(err),
         })
       }
-    } else {
-      log.debug('hook event accepted without status manager', {
+      reply(res, 200, { status: 'accepted' })
+      return
+    }
+
+    if (config.status.enabled !== true) {
+      log.debug('hook event accepted but status disabled', {
         chat_id: payload.chatId,
         hook: payload.hook_event_name,
       })
+      reply(res, 200, { status: 'accepted', note: 'status_disabled' })
+      return
     }
+
+    // statusManager not wired — visibility outage tolerated.
+    log.debug('hook event accepted without status manager', {
+      chat_id: payload.chatId,
+      hook: payload.hook_event_name,
+    })
     reply(res, 200, { status: 'accepted' })
     return
   }
