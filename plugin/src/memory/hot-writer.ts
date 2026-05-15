@@ -119,10 +119,15 @@ export async function appendHotEntry(
 }
 
 /**
- * Collapse newlines to spaces and slice to `max` chars. Used for both
- * user and agent snippets so a multi-line prompt doesn't break the
+ * Collapse newlines to spaces and slice to `max` code points. Used for
+ * both user and agent snippets so a multi-line prompt doesn't break the
  * `### header` / `**User:**` / `**Agent:**` four-line shape.
+ *
+ * Slicing uses `Array.from` so we count Unicode code points (matches
+ * Python `s[:200]`) rather than UTF-16 code units. Emoji-heavy prompts
+ * (Telegram!) would otherwise under-truncate or split a surrogate pair
+ * mid-codepoint, producing an invalid UTF-8 sequence in recent.md.
  */
 export function snippet(s: string, max = 200): string {
-  return (s || '').replace(/\n/g, ' ').slice(0, max)
+  return Array.from((s || '').replace(/\n/g, ' ')).slice(0, max).join('')
 }

@@ -52,6 +52,30 @@ describe('snippet', () => {
     // typecheck-safe: function tolerates undefined-ish via the `|| ''` guard
     expect(snippet(undefined as unknown as string)).toBe('')
   })
+
+  test('slices by code points, not UTF-16 code units (review LOW — astral Unicode parity)', () => {
+    // Each '👋' is a single Unicode code point but two UTF-16 code units
+    // (a surrogate pair). 150 emojis = 300 UTF-16 units = 150 code points.
+    // Pre-fix `.slice(0, 200)` cut after 100 emojis (200 UTF-16 units),
+    // matching Python `s[:200]` semantics only by accident — and could
+    // split a surrogate pair on a non-multiple-of-2 max, producing an
+    // invalid UTF-8 sequence in recent.md.
+    const out = snippet('👋'.repeat(150))
+    expect(Array.from(out).length).toBe(150)
+    // No broken surrogate pair: every code point must be a full emoji.
+    for (const c of out) {
+      expect(c).toBe('👋')
+    }
+  })
+
+  test('snippet honours code-point max even on mixed BMP + astral input', () => {
+    // 'a' (1 code point, 1 UTF-16 unit) interleaved with '😀' (1 code point,
+    // 2 UTF-16 units). 100 each = 200 code points = 300 UTF-16 units.
+    let mixed = ''
+    for (let i = 0; i < 100; i++) mixed += 'a😀'
+    const out = snippet(mixed, 200)
+    expect(Array.from(out).length).toBe(200)
+  })
 })
 
 describe('appendHotEntry', () => {
