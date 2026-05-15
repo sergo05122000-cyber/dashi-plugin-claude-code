@@ -1,0 +1,163 @@
+// Phase 7 / T6 — install-hooks.sh + patch-claude-settings.ts.
+// Drives the real shell script against a temp settings.json so the end-to-end
+// flow is exercised.
+
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+import { spawnSync } from 'child_process'
+
+import { applyPatch } from '../../scripts/patch-claude-settings.js'
+
+const PLUGIN_DIR = join(import.meta.dir, '..', '..')
+const INSTALL_SH = join(PLUGIN_DIR, 'scripts', 'install-hooks.sh')
+const POST_HOOK = join(PLUGIN_DIR, 'scripts', 'post-hook.ts')
+
+let tmp: string
+let settings: string
+
+beforeEach(() => {
+  tmp = mkdtempSync(join(tmpdir(), 'dashi-install-hooks-'))
+  settings = join(tmp, 'settings.json')
+})
+
+afterEach(() => {
+  rmSync(tmp, { recursive: true, force: true })
+})
+
+function readJson(): Record<string, unknown> {
+  return JSON.parse(readFileSync(settings, 'utf8')) as Record<string, unknown>
+}
+
+function runInstall(extraArgs: string[] = []): { code: number; stderr: string } {
+  const r = spawnSync(
+    'bash',
+    [
+      INSTALL_SH,
+      '--settings', settings,
+      '--chat-id', '164795011',
+      '--webhook-url', 'http://127.0.0.1:8089/hooks/agent',
+      '--agent-id', 'dashi-channel',
+      ...extraArgs,
+    ],
+    { encoding: 'utf8' },
+  )
+  return { code: r.status ?? -1, stderr: r.stderr }
+}
+
+describe('install-hooks.sh — fresh settings file', () => {
+  test('creates hooks for all five events', () => {
+    const r = runInstall()
+    expect(r.code).toBe(0)
+    const parsed = readJson()
+    const flat = JSON.stringify(parsed)
+    for (const ev of ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop']) {
+      expect(flat).toContain(ev)
+    }
+    expect(flat).toContain(POST_HOOK)
+    expect(flat).toContain("TELEGRAM_HOOK_CHAT_ID='164795011'")
+    expect(flat).toContain("TELEGRAM_HOOK_AGENT_ID='dashi-channel'")
+  })
+
+  test('never writes TELEGRAM_WEBHOOK_TOKEN', () => {
+    runInstall()
+    const raw = readFileSync(settings, 'utf8')
+    expect(raw).not.toContain('TELEGRAM_WEBHOOK_TOKEN')
+  })
+
+  test('matchers present on PreToolUse and PostToolUse only', () => {
+    runInstall()
+    const parsed = readJson() as {
+      hooks?: Record<string, Array<{ matcher?: string }>>
+    }
+    expect(parsed.hooks?.PreToolUse?.[0]?.matcher).toBe('.*')
+    expect(parsed.hooks?.PostToolUse?.[0]?.matcher).toBe('.*')
+    expect(parsed.hooks?.SessionStart?.[0]?.matcher).toBeUndefined()
+    expect(parsed.hooks?.Stop?.[0]?.matcher).toBeUndefined()
+  })
+})
+
+describe('install-hooks.sh — idempotency', () => {
+  test('second run does not duplicate hook entries', () => {
+    runInstall()
+    const firstCount = countPluginEntries(readJson())
+    runInstall()
+    const secondCount = countPluginEntries(readJson())
+    expect(secondCount).toBe(firstCount)
+  })
+
+  test('preserves unrelated keys', () => {
+    writeFileSync(
+      settings,
+      JSON.stringify({
+        otherKey: { keep: 'me' },
+        hooks: {
+          PreToolUse: [
+            { marker: 'someone-else', hooks: [{ type: 'command', command: 'echo unrelated' }] },
+          ],
+        },
+      }),
+    )
+    runInstall()
+    const parsed = readJson() as Record<string, unknown> & {
+      hooks?: { PreToolUse?: Array<{ marker?: string; hooks?: Array<{ command?: string }> }> }
+    }
+    expect(parsed.otherKey).toEqual({ keep: 'me' })
+    // Other plugin's entry must survive.
+    const preToolUse = parsed.hooks?.PreToolUse ?? []
+    const others = preToolUse.filter((e) => e.marker === 'someone-else')
+    const ours = preToolUse.filter((e) => e.marker === 'dashi-channel-hook')
+    expect(others.length).toBe(1)
+    expect(ours.length).toBe(1)
+    expect(others[0]!.hooks?.[0]?.command).toBe('echo unrelated')
+  })
+})
+
+describe('applyPatch (pure)', () => {
+  test('handles missing hooks section', () => {
+    const out = applyPatch(
+      {},
+      {
+        settingsPath: '/tmp/x',
+        chatId: '1',
+        webhookUrl: 'http://x',
+        helperPath: '/tmp/post-hook.ts',
+      },
+    )
+    expect((out as Record<string, unknown>).hooks).toBeDefined()
+  })
+
+  test('replaces previous dashi-channel-hook entry rather than appending', () => {
+    let s: Record<string, unknown> = {}
+    s = applyPatch(s, {
+      settingsPath: '/tmp/x',
+      chatId: '1',
+      webhookUrl: 'http://old',
+      helperPath: '/tmp/post-hook.ts',
+    })
+    s = applyPatch(s, {
+      settingsPath: '/tmp/x',
+      chatId: '1',
+      webhookUrl: 'http://new',
+      helperPath: '/tmp/post-hook.ts',
+    })
+    const hooks = (s as { hooks?: Record<string, Array<{ marker?: string; hooks?: Array<{ command?: string }> }>> }).hooks
+    const stop = hooks?.Stop ?? []
+    const ours = stop.filter((e) => e.marker === 'dashi-channel-hook')
+    expect(ours.length).toBe(1)
+    expect(ours[0]!.hooks?.[0]?.command).toContain('http://new')
+    expect(ours[0]!.hooks?.[0]?.command).not.toContain('http://old')
+  })
+})
+
+function countPluginEntries(parsed: Record<string, unknown>): number {
+  const hooks = parsed.hooks as Record<string, Array<{ marker?: string }>> | undefined
+  if (!hooks) return 0
+  let total = 0
+  for (const arr of Object.values(hooks)) {
+    if (!Array.isArray(arr)) continue
+    total += arr.filter((e) => e?.marker === 'dashi-channel-hook').length
+  }
+  return total
+}
