@@ -427,3 +427,171 @@ describe('StatusManager.activeChatIds', () => {
     expect(ids).toEqual(['164795011', '200'])
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 7 / T3: recordActivityByChatId — Claude hook integration.
+// ─────────────────────────────────────────────────────────────────────
+
+describe('StatusManager.recordActivityByChatId', () => {
+  test('PreToolUse on existing status renders activity block edit', async () => {
+    const { mgr, api } = makeManager()
+    await mgr.start('164795011', undefined)
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_start',
+      toolName: 'Bash',
+      toolInput: { command: 'bun test' },
+      toolUseId: 'u1',
+    })
+    const edits = api.calls.filter((c) => c.kind === 'edit')
+    const last = edits[edits.length - 1]!
+    expect(last.text).toContain('<pre>')
+    expect(last.text).toContain('working --')
+    expect(last.text).toContain('bash bun test')
+  })
+
+  test('SessionStart with no active status opens one without reply_to', async () => {
+    const { mgr, api } = makeManager()
+    await mgr.recordActivityByChatId('164795011', { kind: 'session_start' })
+    const sends = api.calls.filter((c) => c.kind === 'send')
+    expect(sends.length).toBe(1)
+    expect(sends[0]!.chatId).toBe('164795011')
+    const opts = sends[0]!.opts as { reply_to_message_id?: number }
+    expect(opts.reply_to_message_id).toBeUndefined()
+    expect(mgr.isActive('164795011')).toBe(true)
+  })
+
+  test('Stop calls complete() and stops timers', async () => {
+    const { mgr, api } = makeManager()
+    await mgr.start('164795011', undefined)
+    await mgr.recordActivityByChatId('164795011', { kind: 'session_stop' })
+    expect(mgr.isActive('164795011')).toBe(false)
+    // delete_on_complete=true by default → expect one delete call.
+    const deletes = api.calls.filter((c) => c.kind === 'delete')
+    expect(deletes.length).toBe(1)
+  })
+
+  test('Agent PreToolUse renders immediately even within throttle window', async () => {
+    const { mgr, api, clock } = makeManager()
+    await mgr.start('164795011', undefined)
+    // First non-Agent record sets lastToolRenderAt.
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_start',
+      toolName: 'Bash',
+      toolInput: { command: 'echo hi' },
+      toolUseId: 'u1',
+    })
+    const beforeAgent = api.calls.filter((c) => c.kind === 'edit').length
+    // Within 5 s — non-Agent would NOT trigger an edit. Agent must.
+    clock.advance(100)
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_start',
+      toolName: 'Agent',
+      toolInput: { subagent_type: 'researcher' },
+      toolUseId: 'u2',
+    })
+    const afterAgent = api.calls.filter((c) => c.kind === 'edit').length
+    expect(afterAgent).toBeGreaterThan(beforeAgent)
+    const last = api.calls.filter((c) => c.kind === 'edit').pop()!
+    expect(last.text).toContain('agent researcher')
+  })
+
+  test('Non-Agent PreToolUse within 5s is recorded but not re-rendered', async () => {
+    // Use a very long interval_ms so the dot-animation ticker doesn't add
+    // noise edits between our two record calls.
+    const config = makeConfig({ interval_ms: 100_000_000 })
+    const { mgr, api, clock } = makeManager({ config })
+    await mgr.start('164795011', undefined)
+    // First non-Agent renders immediately (sentinel → past threshold).
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_start',
+      toolName: 'Bash',
+      toolInput: { command: 'one' },
+      toolUseId: 'u1',
+    })
+    const editsAfterFirst = api.calls.filter((c) => c.kind === 'edit').length
+    // Second one within 5 s — throttled, no new edit.
+    clock.advance(2000)
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_start',
+      toolName: 'Bash',
+      toolInput: { command: 'two' },
+      toolUseId: 'u2',
+    })
+    expect(api.calls.filter((c) => c.kind === 'edit').length).toBe(editsAfterFirst)
+    // PostToolUse (reasoning flip) flushes the buffer — must include `two`.
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_end',
+      toolName: 'Bash',
+      toolInput: { command: 'two' },
+      toolUseId: 'u2',
+    })
+    const lastEdit = api.calls.filter((c) => c.kind === 'edit').pop()!
+    expect(lastEdit.text).toContain('bash two')
+    expect(lastEdit.text).toContain('reasoning...')
+  })
+
+  test('UserPromptSubmit flips phase to reasoning and renders', async () => {
+    const { mgr, api } = makeManager()
+    await mgr.start('164795011', undefined)
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_start',
+      toolName: 'Bash',
+      toolInput: { command: 'ls /' },
+      toolUseId: 'u1',
+    })
+    await mgr.recordActivityByChatId('164795011', { kind: 'reasoning' })
+    const last = api.calls.filter((c) => c.kind === 'edit').pop()!
+    expect(last.text).toContain('reasoning...')
+  })
+
+  test('mid-render does not leak raw prompt text through ActivityEvent', async () => {
+    const { mgr, api } = makeManager()
+    // session_start with no prior status → opens. Then a reasoning event
+    // shouldn't carry any user prompt body because the mapping drops it.
+    await mgr.recordActivityByChatId('164795011', { kind: 'session_start' })
+    await mgr.recordActivityByChatId('164795011', { kind: 'reasoning' })
+    const everything = api.calls.map((c) => c.text ?? '').join('\n')
+    expect(everything).not.toContain('prompt')
+    expect(everything).toContain('working --')
+  })
+
+  test('Buffer enforces ACTIVITY_MAX_BUFFER (10) — older shifted out', async () => {
+    const { mgr, api, clock } = makeManager()
+    await mgr.start('164795011', undefined)
+    // Push 12 Agent calls — Agent always renders, so we exercise the path
+    // where the buffer caps and the renderer still shows +N earlier.
+    for (let i = 0; i < 12; i++) {
+      await mgr.recordActivityByChatId('164795011', {
+        kind: 'tool_start',
+        toolName: 'Agent',
+        toolInput: { subagent_type: `subagent-${i}` },
+        toolUseId: `u${i}`,
+      })
+      clock.advance(1)
+    }
+    const last = api.calls.filter((c) => c.kind === 'edit').pop()!
+    // 12 pushed, buffer capped at 10 → 0 and 1 evicted, 2..11 retained.
+    // Use unique trailing suffix to avoid substring overlap with -10/-11.
+    expect(last.text).not.toMatch(/subagent-0[^0-9]/)
+    expect(last.text).not.toMatch(/subagent-1[^0-9]/)
+    expect(last.text).toContain('subagent-11')
+    expect(last.text).toContain('subagent-10')
+    // Renderer window is 5 → "+N earlier" line appears (10 retained, 5 shown).
+    expect(last.text).toContain('earlier')
+  })
+
+  test('Visibility failure during lazy-open is swallowed', async () => {
+    const { mgr, api } = makeManager()
+    api.failEditWith = new Error('sendMessage simulated fail')
+    // Force sendMessage to throw by overriding the api's send method.
+    const origSend = api.api.sendMessage
+    api.api.sendMessage = async () => {
+      throw new Error('telegram down')
+    }
+    // Must not throw.
+    await mgr.recordActivityByChatId('164795011', { kind: 'session_start' })
+    // No active status created → no further calls succeed silently.
+    expect(mgr.isActive('164795011')).toBe(false)
+    api.api.sendMessage = origSend
+  })
+})
