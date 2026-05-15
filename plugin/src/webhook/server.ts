@@ -23,15 +23,30 @@ import type { Logger } from '../log.js'
 import { writeDeadLetter } from '../state/store.js'
 import { WebhookPayloadSchema, type WebhookPayload } from '../schemas.js'
 import { sendChannelNotification, normalizeMeta } from '../channel/notify.js'
+import { toActivityEvent } from '../hooks/claude-events.js'
 
 const BODY_LIMIT_BYTES = 256 * 1024
 const DEFAULT_AGENT_ID = 'dashi-channel'
+
+// Structural surface for the hook branch. Avoids importing the full
+// StatusManager type so test stubs can pass a minimal object. The webhook
+// server only needs to push events into the manager — no read APIs.
+export interface StatusManagerForWebhook {
+  recordActivityByChatId(
+    chatId: string,
+    event: ReturnType<typeof toActivityEvent>,
+  ): Promise<void>
+}
 
 export interface WebhookDeps {
   mcpServer: McpServer
   config: AppConfig
   statePaths: StatePaths
   log: Logger
+  // Optional — if absent, hook-event payloads are accepted but no Telegram
+  // status update happens. The 200 path stays open so Claude hooks never
+  // back-pressure on visibility outages.
+  statusManager?: StatusManagerForWebhook
 }
 
 export interface WebhookServerHandle {
@@ -50,9 +65,14 @@ export function validateWebhookPayload(value: unknown): WebhookPayload {
     return WebhookPayloadSchema.parse(value)
   } catch (err) {
     if (err instanceof z.ZodError) {
+      // Cap the issue summary so a deeply-nested or discriminated-union
+      // failure can't return a kilobyte-long error to the caller / dead
+      // letter (review L2). 512 chars is plenty to identify which field
+      // failed without amplifying payload-shaped attacks.
       const summary = err.issues
         .map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`)
         .join('; ')
+        .slice(0, 512)
       throw new Error(redactToken(`invalid webhook payload: ${summary}`))
     }
     throw new Error(redactToken(`invalid webhook payload: ${err instanceof Error ? err.message : String(err)}`))
@@ -77,18 +97,20 @@ function reply(res: ServerResponse, status: number, body: Record<string, unknown
 }
 
 function bearerEquals(received: string, expected: string): boolean {
-  // Encode to fixed-length buffers so timingSafeEqual never throws on
-  // length mismatch; length difference is independently checked.
+  // Pad both sides to a single fixed length BEFORE the comparison so we run
+  // the exact same timingSafeEqual call regardless of input lengths — no
+  // length-conditional code path that could leak a length bit (review M4).
+  // Final result combines the constant-time byte-compare with an explicit
+  // length-equality bit, so mismatched lengths still return false.
   const a = Buffer.from(received)
   const b = Buffer.from(expected)
-  if (a.length !== b.length) {
-    // Still run a constant-time compare on equal-length padded buffers so
-    // the failure path runs the same code; the length check is its own bit.
-    const pad = Buffer.alloc(b.length)
-    timingSafeEqual(pad, b)
-    return false
-  }
-  return timingSafeEqual(a, b)
+  const max = Math.max(a.length, b.length, 32)
+  const padA = Buffer.alloc(max)
+  const padB = Buffer.alloc(max)
+  a.copy(padA)
+  b.copy(padB)
+  const bytesEqual = timingSafeEqual(padA, padB)
+  return bytesEqual && a.length === b.length
 }
 
 // Drain request body up to BODY_LIMIT_BYTES + 1. We return early as soon
@@ -147,7 +169,7 @@ async function handleRequest(
   deps: WebhookDeps,
   webhookToken: string | undefined,
 ): Promise<void> {
-  const { config, statePaths, log, mcpServer } = deps
+  const { config, statePaths, log, mcpServer, statusManager } = deps
   const method = req.method ?? 'GET'
   const url = req.url ?? '/'
 
@@ -242,7 +264,50 @@ async function handleRequest(
     return
   }
 
-  // Forward to MCP channel.
+  // Branch on payload variant. Discriminator was set by the Zod transform
+  // so we don't have to re-sniff fields here.
+  if (payload.kind === 'claude_hook') {
+    // PLAN.md:173 — when config.status.enabled=false the hook path must
+    // be a no-op. We accept the request (200) so Claude hooks don't
+    // back-pressure on a disabled visibility surface, but skip dispatch
+    // entirely (no statusManager call, no lazy status open).
+    if (config.status.enabled === true && statusManager) {
+      try {
+        await statusManager.recordActivityByChatId(
+          payload.chatId,
+          toActivityEvent(payload),
+        )
+      } catch (err) {
+        // Visibility failure must not block Claude. Log + 200.
+        log.warn('hook event status update failed (ignored)', {
+          chat_id: payload.chatId,
+          hook: payload.hook_event_name,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+      reply(res, 200, { status: 'accepted' })
+      return
+    }
+
+    if (config.status.enabled !== true) {
+      log.debug('hook event accepted but status disabled', {
+        chat_id: payload.chatId,
+        hook: payload.hook_event_name,
+      })
+      reply(res, 200, { status: 'accepted', note: 'status_disabled' })
+      return
+    }
+
+    // statusManager not wired — visibility outage tolerated.
+    log.debug('hook event accepted without status manager', {
+      chat_id: payload.chatId,
+      hook: payload.hook_event_name,
+    })
+    reply(res, 200, { status: 'accepted' })
+    return
+  }
+
+  // Forward message payload to MCP channel (existing behaviour).
   const metaRaw: Record<string, unknown> = {
     source: 'webhook',
     chat_id: payload.chatId,

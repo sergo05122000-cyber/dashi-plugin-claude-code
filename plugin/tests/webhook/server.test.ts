@@ -100,6 +100,8 @@ function url(h: WebhookServerHandle, path: string): string {
 describe('validateWebhookPayload', () => {
   test('accepts {message, chatId} numeric', () => {
     const p = validateWebhookPayload({ message: 'hi', chatId: 164795011 })
+    expect(p.kind).toBe('message')
+    if (p.kind !== 'message') throw new Error('unreachable')
     expect(p.message).toBe('hi')
     expect(p.chatId).toBe('164795011')
     expect(p.agentId).toBeUndefined()
@@ -111,6 +113,49 @@ describe('validateWebhookPayload', () => {
 
   test('rejects missing chatId', () => {
     expect(() => validateWebhookPayload({ message: 'x' })).toThrow(/invalid webhook payload/)
+  })
+
+  test('Zod issue summary is capped at 512 chars (L2)', () => {
+    // Pre-fix: a deeply-nested or discriminated-union failure could amplify
+    // a single bad request into a kilobyte-long error string that landed in
+    // both the 400 response body and the dead-letter file. Cap is 512 chars
+    // on the appended `summary` slice. Total Error message includes the
+    // `invalid webhook payload: ` prefix (~25 chars), so message ≤ ~540.
+    let caught: unknown
+    try {
+      // Use a payload that's the wrong shape entirely — Zod produces several
+      // issues for the union failure.
+      validateWebhookPayload({ junk: 'x'.repeat(2000), more_junk: 'y'.repeat(2000) })
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBeInstanceOf(Error)
+    const msg = (caught as Error).message
+    expect(msg.startsWith('invalid webhook payload: ')).toBe(true)
+    // Prefix + capped summary should be well below 600 chars.
+    expect(msg.length).toBeLessThanOrEqual(600)
+  })
+
+  test('discriminator: hook_event_name presence routes to claude_hook (not message)', () => {
+    // Pre-fix: union evaluated message-first; this payload matched message
+    // and the hook fields were silently dropped. Post-fix: hook_event_name
+    // routes to the hook schema even when `message` is present.
+    const p = validateWebhookPayload({
+      message: 'this should NOT win',
+      chatId: 164795011,
+      hook_event_name: 'PreToolUse',
+      session_id: 's1',
+      transcript_path: '/tmp/t.jsonl',
+      cwd: '/tmp',
+      tool_name: 'Read',
+      tool_use_id: 'u1',
+      tool_input: { file_path: '/x/y.ts' },
+    })
+    expect(p.kind).toBe('claude_hook')
+    if (p.kind !== 'claude_hook') throw new Error('unreachable')
+    expect(p.hook_event_name).toBe('PreToolUse')
+    if (p.hook_event_name !== 'PreToolUse') throw new Error('unreachable')
+    expect(p.tool_name).toBe('Read')
   })
 })
 
@@ -202,6 +247,26 @@ describe('POST /hooks/agent', () => {
       body: JSON.stringify({ message: 'x', chatId: 164795011 }),
     })
     expect(resp.status).toBe(401)
+  })
+
+  test('bearer of different length returns 401 (no length-leak path) (M4)', async () => {
+    // After the M4 fix bearerEquals pads both sides to the same fixed
+    // length and combines the byte-compare with an explicit length-equality
+    // bit. Differing-length tokens — both shorter and longer than the
+    // configured one — must still produce 401 cleanly.
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const { handle: h } = await startEnabled(enabledConfig())
+    for (const token of ['short', `${WEBHOOK_TOKEN}_with_extra_tail`, '']) {
+      const resp = await fetch(url(h, '/hooks/agent'), {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ message: 'x', chatId: 164795011 }),
+      })
+      expect(resp.status).toBe(401)
+    }
   })
 
   test('without configured token returns 503', async () => {
@@ -374,5 +439,307 @@ describe('POST /hooks/agent', () => {
     // small enough to succeed (200). Either reject path is acceptable: this
     // test mainly proves we don't crash. Assert non-5xx.
     expect(resp.status).toBeLessThan(500)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 7 / T4: Claude hook branch — chatId allowlist, agentId guard,
+// status-manager dispatch, MCP channel must NOT fire.
+// ─────────────────────────────────────────────────────────────────────
+
+interface StatusStubCall {
+  chatId: string
+  event: { kind: string } & Record<string, unknown>
+}
+
+function makeStatusStub(): {
+  manager: { recordActivityByChatId: (chatId: string, event: unknown) => Promise<void> }
+  calls: StatusStubCall[]
+} {
+  const calls: StatusStubCall[] = []
+  return {
+    manager: {
+      recordActivityByChatId: async (chatId: string, event: unknown) => {
+        calls.push({ chatId, event: event as StatusStubCall['event'] })
+      },
+    },
+    calls,
+  }
+}
+
+async function startEnabledWithStatus(config: AppConfig): Promise<{
+  handle: WebhookServerHandle
+  mcp: ReturnType<typeof makeMcpStub>
+  status: ReturnType<typeof makeStatusStub>
+}> {
+  const mcp = makeMcpStub()
+  const status = makeStatusStub()
+  const h = await startWebhookServer(config, {
+    mcpServer: mcp.server,
+    config,
+    statePaths: paths,
+    log: createLogger('test'),
+    statusManager: status.manager,
+  })
+  if (!h) throw new Error('expected handle')
+  handle = h
+  return { handle: h, mcp, status }
+}
+
+describe('POST /hooks/agent — Claude hook payload branch', () => {
+  test('valid PreToolUse dispatches to statusManager, no MCP channel call', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const { handle: h, mcp, status } = await startEnabledWithStatus(enabledConfig())
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        agentId: 'dashi-channel',
+        hook_event_name: 'PreToolUse',
+        session_id: 's1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+        permission_mode: 'default',
+        tool_name: 'Read',
+        tool_use_id: 'u1',
+        tool_input: { file_path: '/repo/plugin/src/server.ts' },
+      }),
+    })
+    expect(resp.status).toBe(200)
+    const body = (await resp.json()) as Record<string, unknown>
+    expect(body.status).toBe('accepted')
+    expect(mcp.calls).toEqual([])
+    expect(status.calls.length).toBe(1)
+    expect(status.calls[0]!.chatId).toBe('164795011')
+    expect(status.calls[0]!.event.kind).toBe('tool_start')
+  })
+
+  test('Stop payload maps to session_stop', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const { handle: h, status } = await startEnabledWithStatus(enabledConfig())
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'Stop',
+        session_id: 's1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+      }),
+    })
+    expect(resp.status).toBe(200)
+    expect(status.calls[0]!.event.kind).toBe('session_stop')
+  })
+
+  test('UserPromptSubmit does NOT leak prompt into status event', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const { handle: h, status } = await startEnabledWithStatus(enabledConfig())
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 's1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+        prompt: 'Top secret user question',
+      }),
+    })
+    expect(resp.status).toBe(200)
+    expect(status.calls[0]!.event.kind).toBe('reasoning')
+    expect(JSON.stringify(status.calls)).not.toContain('Top secret user question')
+  })
+
+  test('hook payload with non-allowlisted chatId returns 403, no status dispatch', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const { handle: h, status } = await startEnabledWithStatus(enabledConfig())
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 999999999,
+        hook_event_name: 'Stop',
+        session_id: 's1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+      }),
+    })
+    expect(resp.status).toBe(403)
+    expect(status.calls.length).toBe(0)
+  })
+
+  test('hook payload with unknown agentId returns 404', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const { handle: h, status } = await startEnabledWithStatus(enabledConfig())
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        agentId: 'someone-else',
+        hook_event_name: 'Stop',
+        session_id: 's1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+      }),
+    })
+    expect(resp.status).toBe(404)
+    expect(status.calls.length).toBe(0)
+  })
+
+  test('invalid hook payload (missing required field) dead-letters + 400', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const { handle: h, status } = await startEnabledWithStatus(enabledConfig())
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'PreToolUse',
+        session_id: 's1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+        // Missing tool_name, tool_use_id, tool_input.
+      }),
+    })
+    expect(resp.status).toBe(400)
+    expect(status.calls.length).toBe(0)
+    const dlFiles = readdirSync(paths.deadLetterWebhook)
+    expect(dlFiles.length).toBeGreaterThanOrEqual(1)
+  })
+
+  test('hook payload with no statusManager returns 200 (visibility outage tolerated)', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const mcp = makeMcpStub()
+    const cfg = enabledConfig()
+    const h = await startWebhookServer(cfg, {
+      mcpServer: mcp.server,
+      config: cfg,
+      statePaths: paths,
+      log: createLogger('test'),
+      // No statusManager intentionally.
+    })
+    if (!h) throw new Error('expected handle')
+    handle = h
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'Stop',
+        session_id: 's1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+      }),
+    })
+    expect(resp.status).toBe(200)
+    expect(mcp.calls.length).toBe(0)
+  })
+
+  test('hook payload — statusManager throw still returns 200', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const cfg = enabledConfig()
+    const mcp = makeMcpStub()
+    const h = await startWebhookServer(cfg, {
+      mcpServer: mcp.server,
+      config: cfg,
+      statePaths: paths,
+      log: createLogger('test'),
+      statusManager: {
+        recordActivityByChatId: async () => {
+          throw new Error('Telegram down')
+        },
+      },
+    })
+    if (!h) throw new Error('expected handle')
+    handle = h
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'Stop',
+        session_id: 's1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+      }),
+    })
+    expect(resp.status).toBe(200)
+  })
+
+  test('config.status.enabled=false → hook payload accepted but no dispatch', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    // Override status.enabled to false on top of webhook-enabled config.
+    const cfg: AppConfig = {
+      ...enabledConfig(),
+      status: { ...baseConfig.status, enabled: false },
+    }
+    const { handle: h, status, mcp } = await startEnabledWithStatus(cfg)
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'PreToolUse',
+        session_id: 's1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+        tool_name: 'Read',
+        tool_use_id: 'u1',
+        tool_input: { file_path: '/x/y.ts' },
+      }),
+    })
+    expect(resp.status).toBe(200)
+    const body = (await resp.json()) as Record<string, unknown>
+    expect(body.status).toBe('accepted')
+    expect(body.note).toBe('status_disabled')
+    expect(status.calls.length).toBe(0)
+    expect(mcp.calls.length).toBe(0)
+  })
+
+  test('message payload path is unchanged when statusManager is wired', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const { handle: h, mcp, status } = await startEnabledWithStatus(enabledConfig())
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ message: 'legacy hello', chatId: 164795011 }),
+    })
+    expect(resp.status).toBe(200)
+    expect(mcp.calls.length).toBe(1)
+    expect(status.calls.length).toBe(0)
   })
 })

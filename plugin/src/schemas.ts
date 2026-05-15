@@ -62,11 +62,132 @@ export const StatusArgsSchema = z.object({
 })
 export type StatusArgs = z.infer<typeof StatusArgsSchema>
 
-// Webhook payload for /hooks/agent
-export const WebhookPayloadSchema = z.object({
+// Webhook payload for /hooks/agent — message variant.
+// Today's `/hooks/agent` callers post `{ message, chatId, agentId? }` and the
+// server forwards content as a channel notification (gateway.py:3531-3589 path).
+export const WebhookMessagePayloadSchema = z.object({
   message: z.string().min(1).max(64 * 1024),
   chatId: z.union([z.number(), z.string()]).transform((v) => String(v)),
   agentId: z.string().optional(),
+})
+export type WebhookMessagePayload = z.infer<typeof WebhookMessagePayloadSchema>
+
+// Common fields every Claude Code hook payload carries. Claude doesn't know
+// which Telegram chat to update, so the plugin requires `chatId` as part of
+// the same envelope — same gate as the message variant.
+const ClaudeHookCommonShape = {
+  chatId: z.union([z.number(), z.string()]).transform((v) => String(v)),
+  agentId: z.string().optional(),
+  session_id: z.string().min(1),
+  transcript_path: z.string().min(1),
+  cwd: z.string().min(1),
+  permission_mode: z.string().optional(),
+  agent_id: z.string().optional(),
+  agent_type: z.string().optional(),
+} as const
+
+// Tool input is an opaque record per Claude hook spec; renderer reads explicit
+// keys only and never embeds the raw object. `passthrough` keeps unknown
+// fields from Claude (Bash `description`, `run_in_background`, etc.) usable
+// downstream without forcing schema churn on every Claude version bump.
+const ToolInputSchema = z.record(z.unknown())
+
+export const ClaudePreToolUseSchema = z
+  .object({
+    ...ClaudeHookCommonShape,
+    hook_event_name: z.literal('PreToolUse'),
+    tool_name: z.string().min(1),
+    tool_use_id: z.string().min(1),
+    tool_input: ToolInputSchema,
+  })
+  .passthrough()
+
+export const ClaudePostToolUseSchema = z
+  .object({
+    ...ClaudeHookCommonShape,
+    hook_event_name: z.literal('PostToolUse'),
+    tool_name: z.string().min(1),
+    tool_use_id: z.string().min(1),
+    tool_input: ToolInputSchema,
+    tool_result: z.unknown().optional(),
+  })
+  .passthrough()
+
+export const ClaudeStopSchema = z
+  .object({
+    ...ClaudeHookCommonShape,
+    hook_event_name: z.literal('Stop'),
+    effort: z.unknown().optional(),
+  })
+  .passthrough()
+
+export const ClaudeUserPromptSubmitSchema = z
+  .object({
+    ...ClaudeHookCommonShape,
+    hook_event_name: z.literal('UserPromptSubmit'),
+    // We require prompt to validate Claude's contract but the renderer must
+    // never display it (private to the user → leaking into Telegram would
+    // double-broadcast the question that triggered the agent).
+    prompt: z.string(),
+  })
+  .passthrough()
+
+export const ClaudeSessionStartSchema = z
+  .object({
+    ...ClaudeHookCommonShape,
+    hook_event_name: z.literal('SessionStart'),
+    source: z.enum(['startup', 'resume', 'clear', 'compact']).optional(),
+    model: z.string().optional(),
+  })
+  .passthrough()
+
+export const ClaudeHookPayloadSchema = z.discriminatedUnion('hook_event_name', [
+  ClaudePreToolUseSchema,
+  ClaudePostToolUseSchema,
+  ClaudeStopSchema,
+  ClaudeUserPromptSubmitSchema,
+  ClaudeSessionStartSchema,
+])
+export type ClaudeHookPayload = z.infer<typeof ClaudeHookPayloadSchema>
+
+// Unified webhook payload. Transform tags the variant so `server.ts` can
+// branch without re-sniffing fields.
+//
+// Discriminator: presence of `hook_event_name` selects the Claude hook
+// schema; everything else falls through to message. We pre-check at the
+// schema boundary instead of relying on `z.union` evaluation order — the
+// message schema has very permissive optional fields, so a payload like
+// `{ message, chatId, hook_event_name }` would otherwise match message
+// first and silently drop the hook fields (review §3).
+export const WebhookPayloadSchema = z.preprocess(
+  (raw) => raw,
+  z.unknown(),
+).transform((value, ctx) => {
+  // Empty / non-object payloads fall through to message validation so the
+  // existing "missing required" 400 path still fires with a helpful summary.
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    const parsed = WebhookMessagePayloadSchema.safeParse(value)
+    if (!parsed.success) {
+      for (const issue of parsed.error.issues) ctx.addIssue(issue)
+      return z.NEVER
+    }
+    return { kind: 'message' as const, ...parsed.data }
+  }
+  const obj = value as Record<string, unknown>
+  if (typeof obj.hook_event_name === 'string') {
+    const parsed = ClaudeHookPayloadSchema.safeParse(obj)
+    if (!parsed.success) {
+      for (const issue of parsed.error.issues) ctx.addIssue(issue)
+      return z.NEVER
+    }
+    return { kind: 'claude_hook' as const, ...parsed.data }
+  }
+  const parsed = WebhookMessagePayloadSchema.safeParse(obj)
+  if (!parsed.success) {
+    for (const issue of parsed.error.issues) ctx.addIssue(issue)
+    return z.NEVER
+  }
+  return { kind: 'message' as const, ...parsed.data }
 })
 export type WebhookPayload = z.infer<typeof WebhookPayloadSchema>
 

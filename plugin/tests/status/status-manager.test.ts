@@ -427,3 +427,251 @@ describe('StatusManager.activeChatIds', () => {
     expect(ids).toEqual(['164795011', '200'])
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 7 / T3: recordActivityByChatId — Claude hook integration.
+// ─────────────────────────────────────────────────────────────────────
+
+describe('StatusManager.recordActivityByChatId', () => {
+  test('PreToolUse on existing status renders activity block edit', async () => {
+    const { mgr, api } = makeManager()
+    await mgr.start('164795011', undefined)
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_start',
+      toolName: 'Bash',
+      toolInput: { command: 'bun test' },
+      toolUseId: 'u1',
+    })
+    const edits = api.calls.filter((c) => c.kind === 'edit')
+    const last = edits[edits.length - 1]!
+    expect(last.text).toContain('<pre>')
+    expect(last.text).toContain('working --')
+    // Humanized line: Bash non-curl/git/read → `running: <code>cmd</code>`
+    expect(last.text).toContain('running: <code>bun test</code>')
+  })
+
+  test('SessionStart with no active status opens one without reply_to', async () => {
+    const { mgr, api } = makeManager()
+    await mgr.recordActivityByChatId('164795011', { kind: 'session_start' })
+    const sends = api.calls.filter((c) => c.kind === 'send')
+    expect(sends.length).toBe(1)
+    expect(sends[0]!.chatId).toBe('164795011')
+    const opts = sends[0]!.opts as { reply_to_message_id?: number }
+    expect(opts.reply_to_message_id).toBeUndefined()
+    expect(mgr.isActive('164795011')).toBe(true)
+  })
+
+  test('Stop calls complete() and stops timers', async () => {
+    const { mgr, api } = makeManager()
+    await mgr.start('164795011', undefined)
+    await mgr.recordActivityByChatId('164795011', { kind: 'session_stop' })
+    expect(mgr.isActive('164795011')).toBe(false)
+    // delete_on_complete=true by default → expect one delete call.
+    const deletes = api.calls.filter((c) => c.kind === 'delete')
+    expect(deletes.length).toBe(1)
+  })
+
+  test('Agent PreToolUse renders immediately even within throttle window', async () => {
+    const { mgr, api, clock } = makeManager()
+    await mgr.start('164795011', undefined)
+    // First non-Agent record sets lastToolRenderAt.
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_start',
+      toolName: 'Bash',
+      toolInput: { command: 'echo hi' },
+      toolUseId: 'u1',
+    })
+    const beforeAgent = api.calls.filter((c) => c.kind === 'edit').length
+    // Within 5 s — non-Agent would NOT trigger an edit. Agent must.
+    clock.advance(100)
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_start',
+      toolName: 'Agent',
+      toolInput: { subagent_type: 'researcher' },
+      toolUseId: 'u2',
+    })
+    const afterAgent = api.calls.filter((c) => c.kind === 'edit').length
+    expect(afterAgent).toBeGreaterThan(beforeAgent)
+    const last = api.calls.filter((c) => c.kind === 'edit').pop()!
+    // Humanized Agent line uses SUBAGENT_LABELS map for `researcher`.
+    expect(last.text).toContain('<b>searching and verifying sources</b>')
+  })
+
+  test('Non-Agent PreToolUse within 5s is recorded but not re-rendered', async () => {
+    // Use a very long interval_ms so the dot-animation ticker doesn't add
+    // noise edits between our two record calls.
+    const config = makeConfig({ interval_ms: 100_000_000 })
+    const { mgr, api, clock } = makeManager({ config })
+    await mgr.start('164795011', undefined)
+    // First non-Agent renders immediately (sentinel → past threshold).
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_start',
+      toolName: 'Bash',
+      toolInput: { command: 'one' },
+      toolUseId: 'u1',
+    })
+    const editsAfterFirst = api.calls.filter((c) => c.kind === 'edit').length
+    // Second one within 5 s — throttled, no new edit.
+    clock.advance(2000)
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_start',
+      toolName: 'Bash',
+      toolInput: { command: 'two' },
+      toolUseId: 'u2',
+    })
+    expect(api.calls.filter((c) => c.kind === 'edit').length).toBe(editsAfterFirst)
+    // PostToolUse (reasoning flip) flushes the buffer — must include `two`.
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_end',
+      toolName: 'Bash',
+      toolInput: { command: 'two' },
+      toolUseId: 'u2',
+    })
+    const lastEdit = api.calls.filter((c) => c.kind === 'edit').pop()!
+    // Humanized: Bash non-curl/git/read → `running: <code>two</code>`
+    expect(lastEdit.text).toContain('running: <code>two</code>')
+    expect(lastEdit.text).toContain('reasoning...')
+  })
+
+  test('UserPromptSubmit flips phase to reasoning and renders', async () => {
+    const { mgr, api } = makeManager()
+    await mgr.start('164795011', undefined)
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_start',
+      toolName: 'Bash',
+      toolInput: { command: 'ls /' },
+      toolUseId: 'u1',
+    })
+    await mgr.recordActivityByChatId('164795011', { kind: 'reasoning' })
+    const last = api.calls.filter((c) => c.kind === 'edit').pop()!
+    expect(last.text).toContain('reasoning...')
+  })
+
+  test('mid-render does not leak raw prompt text through ActivityEvent', async () => {
+    const { mgr, api } = makeManager()
+    // session_start with no prior status → opens. Then a reasoning event
+    // shouldn't carry any user prompt body because the mapping drops it.
+    await mgr.recordActivityByChatId('164795011', { kind: 'session_start' })
+    await mgr.recordActivityByChatId('164795011', { kind: 'reasoning' })
+    const everything = api.calls.map((c) => c.text ?? '').join('\n')
+    expect(everything).not.toContain('prompt')
+    expect(everything).toContain('working --')
+  })
+
+  test('Buffer enforces ACTIVITY_MAX_BUFFER (10) — older shifted out', async () => {
+    const { mgr, api, clock } = makeManager()
+    await mgr.start('164795011', undefined)
+    // Push 12 Agent calls — Agent always renders, so we exercise the path
+    // where the buffer caps and the renderer still shows +N earlier.
+    for (let i = 0; i < 12; i++) {
+      await mgr.recordActivityByChatId('164795011', {
+        kind: 'tool_start',
+        toolName: 'Agent',
+        toolInput: { subagent_type: `subagent-${i}` },
+        toolUseId: `u${i}`,
+      })
+      clock.advance(1)
+    }
+    const last = api.calls.filter((c) => c.kind === 'edit').pop()!
+    // 12 pushed, buffer capped at 10 → 0 and 1 evicted, 2..11 retained.
+    // Use unique trailing suffix to avoid substring overlap with -10/-11.
+    expect(last.text).not.toMatch(/subagent-0[^0-9]/)
+    expect(last.text).not.toMatch(/subagent-1[^0-9]/)
+    expect(last.text).toContain('subagent-11')
+    expect(last.text).toContain('subagent-10')
+    // Renderer window is 5 → "+N earlier" line appears (10 retained, 5 shown).
+    expect(last.text).toContain('earlier')
+  })
+
+  test('Visibility failure during lazy-open is swallowed', async () => {
+    const { mgr, api } = makeManager()
+    api.failEditWith = new Error('sendMessage simulated fail')
+    // Force sendMessage to throw by overriding the api's send method.
+    const origSend = api.api.sendMessage
+    api.api.sendMessage = async () => {
+      throw new Error('telegram down')
+    }
+    // Must not throw.
+    await mgr.recordActivityByChatId('164795011', { kind: 'session_start' })
+    // No active status created → no further calls succeed silently.
+    expect(mgr.isActive('164795011')).toBe(false)
+    api.api.sendMessage = origSend
+  })
+
+  test('Agent tool_result is masked at store time (regression §7)', async () => {
+    // The activity buffer must never hold an unmasked secret-shaped string.
+    // Pre-fix: raw tool_result lived in `activityCalls[idx].detail` until
+    // render. Verify by triggering tool_end with a long token in toolResult
+    // and inspecting the subsequent edit text — the masked summary must
+    // appear in the very next render (proving the buffer already held it).
+    const { mgr, clock, api } = makeManager()
+    await mgr.start('164795011', undefined)
+
+    // Pair: PreToolUse with toolUseId → PostToolUse with same id.
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_start',
+      toolName: 'Agent',
+      toolInput: { subagent_type: 'researcher' },
+      toolUseId: 'agent-1',
+    })
+
+    const longToken = `abcd${'x'.repeat(20)}wxyz` // matches generic-long rule
+    clock.advance(100)
+    const editsBefore = api.calls.filter((c) => c.kind === 'edit').length
+    await mgr.recordActivityByChatId('164795011', {
+      kind: 'tool_end',
+      toolName: 'Agent',
+      toolInput: { subagent_type: 'researcher' },
+      toolUseId: 'agent-1',
+      toolResult: longToken,
+    })
+    const editsAfter = api.calls.filter((c) => c.kind === 'edit')
+    expect(editsAfter.length).toBeGreaterThan(editsBefore)
+    const lastEdit = editsAfter[editsAfter.length - 1]!
+    // Token must not appear anywhere in the rendered text; the masked
+    // form (abcd***wxyz) confirms maskSecrets ran before store.
+    expect(lastEdit.text).not.toContain(longToken)
+    expect(lastEdit.text).toContain('abcd***wxyz')
+  })
+
+  test('Non-Agent throttle + buffer overflow interaction (coverage gap §3)', async () => {
+    // Fire 12 Bash calls in quick succession. First non-Agent always renders
+    // (sentinel `Number.NEGATIVE_INFINITY`); subsequent calls within the
+    // 5 s throttle are buffered without an extra edit. Buffer cap is 10 →
+    // calls 0 and 1 evict; render window is 5 → on the eventual flush the
+    // edit shows the most recent 5 + a `+5 earlier` summary (10 buffered − 5
+    // shown). Flush via a `reasoning` event since it always renders.
+    const config = makeConfig({ interval_ms: 100_000_000 })
+    const { mgr, api, clock } = makeManager({ config })
+    await mgr.start('164795011', undefined)
+
+    const editsAtStart = api.calls.filter((c) => c.kind === 'edit').length
+    for (let i = 0; i < 12; i++) {
+      await mgr.recordActivityByChatId('164795011', {
+        kind: 'tool_start',
+        toolName: 'Bash',
+        toolInput: { command: `cmd-${i.toString().padStart(2, '0')}` },
+        toolUseId: `u${i}`,
+      })
+      // Stay well within the 5 s throttle window so only the first renders.
+      clock.advance(100)
+    }
+    // Only the first Bash should have triggered an edit (sentinel render);
+    // remaining 11 were throttled.
+    const editsAfterTools = api.calls.filter((c) => c.kind === 'edit').length
+    expect(editsAfterTools - editsAtStart).toBe(1)
+
+    // Flush via reasoning event → always renders.
+    await mgr.recordActivityByChatId('164795011', { kind: 'reasoning' })
+    const last = api.calls.filter((c) => c.kind === 'edit').pop()!
+    // Buffer kept the last 10 (cmd-02..cmd-11). Renderer window is 5 →
+    // show cmd-07..cmd-11 + a `+5 earlier` line (10 buffered − 5 shown).
+    expect(last.text).toContain('+5 earlier')
+    expect(last.text).toContain('cmd-11')
+    expect(last.text).toContain('cmd-07')
+    // cmd-00 and cmd-01 evicted; cmd-02..cmd-06 in the +5 collapse.
+    expect(last.text).not.toContain('cmd-00')
+    expect(last.text).not.toContain('cmd-01')
+    expect(last.text).not.toContain('cmd-06')
+  })
+})
