@@ -184,7 +184,6 @@ tasks:
       - "Either a safe smoke-test receipt or a blocked receipt naming the missing host/operator evidence."
       - "Next migration slice recommendation after smoke evidence."
     receipt: null
-    receipt: null
   - id: T999
     type: judge
     assignee: Judge
