@@ -743,3 +743,242 @@ describe('POST /hooks/agent — Claude hook payload branch', () => {
     expect(status.calls.length).toBe(0)
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 8 / T7: memoryWriter dispatch in claude_hook branch.
+// ─────────────────────────────────────────────────────────────────────
+
+interface MemoryStubCall { hook: string; chatId: string; raw: unknown }
+function makeMemoryStub(opts: { throws?: boolean } = {}): {
+  writer: { onHook: (p: unknown) => Promise<void> }
+  calls: MemoryStubCall[]
+} {
+  const calls: MemoryStubCall[] = []
+  return {
+    writer: {
+      onHook: async (p: unknown) => {
+        const obj = p as { hook_event_name?: string; chatId?: string }
+        calls.push({
+          hook: obj.hook_event_name ?? '',
+          chatId: obj.chatId ?? '',
+          raw: p,
+        })
+        if (opts.throws) throw new Error('memory disk full')
+      },
+    },
+    calls,
+  }
+}
+
+function withMemoryEnabled(cfg: AppConfig, opts: { enabled?: boolean } = {}): AppConfig {
+  return {
+    ...cfg,
+    memory: {
+      enabled: opts.enabled ?? true,
+      workspace_path: '/tmp/dashi-test-workspace',
+      source_tag: 'tg',
+      max_hot_bytes: 20480,
+      trim_keep_lines: 600,
+      buffer_ttl_ms: 5 * 60 * 1000,
+      buffer_max_entries: 100,
+    },
+  }
+}
+
+describe('POST /hooks/agent — memoryWriter branch (Phase 8 T7)', () => {
+  test('UserPromptSubmit with memoryWriter wired: writer.onHook called, status no-op', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const mcp = makeMcpStub()
+    const status = makeStatusStub()
+    const memory = makeMemoryStub()
+    const cfg = withMemoryEnabled(enabledConfig())
+    const h = await startWebhookServer(cfg, {
+      mcpServer: mcp.server,
+      config: cfg,
+      statePaths: paths,
+      log: createLogger('test'),
+      statusManager: status.manager,
+      memoryWriter: memory.writer as never,
+    })
+    if (!h) throw new Error('expected handle')
+    handle = h
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 'sid-1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+        prompt: 'secret prompt body',
+      }),
+    })
+    expect(resp.status).toBe(200)
+    expect(memory.calls.length).toBe(1)
+    expect(memory.calls[0]!.hook).toBe('UserPromptSubmit')
+    expect(memory.calls[0]!.chatId).toBe('164795011')
+    // Status STILL fires (it owns Telegram visibility) — memory is sibling, not replacement.
+    expect(status.calls.length).toBe(1)
+    expect(mcp.calls.length).toBe(0)
+  })
+
+  test('Stop with memoryWriter wired: writer.onHook called', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const mcp = makeMcpStub()
+    const status = makeStatusStub()
+    const memory = makeMemoryStub()
+    const cfg = withMemoryEnabled(enabledConfig())
+    const h = await startWebhookServer(cfg, {
+      mcpServer: mcp.server,
+      config: cfg,
+      statePaths: paths,
+      log: createLogger('test'),
+      statusManager: status.manager,
+      memoryWriter: memory.writer as never,
+    })
+    if (!h) throw new Error('expected handle')
+    handle = h
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'Stop',
+        session_id: 'sid-1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+      }),
+    })
+    expect(resp.status).toBe(200)
+    expect(memory.calls.length).toBe(1)
+    expect(memory.calls[0]!.hook).toBe('Stop')
+  })
+
+  test('memoryWriter throwing → 200 still returned, error logged, status still fires', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const mcp = makeMcpStub()
+    const status = makeStatusStub()
+    const memory = makeMemoryStub({ throws: true })
+    const cfg = withMemoryEnabled(enabledConfig())
+    const h = await startWebhookServer(cfg, {
+      mcpServer: mcp.server,
+      config: cfg,
+      statePaths: paths,
+      log: createLogger('test'),
+      statusManager: status.manager,
+      memoryWriter: memory.writer as never,
+    })
+    if (!h) throw new Error('expected handle')
+    handle = h
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'Stop',
+        session_id: 'sid-1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+      }),
+    })
+    expect(resp.status).toBe(200)
+    expect(memory.calls.length).toBe(1)
+    // Status branch still runs after memory throw.
+    expect(status.calls.length).toBe(1)
+  })
+
+  test('memoryWriter undefined: 200 returned, no-op (other branches unaffected)', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    // No memoryWriter passed — using existing startEnabledWithStatus.
+    const { handle: h, status } = await startEnabledWithStatus(enabledConfig())
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'Stop',
+        session_id: 'sid-1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+      }),
+    })
+    expect(resp.status).toBe(200)
+    expect(status.calls.length).toBe(1)
+  })
+
+  test('config.memory.enabled=false + memoryWriter present: writer NOT called', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const mcp = makeMcpStub()
+    const status = makeStatusStub()
+    const memory = makeMemoryStub()
+    // memory.enabled=false despite writer being present — the runtime
+    // gate in webhook/server.ts must skip the dispatch.
+    const cfg = withMemoryEnabled(enabledConfig(), { enabled: false })
+    const h = await startWebhookServer(cfg, {
+      mcpServer: mcp.server,
+      config: cfg,
+      statePaths: paths,
+      log: createLogger('test'),
+      statusManager: status.manager,
+      memoryWriter: memory.writer as never,
+    })
+    if (!h) throw new Error('expected handle')
+    handle = h
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'Stop',
+        session_id: 'sid-1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+      }),
+    })
+    expect(resp.status).toBe(200)
+    expect(memory.calls.length).toBe(0)
+  })
+
+  test('memoryWriter does NOT fire on message-variant payload (only claude_hook branch)', async () => {
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const mcp = makeMcpStub()
+    const memory = makeMemoryStub()
+    const cfg = withMemoryEnabled(enabledConfig())
+    const h = await startWebhookServer(cfg, {
+      mcpServer: mcp.server,
+      config: cfg,
+      statePaths: paths,
+      log: createLogger('test'),
+      memoryWriter: memory.writer as never,
+    })
+    if (!h) throw new Error('expected handle')
+    handle = h
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ message: 'plain message', chatId: 164795011 }),
+    })
+    expect(resp.status).toBe(200)
+    expect(memory.calls.length).toBe(0)
+    expect(mcp.calls.length).toBe(1)
+  })
+})

@@ -36,6 +36,8 @@ import {
   type ToolDeps,
 } from './channel/tools.js'
 import { StatusManager } from './status/status-manager.js'
+import { MemoryWriter, type MemoryConfig } from './memory/writer.js'
+import { dirname as pathDirname } from 'path'
 import {
   createPendingMap,
   createPermissionRelayHooks,
@@ -239,6 +241,38 @@ const mcp = new Server(
 // message we edit while Claude is composing a reply. The handler opens it
 // on inbound delivery; the reply tool closes it on successful send.
 const statusManager = new StatusManager({ telegramApi, config, log })
+
+// Phase 8 / T7: MemoryWriter persists turns to <workspace>/core/hot/recent.md
+// and <workspace_parent>/logs/verbose-YYYY-MM-DD.jsonl. Only instantiated
+// when config.memory.enabled === true AND workspace_path is set — schema
+// refine already guarantees the second condition when enabled is true, but
+// the explicit check keeps the runtime gate symmetric with the webhook
+// branch in webhook/server.ts.
+let memoryWriter: MemoryWriter | undefined
+if (config.memory.enabled === true && config.memory.workspace_path !== undefined) {
+  const memCfg: MemoryConfig = {
+    workspacePath: config.memory.workspace_path,
+    // Default logs dir is sibling of workspace ('<parent>/logs/'), mirroring
+    // gateway.py:2010 (`Path(workspace).parent / "logs"`).
+    logsPath: config.memory.logs_path ?? join(pathDirname(config.memory.workspace_path), 'logs'),
+    sourceTag: config.memory.source_tag,
+    // Agent label preference: explicit memory.agent_label > 'Agent' fallback.
+    // Telegram bot username is not used here because it's typically the
+    // assistant's tool-handle (e.g. 'fridayhumanbot') rather than the
+    // human-readable agent name ('Silvana') that goes into recent.md.
+    agentLabel: config.memory.agent_label ?? 'Agent',
+    maxHotBytes: config.memory.max_hot_bytes,
+    trimKeepLines: config.memory.trim_keep_lines,
+    bufferTtlMs: config.memory.buffer_ttl_ms,
+    bufferMaxEntries: config.memory.buffer_max_entries,
+  }
+  memoryWriter = new MemoryWriter(memCfg, log)
+  log.info('memory writer enabled', {
+    workspace: memCfg.workspacePath,
+    logs: memCfg.logsPath,
+    agent: memCfg.agentLabel,
+  })
+}
 
 const toolDeps: ToolDeps = {
   config,
@@ -482,6 +516,7 @@ try {
     statePaths,
     log,
     statusManager,
+    ...(memoryWriter !== undefined ? { memoryWriter } : {}),
   })
 } catch (err) {
   log.error('webhook server failed to start', {

@@ -24,6 +24,7 @@ import { writeDeadLetter } from '../state/store.js'
 import { WebhookPayloadSchema, type WebhookPayload } from '../schemas.js'
 import { sendChannelNotification, normalizeMeta } from '../channel/notify.js'
 import { toActivityEvent } from '../hooks/claude-events.js'
+import type { MemoryWriter } from '../memory/writer.js'
 
 const BODY_LIMIT_BYTES = 256 * 1024
 const DEFAULT_AGENT_ID = 'dashi-channel'
@@ -47,6 +48,10 @@ export interface WebhookDeps {
   // status update happens. The 200 path stays open so Claude hooks never
   // back-pressure on visibility outages.
   statusManager?: StatusManagerForWebhook
+  // Phase 8: optional memory writer. Receives a sibling dispatch of every
+  // hook payload (UserPromptSubmit buffers, Stop writes recent.md +
+  // verbose.jsonl). Throws are caught and logged — never block the 200.
+  memoryWriter?: MemoryWriter
 }
 
 export interface WebhookServerHandle {
@@ -169,7 +174,7 @@ async function handleRequest(
   deps: WebhookDeps,
   webhookToken: string | undefined,
 ): Promise<void> {
-  const { config, statePaths, log, mcpServer, statusManager } = deps
+  const { config, statePaths, log, mcpServer, statusManager, memoryWriter } = deps
   const method = req.method ?? 'GET'
   const url = req.url ?? '/'
 
@@ -267,6 +272,20 @@ async function handleRequest(
   // Branch on payload variant. Discriminator was set by the Zod transform
   // so we don't have to re-sniff fields here.
   if (payload.kind === 'claude_hook') {
+    // Phase 8: dispatch to memory writer first, BEFORE the status branch,
+    // so memory persistence runs regardless of status.enabled. Errors are
+    // logged and swallowed — memory must never back-pressure the 200.
+    if (config.memory.enabled && memoryWriter) {
+      try {
+        await memoryWriter.onHook(payload)
+      } catch (err) {
+        log.warn('[memory] writer error (ignored)', {
+          hook: payload.hook_event_name,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
+
     // PLAN.md:173 — when config.status.enabled=false the hook path must
     // be a no-op. We accept the request (200) so Claude hooks don't
     // back-pressure on a disabled visibility surface, but skip dispatch
