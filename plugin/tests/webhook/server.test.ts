@@ -897,6 +897,64 @@ describe('POST /hooks/agent — memoryWriter branch (Phase 8 T7)', () => {
     expect(status.calls.length).toBe(1)
   })
 
+  test('memoryWriter throw is logged via log.warn with [memory] prefix (review LOW)', async () => {
+    // Pre-fix: the swallow-and-200 contract was correct, but there was
+    // no test that the error actually surfaced as a warn-level log line
+    // — silent loss of writer errors would defeat operator triage.
+    // Capture the logger stream and assert a `[memory]` prefix line was
+    // written. Mirrors the silent-stream pattern used in other webhook /
+    // status-manager tests, but accumulates instead of dropping.
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const captured: string[] = []
+    const capturingLog = createLogger('test', {
+      stream: {
+        write: (chunk: string | Buffer): boolean => {
+          captured.push(typeof chunk === 'string' ? chunk : chunk.toString('utf8'))
+          return true
+        },
+      } as unknown as NodeJS.WritableStream,
+    })
+
+    const mcp = makeMcpStub()
+    const status = makeStatusStub()
+    const memory = makeMemoryStub({ throws: true })
+    const cfg = withMemoryEnabled(enabledConfig())
+    const h = await startWebhookServer(cfg, {
+      mcpServer: mcp.server,
+      config: cfg,
+      statePaths: paths,
+      log: capturingLog,
+      statusManager: status.manager,
+      memoryWriter: memory.writer as never,
+    })
+    if (!h) throw new Error('expected handle')
+    handle = h
+
+    const resp = await fetch(url(h, '/hooks/agent'), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${WEBHOOK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chatId: 164795011,
+        hook_event_name: 'Stop',
+        session_id: 'sid-1',
+        transcript_path: '/tmp/t.jsonl',
+        cwd: '/tmp',
+      }),
+    })
+    expect(resp.status).toBe(200)
+
+    // At least one [warn] line containing the [memory] prefix must
+    // appear. The throwing stub message ('memory disk full') should
+    // also be embedded so the operator can grep it.
+    const joined = captured.join('')
+    expect(joined).toMatch(/\[warn\]/)
+    expect(joined).toContain('[memory]')
+    expect(joined).toContain('memory disk full')
+  })
+
   test('memoryWriter undefined: 200 returned, no-op (other branches unaffected)', async () => {
     process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
     // No memoryWriter passed — using existing startEnabledWithStatus.
