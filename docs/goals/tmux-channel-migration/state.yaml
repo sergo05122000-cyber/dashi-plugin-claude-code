@@ -63,7 +63,7 @@ visual_board:
     command: "npx goalbuddy extend github-projects"
     missing: []
 
-active_task: T014
+active_task: T015
 
 tasks:
   - id: T001
@@ -691,7 +691,7 @@ tasks:
   - id: T014
     type: pm
     assignee: PM
-    status: active
+    status: done
     reasoning_hint: medium
     objective: "Wait for host-level Claude auth and tmux access so the canary ACK consumer can be safely replaced by the verified fallback bridge."
     inputs:
@@ -705,13 +705,69 @@ tasks:
     expected_output:
       - "Host-level auth/tmux evidence."
       - "Safe replacement of `orgrimmar-canary` ACK session only, or a blocked receipt if host access remains unavailable."
+    receipt:
+      result: done
+      summary: "Host-level checks resolved the sandbox blockers. Claude auth is logged in on the host, a `claude --print` probe succeeds with `--max-budget-usd 0.20`, and host tmux access confirmed that the old `orgrimmar-canary` pane was the ACK poller. The ACK session was stopped and replaced with the canary-only Claude fallback bridge in the same tmux session name, preserving one-token-one-consumer."
+      commands:
+        - cmd: "claude auth status"
+          status: pass
+          note: "Host-level check reported `loggedIn: true`, `authMethod: claude.ai`, `apiProvider: firstParty`, `subscriptionType: max`."
+        - cmd: "claude --print --max-budget-usd 0.01 -- 'Respond with exactly: fallback-auth-probe'"
+          status: blocked
+          note: "Claude Code budget gate reported `Exceeded USD budget (0.01)`."
+        - cmd: "claude --print --max-budget-usd 0.05 -- 'Respond with exactly: fallback-auth-probe'"
+          status: blocked
+          note: "Claude Code budget gate reported `Exceeded USD budget (0.05)`."
+        - cmd: "claude --print --max-budget-usd 0.20 -- 'Respond with exactly: fallback-auth-probe'"
+          status: pass
+          note: "Returned `fallback-auth-probe`."
+        - cmd: "tmux list-panes -t orgrimmar-canary -F '#{pane_current_command} #{pane_start_command}'"
+          status: pass
+          note: "Before replacement, the pane command was the ACK canary runner without `--reply-mode claude`."
+        - cmd: "tmux kill-session -t orgrimmar-canary"
+          status: pass
+        - cmd: "tmux new-session -d -s orgrimmar-canary -c /Users/jasonqwwen/qwwiwi-channel-telegram-Claude-code 'env DASHI_CHANNEL_RUNTIME_ROOT=/Users/jasonqwwen/.claude-lab/shared/channel-runtime PYTHONUNBUFFERED=1 scripts/dashi-telegram-canary-bot --reply-mode claude --claude-max-budget-usd 0.20 --poll-timeout 20'"
+          status: pass
+        - cmd: "tmux ls"
+          status: pass
+          note: "`orgrimmar-canary` is present after replacement."
+        - cmd: "tmux list-panes -t orgrimmar-canary -F '#{pane_current_command} #{pane_start_command}'"
+          status: pass
+          note: "After replacement, the pane command includes `--reply-mode claude --claude-max-budget-usd 0.20`."
+        - cmd: "tmux capture-pane -t orgrimmar-canary -p -S -20"
+          status: pass
+          note: "Pane shows the canary runner status line with `status: running`."
+      launched: true
+      running_tmux_session: "orgrimmar-canary"
+      running_mode: "canary-only Claude fallback bridge"
+      remaining_work:
+        - "Operator Telegram smoke test must confirm a Claude-generated reply is received."
+        - "True Claude Code channel/plugin runtime is still not running."
+        - "Production token files, launchd jobs, gateway config, and production tmux sessions remain untouched."
+  - id: T015
+    type: pm
+    assignee: PM
+    status: active
+    reasoning_hint: medium
+    objective: "Capture the operator Telegram smoke-test result for the running canary Claude fallback bridge, then continue true channel/plugin migration planning."
+    inputs:
+      - "Running `orgrimmar-canary` tmux session."
+      - "Operator Telegram message/reply observation."
+      - "T014 receipt."
+    constraints:
+      - "Do not expose the canary Telegram token value."
+      - "Do not start a second canary Telegram poller."
+      - "Do not touch production token files, launchd jobs, gateway config, or production tmux sessions."
+    expected_output:
+      - "Telegram smoke-test evidence: Claude-generated reply, fallback-unavailable reply, or no reply with logs."
+      - "Next true-channel migration task."
     receipt: null
 
 checks:
   dirty_fingerprint: unknown
   last_verification:
-    result: blocked
-    task: T013
+    result: pass
+    task: T014
     commands:
       - "python3 -m unittest tests.test_dashi_channel_supervisor -v"
       - "python3 -m py_compile scripts/dashi-channel-supervisor"
@@ -730,3 +786,6 @@ checks:
       - "git diff --check"
       - "claude auth status"
       - "tmux ls"
+      - "claude --print --max-budget-usd 0.20 -- 'Respond with exactly: fallback-auth-probe'"
+      - "tmux list-panes -t orgrimmar-canary -F '#{pane_current_command} #{pane_start_command}'"
+      - "tmux capture-pane -t orgrimmar-canary -p -S -20"

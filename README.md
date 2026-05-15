@@ -62,7 +62,7 @@ Custom Claude Code **channel plugin** для Telegram — миграция Orgri
 
 ## Status
 
-**WIP, 2026-05-14 PDT:** tmux-first supervisor scaffold implemented; separate canary Telegram smoke bot reached ACK mode in `orgrimmar-canary`, and a canary-only Claude fallback mode now exists in `scripts/dashi-telegram-canary-bot --reply-mode claude`. It is not launched from this sandbox because Claude auth reports logged out and the host tmux socket is not reachable here. Production cutover is not done: true Claude Code channel runtime, billing classification, permission relay, parity, rollback, and operator sign-off remain gated.
+**WIP, 2026-05-14 PDT:** tmux-first supervisor scaffold implemented; separate canary Telegram smoke bot reached ACK mode, then `orgrimmar-canary` was replaced with canary-only Claude fallback mode: `scripts/dashi-telegram-canary-bot --reply-mode claude --claude-max-budget-usd 0.20`. Production cutover is not done: true Claude Code channel runtime, billing classification, permission relay, parity, rollback, and operator sign-off remain gated.
 
 ## Related repos
 
