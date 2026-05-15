@@ -1,0 +1,245 @@
+// Phase 7 / T2 — humanization + rolling activity render.
+
+import { describe, expect, test } from 'bun:test'
+
+import {
+  buildActivityDetail,
+  humanizeTool,
+  maskSecrets,
+  renderActivityBlock,
+  summarizeToolInput,
+  type ActivitySnapshot,
+} from '../../src/status/activity-renderer.js'
+
+describe('maskSecrets', () => {
+  test('masks IPv4 keeping first and last octet', () => {
+    expect(maskSecrets('connect 10.2.3.44 done')).toBe('connect 10.***.***.44 done')
+  })
+
+  test('masks secret paths (direct ~/.foo/secrets/...)', () => {
+    // Python regex `(~/?\.\w+/)secrets/\S+` matches a single dot-prefixed
+    // segment immediately before `secrets/`. Deep paths (e.g.
+    // `~/.claude-lab/silvana/secrets/...`) intentionally fall through to
+    // the generic-long-token rule instead.
+    expect(maskSecrets('~/.config/secrets/openviking.key')).toContain('secrets/***')
+    expect(maskSecrets('~/.config/secrets/openviking.key')).not.toContain('openviking.key')
+  })
+
+  test('masks generic long tokens (≥24 chars)', () => {
+    const tok = `abcd${'x'.repeat(20)}wxyz`
+    const masked = maskSecrets(`bearer ${tok} ok`)
+    expect(masked).not.toContain(tok)
+    expect(masked).toContain('abcd***wxyz')
+  })
+
+  test('does not mangle short identifiers', () => {
+    expect(maskSecrets('short_id=foo')).toBe('short_id=foo')
+  })
+
+  test('masks Telegram bot token (generic-long covers the secret half)', () => {
+    // Python order: IPv4 → secret-paths → generic-long → bot-token. The
+    // generic-long rule consumes the alphanumeric run after the colon
+    // before bot-token can match. Both behaviours mask the secret payload
+    // (`AAH-fake_test_token...`) — verify the secret is gone, regardless
+    // of which rule fired.
+    const tok = '1234567890:AAH-fake_test_token_with_at_least_thirty_chars'
+    const masked = maskSecrets(`Authorization: ${tok}`)
+    expect(masked).not.toContain('AAH-fake_test_token')
+    expect(masked).not.toContain('thirty_chars')
+  })
+
+  test('masks Supabase host project id', () => {
+    const masked = maskSecrets('https://abcdefghij1234567890.supabase.co/rest/v1')
+    expect(masked).not.toContain('abcdefghij1234567890.supabase.co')
+    expect(masked).toContain('*****')
+  })
+})
+
+describe('summarizeToolInput', () => {
+  test('Read returns last two path segments', () => {
+    expect(summarizeToolInput('Read', { file_path: '/a/b/c/server.ts' })).toBe('c/server.ts')
+  })
+
+  test('Read accepts `path` fallback and normalizes backslashes', () => {
+    expect(summarizeToolInput('Read', { path: 'src\\\\foo\\\\bar.ts' })).toBe('foo/bar.ts')
+  })
+
+  test('Bash truncates to 40', () => {
+    const long = 'a'.repeat(80)
+    expect(summarizeToolInput('Bash', { command: long }).length).toBeLessThanOrEqual(40)
+  })
+
+  test('Grep wraps pattern in quotes', () => {
+    expect(summarizeToolInput('Grep', { pattern: 'TODO' })).toBe('&quot;TODO&quot;')
+  })
+
+  test('Agent uses subagent_type', () => {
+    expect(summarizeToolInput('Agent', { subagent_type: 'researcher' })).toBe('researcher')
+  })
+
+  test('WebFetch returns host', () => {
+    expect(summarizeToolInput('WebFetch', { url: 'https://example.com/path?x=1' })).toBe('example.com')
+  })
+
+  test('Unknown tool produces bounded safe summary', () => {
+    const out = summarizeToolInput('Hypothetical', { a: 'one', b: 2, c: false, d: 'longvalue' })
+    expect(out.length).toBeLessThanOrEqual(40)
+    expect(out).toContain('a=one')
+  })
+
+  test('Unknown tool with empty input returns empty string', () => {
+    expect(summarizeToolInput('Hypothetical', {})).toBe('')
+  })
+
+  test('escapes HTML special chars', () => {
+    expect(summarizeToolInput('Bash', { command: '<script>' })).toBe('&lt;script&gt;')
+  })
+})
+
+describe('humanizeTool', () => {
+  test('Bash curl → calling API', () => {
+    expect(humanizeTool('Bash', { command: 'curl https://x' })).toBe('calling API')
+  })
+
+  test('Bash git → git command', () => {
+    expect(humanizeTool('Bash', { command: 'git status --short' })).toBe('git command')
+  })
+
+  test('Bash read-like → reading files', () => {
+    expect(humanizeTool('Bash', { command: 'cat /etc/hosts' })).toBe('reading files')
+  })
+
+  test('Bash other → masked running:', () => {
+    const out = humanizeTool('Bash', { command: 'echo helloworld' })
+    expect(out).toContain('running:')
+    expect(out).toContain('<code>')
+  })
+
+  test('Bash running: truncates to 60 and masks long token', () => {
+    const tok = `abcd${'x'.repeat(20)}wxyz`
+    const out = humanizeTool('Bash', { command: `echo ${tok}` }) ?? ''
+    expect(out).not.toContain(tok)
+  })
+
+  test('Read returns basename only', () => {
+    expect(humanizeTool('Read', { file_path: '/repo/a/b/server.ts' })).toBe('reading <code>server.ts</code>')
+  })
+
+  test('Read without file_path falls back', () => {
+    expect(humanizeTool('Read', {})).toBe('reading file')
+  })
+
+  test('Write, Edit, MultiEdit return creating/editing labels', () => {
+    expect(humanizeTool('Write', { file_path: '/x/y.txt' })).toBe('creating <code>y.txt</code>')
+    expect(humanizeTool('Edit', { file_path: '/x/y.txt' })).toBe('editing <code>y.txt</code>')
+    expect(humanizeTool('MultiEdit', { file_path: '/x/y.txt' })).toBe('editing <code>y.txt</code>')
+  })
+
+  test('Agent uses SUBAGENT_LABELS map', () => {
+    expect(humanizeTool('Agent', { subagent_type: 'researcher' })).toBe(
+      '<b>searching and verifying sources</b>',
+    )
+  })
+
+  test('Agent unknown subagent_type falls back to "running X"', () => {
+    expect(humanizeTool('Agent', { subagent_type: 'mystery' })).toBe('<b>running mystery</b>')
+  })
+
+  test('TodoWrite and unknown tools return null', () => {
+    expect(humanizeTool('TodoWrite', { todos: [] })).toBeNull()
+    expect(humanizeTool('Hypothetical', {})).toBeNull()
+  })
+
+  test('WebSearch wraps query in <i>', () => {
+    expect(humanizeTool('WebSearch', { query: 'latest news' })).toBe(
+      'web search: <i>latest news</i>',
+    )
+  })
+})
+
+describe('renderActivityBlock', () => {
+  const baseStart = 1_000_000_000_000
+
+  test('no calls, reasoning phase, 0s', () => {
+    const snap: ActivitySnapshot = {
+      startedAtMs: baseStart,
+      calls: [],
+      phase: 'reasoning',
+    }
+    const out = renderActivityBlock(snap, baseStart)
+    expect(out).toContain('working -- 0s')
+    expect(out).toContain('reasoning...')
+    expect(out.startsWith('<pre>')).toBe(true)
+    expect(out.endsWith('</pre>')).toBe(true)
+  })
+
+  test('renders last 5 calls with arrow prefix', () => {
+    const snap: ActivitySnapshot = {
+      startedAtMs: baseStart,
+      calls: [
+        { toolName: 'Read', detail: 'read a.ts' },
+        { toolName: 'Read', detail: 'read b.ts' },
+        { toolName: 'Bash', detail: 'bash bun test' },
+      ],
+      phase: 'tool',
+    }
+    const out = renderActivityBlock(snap, baseStart + 12_000)
+    expect(out).toContain('working -- 12s')
+    expect(out).toContain('▸ read a.ts')
+    expect(out).toContain('▸ bash bun test')
+  })
+
+  test('rolling overflow shows +N earlier', () => {
+    const snap: ActivitySnapshot = {
+      startedAtMs: baseStart,
+      calls: [
+        { toolName: 'Bash', detail: 'bash one' },
+        { toolName: 'Bash', detail: 'bash two' },
+        { toolName: 'Bash', detail: 'bash three' },
+        { toolName: 'Grep', detail: 'grep four' },
+        { toolName: 'Read', detail: 'read five' },
+        { toolName: 'Edit', detail: 'edit six' },
+        { toolName: 'Bash', detail: 'bash seven' },
+        { toolName: 'Bash', detail: 'bash eight' },
+      ],
+      phase: 'tool',
+    }
+    const out = renderActivityBlock(snap, baseStart + 25_000)
+    expect(out).toContain('working -- 25s')
+    expect(out).toContain('+3 earlier')
+    expect(out).toContain('▸ bash eight')
+    expect(out).not.toContain('bash one')
+  })
+
+  test('masks secrets in detail before render', () => {
+    const tok = `abcd${'x'.repeat(20)}wxyz`
+    const snap: ActivitySnapshot = {
+      startedAtMs: baseStart,
+      calls: [{ toolName: 'Bash', detail: `bash echo ${tok}` }],
+      phase: 'tool',
+    }
+    const out = renderActivityBlock(snap, baseStart + 1_000)
+    expect(out).not.toContain(tok)
+  })
+
+  test('escapes HTML in <pre> body', () => {
+    const snap: ActivitySnapshot = {
+      startedAtMs: baseStart,
+      calls: [{ toolName: 'Bash', detail: 'bash <script>' }],
+      phase: 'tool',
+    }
+    const out = renderActivityBlock(snap, baseStart)
+    expect(out).toContain('&lt;script&gt;')
+    expect(out).not.toContain('<script>')
+  })
+})
+
+describe('buildActivityDetail', () => {
+  test('lowercases tool name + summary', () => {
+    expect(buildActivityDetail('Bash', { command: 'bun test' })).toBe('bash bun test')
+  })
+
+  test('omits summary if empty', () => {
+    expect(buildActivityDetail('Read', {})).toBe('read')
+  })
+})
