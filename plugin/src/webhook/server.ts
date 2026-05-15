@@ -92,18 +92,20 @@ function reply(res: ServerResponse, status: number, body: Record<string, unknown
 }
 
 function bearerEquals(received: string, expected: string): boolean {
-  // Encode to fixed-length buffers so timingSafeEqual never throws on
-  // length mismatch; length difference is independently checked.
+  // Pad both sides to a single fixed length BEFORE the comparison so we run
+  // the exact same timingSafeEqual call regardless of input lengths — no
+  // length-conditional code path that could leak a length bit (review M4).
+  // Final result combines the constant-time byte-compare with an explicit
+  // length-equality bit, so mismatched lengths still return false.
   const a = Buffer.from(received)
   const b = Buffer.from(expected)
-  if (a.length !== b.length) {
-    // Still run a constant-time compare on equal-length padded buffers so
-    // the failure path runs the same code; the length check is its own bit.
-    const pad = Buffer.alloc(b.length)
-    timingSafeEqual(pad, b)
-    return false
-  }
-  return timingSafeEqual(a, b)
+  const max = Math.max(a.length, b.length, 32)
+  const padA = Buffer.alloc(max)
+  const padB = Buffer.alloc(max)
+  a.copy(padA)
+  b.copy(padB)
+  const bytesEqual = timingSafeEqual(padA, padB)
+  return bytesEqual && a.length === b.length
 }
 
 // Drain request body up to BODY_LIMIT_BYTES + 1. We return early as soon

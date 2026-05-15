@@ -228,6 +228,26 @@ describe('POST /hooks/agent', () => {
     expect(resp.status).toBe(401)
   })
 
+  test('bearer of different length returns 401 (no length-leak path) (M4)', async () => {
+    // After the M4 fix bearerEquals pads both sides to the same fixed
+    // length and combines the byte-compare with an explicit length-equality
+    // bit. Differing-length tokens — both shorter and longer than the
+    // configured one — must still produce 401 cleanly.
+    process.env.TELEGRAM_WEBHOOK_TOKEN = WEBHOOK_TOKEN
+    const { handle: h } = await startEnabled(enabledConfig())
+    for (const token of ['short', `${WEBHOOK_TOKEN}_with_extra_tail`, '']) {
+      const resp = await fetch(url(h, '/hooks/agent'), {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ message: 'x', chatId: 164795011 }),
+      })
+      expect(resp.status).toBe(401)
+    }
+  })
+
   test('without configured token returns 503', async () => {
     // No env token set => any auth fails with 503 (gateway.py:3535-3537 parity).
     const { handle: h } = await startEnabled(enabledConfig())
