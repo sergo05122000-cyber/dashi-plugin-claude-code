@@ -446,7 +446,8 @@ describe('StatusManager.recordActivityByChatId', () => {
     const last = edits[edits.length - 1]!
     expect(last.text).toContain('<pre>')
     expect(last.text).toContain('working --')
-    expect(last.text).toContain('bash bun test')
+    // Humanized line: Bash non-curl/git/read → `running: <code>cmd</code>`
+    expect(last.text).toContain('running: <code>bun test</code>')
   })
 
   test('SessionStart with no active status opens one without reply_to', async () => {
@@ -492,7 +493,8 @@ describe('StatusManager.recordActivityByChatId', () => {
     const afterAgent = api.calls.filter((c) => c.kind === 'edit').length
     expect(afterAgent).toBeGreaterThan(beforeAgent)
     const last = api.calls.filter((c) => c.kind === 'edit').pop()!
-    expect(last.text).toContain('agent researcher')
+    // Humanized Agent line uses SUBAGENT_LABELS map for `researcher`.
+    expect(last.text).toContain('<b>searching and verifying sources</b>')
   })
 
   test('Non-Agent PreToolUse within 5s is recorded but not re-rendered', async () => {
@@ -526,7 +528,8 @@ describe('StatusManager.recordActivityByChatId', () => {
       toolUseId: 'u2',
     })
     const lastEdit = api.calls.filter((c) => c.kind === 'edit').pop()!
-    expect(lastEdit.text).toContain('bash two')
+    // Humanized: Bash non-curl/git/read → `running: <code>two</code>`
+    expect(lastEdit.text).toContain('running: <code>two</code>')
     expect(lastEdit.text).toContain('reasoning...')
   })
 

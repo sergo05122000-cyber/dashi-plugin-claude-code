@@ -61,11 +61,19 @@ function basename(rawPath: string): string {
  */
 export function maskSecrets(input: string): string {
   let s = input
-  // IPv4 — keep first/last octet so debugging stays possible.
+  // IPv4 — keep first/last octet so debugging stays possible. Loopback
+  // (`127.*`) and `0.*` placeholders are pure debug noise, never secrets;
+  // masking them just hurts operator readability (review M3).
   s = s.replace(
     /\b(\d{1,3})\.\d{1,3}\.\d{1,3}\.(\d{1,3})\b/g,
-    '$1.***.***.$2',
+    (full, first: string, last: string) => {
+      if (first === '127' || first === '0') return full
+      return `${first}.***.***.${last}`
+    },
   )
+  // `localhost` / `::1` literals are also debug-friendly; leave untouched.
+  // (Regex above already skips them — IPv6 ::1 and the literal string
+  // `localhost` don't match the IPv4 pattern.)
   // Secret paths under ~/.foo/secrets/...  (legacy tilde-anchored form)
   s = s.replace(/(~\/?\.\w+\/)secrets\/\S+/g, '$1secrets/***')
   // Anchored `secrets/<file>` — catches summarized last-two-segments output
@@ -258,6 +266,14 @@ export function humanizeTool(toolName: string, toolInput: ToolInput): string | n
 export interface ActivityCall {
   readonly toolName: string
   readonly detail: string
+  // Pre-rendered humanized HTML for the line (e.g. `reading <code>foo.ts</code>`)
+  // or `null`/absent when the tool doesn't have a richer label (TodoWrite,
+  // unknown). The HTML is already secret-masked + escape-safe — its internal
+  // `<code>` and `<b>` tags are emitted verbatim inside the `<pre>` body,
+  // while non-tag content was passed through `escapeHtml` at construction.
+  // Optional so legacy callers (test fixtures) without humanized can build
+  // ActivityCall literals; renderer treats `undefined` the same as `null`.
+  readonly humanized?: string | null
 }
 
 export interface ActivitySnapshot {
@@ -268,22 +284,31 @@ export interface ActivitySnapshot {
 
 const ACTIVITY_WINDOW = 5
 
+// Telegram editMessageText rejects messages > 4096 chars. Cap the inner
+// `<pre>` body well below that limit (room for the wrapping tags + safety
+// margin in case maskSecrets or escape expands a line).
+const PRE_BODY_MAX_CHARS = 3900
+
 /**
  * Render the full `<pre>working -- Ns\n\n[reasoning…]\n\n▸ …</pre>` block.
- * Ports `_render`/`_render_activity` from gateway.py:1740-1784. The whole
- * body is HTML-escaped once (inside <pre>) so callers can hand the result
- * straight to Telegram with `parse_mode=HTML`.
+ * Ports `_render`/`_render_activity` from gateway.py:1740-1784.
+ *
+ * Lines are escaped individually so a humanized line (which carries safe
+ * inline HTML like `<code>foo.ts</code>`) lands verbatim while plain-detail
+ * lines and the timer header get standard escaping. Body is capped at
+ * `PRE_BODY_MAX_CHARS` so a runaway summary can never blow past Telegram's
+ * 4096-char editMessageText limit (review M2).
  */
 export function renderActivityBlock(
   snapshot: ActivitySnapshot,
   nowMs: number,
 ): string {
   const elapsedSec = Math.max(0, Math.floor((nowMs - snapshot.startedAtMs) / 1000))
-  const lines: string[] = [`working -- ${elapsedSec}s`]
+  const lines: string[] = [escapeHtml(`working -- ${elapsedSec}s`)]
 
   if (snapshot.phase === 'reasoning') {
     lines.push('')
-    lines.push('reasoning...')
+    lines.push(escapeHtml('reasoning...'))
   }
 
   if (snapshot.calls.length > 0) {
@@ -292,17 +317,45 @@ export function renderActivityBlock(
     const window = Math.min(ACTIVITY_WINDOW, total)
     const recent = snapshot.calls.slice(total - window)
     if (total > recent.length) {
-      lines.push(`▸ ... +${total - recent.length} earlier`)
+      lines.push(escapeHtml(`▸ ... +${total - recent.length} earlier`))
     }
     for (const call of recent) {
-      // detail may already be the humanized string; mask again to be safe.
-      // The Python pipeline also re-masks at render time (gateway.py:1782).
-      lines.push(`▸ ${maskSecrets(call.detail)}`)
+      if (call.humanized) {
+        // Humanized string is already HTML-safe: inner identifiers were
+        // escaped at construction (see humanizeTool), inline tags are
+        // intentional. Re-mask defensively against any post-store mutation.
+        lines.push(`▸ ${maskSecretsPreserveTags(call.humanized)}`)
+      } else {
+        // Plain detail — single escape at render boundary so a Grep pattern
+        // like `"recordActivity"` lands as `&quot;recordActivity&quot;` once,
+        // not twice (review §1).
+        lines.push(escapeHtml(`▸ ${maskSecrets(call.detail)}`))
+      }
     }
   }
 
-  const body = lines.join('\n').trim()
-  return `<pre>${escapeHtml(body)}</pre>`
+  let body = lines.join('\n').trim()
+  if (body.length > PRE_BODY_MAX_CHARS) {
+    // Truncate at a line boundary so we don't split an HTML entity.
+    const truncated = body.slice(0, PRE_BODY_MAX_CHARS)
+    const lastNl = truncated.lastIndexOf('\n')
+    const head = lastNl > 0 ? truncated.slice(0, lastNl) : truncated
+    body = `${head}\n…+truncated`
+  }
+  return `<pre>${body}</pre>`
+}
+
+/**
+ * Re-mask a humanized HTML line without disturbing the inline tags. The
+ * masking rules only touch IPs, secret paths, long tokens, Telegram bot
+ * tokens, and Supabase hosts — none of those overlap with the `<code>`/`<b>`
+ * tag bodies emitted by humanizeTool (we already mask path/cmd content
+ * before wrapping). So a plain pass is safe; this is kept as a separate
+ * function for clarity and to localize future changes if a mask rule ever
+ * threatens an HTML tag.
+ */
+function maskSecretsPreserveTags(html: string): string {
+  return maskSecrets(html)
 }
 
 /**
@@ -318,4 +371,20 @@ export function buildActivityDetail(toolName: string, toolInput: ToolInput): str
   const lower = toolName.toLowerCase()
   const detail = summary ? `${lower} ${summary}` : lower
   return maskSecrets(detail)
+}
+
+/**
+ * Build the pre-rendered humanized HTML line for `ActivityCall.humanized`.
+ * Returns null for TodoWrite/unknown so the renderer falls back to the
+ * plain `detail` path. The string already contains escaped content + safe
+ * inline tags (e.g. `<code>`, `<b>`) — masking is applied at the end so
+ * the buffer never holds a raw token.
+ */
+export function buildHumanizedActivityLine(
+  toolName: string,
+  toolInput: ToolInput,
+): string | null {
+  const raw = humanizeTool(toolName, toolInput)
+  if (raw === null) return null
+  return maskSecrets(raw)
 }

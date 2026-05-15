@@ -23,6 +23,7 @@ import { escapeHtml } from '../format/html.js'
 import type { ActivityStatusEvent } from '../hooks/claude-events.js'
 import {
   buildActivityDetail,
+  buildHumanizedActivityLine,
   maskSecrets,
   renderActivityBlock,
   type ActivityCall,
@@ -348,7 +349,8 @@ export class StatusManager {
       case 'tool_start': {
         // Record every call up to the buffer cap so PostToolUse can pair.
         const detail = buildActivityDetail(event.toolName, event.toolInput)
-        const call: ActivityCall = { toolName: event.toolName, detail }
+        const humanized = buildHumanizedActivityLine(event.toolName, event.toolInput)
+        const call: ActivityCall = { toolName: event.toolName, detail, humanized }
         entry.activityCalls.push(call)
         if (entry.activityCalls.length > ACTIVITY_MAX_BUFFER) {
           entry.activityCalls.shift()
@@ -396,6 +398,10 @@ export class StatusManager {
                 entry.activityCalls[idx] = {
                   toolName: prev.toolName,
                   detail: `${prev.detail} — ${summary}`,
+                  humanized:
+                    prev.humanized !== null
+                      ? `${prev.humanized} — ${escapeHtml(summary)}`
+                      : null,
                 }
               }
             }

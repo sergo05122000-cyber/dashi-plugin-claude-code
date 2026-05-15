@@ -4,6 +4,7 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   buildActivityDetail,
+  buildHumanizedActivityLine,
   humanizeTool,
   maskSecrets,
   renderActivityBlock,
@@ -273,6 +274,151 @@ describe('secret-path leak after summarization (regression)', () => {
     const out = renderActivityBlock(snap, 0)
     expect(out).not.toContain('openviking.key')
     expect(out).toContain('secrets/***')
+  })
+})
+
+describe('humanized lines wired into render (M1)', () => {
+  // Wiring test — renderer must surface humanizeTool output on lines that
+  // carry a `humanized` HTML string, and fall back to the plain detail
+  // path for tools that don't have a richer label (TodoWrite, unknown).
+
+  test('Bash humanized line emits `running: <code>cmd</code>` inside <pre>', () => {
+    const humanized = buildHumanizedActivityLine('Bash', { command: 'bun test' })
+    expect(humanized).toBe('running: <code>bun test</code>')
+    const snap: ActivitySnapshot = {
+      startedAtMs: 0,
+      calls: [{ toolName: 'Bash', detail: 'bash bun test', humanized }],
+      phase: 'tool',
+    }
+    const out = renderActivityBlock(snap, 0)
+    expect(out).toContain('▸ running: <code>bun test</code>')
+    // Plain detail string is no longer the primary surface.
+    expect(out).not.toContain('▸ bash bun test')
+  })
+
+  test('Agent humanized line uses SUBAGENT_LABELS map', () => {
+    const humanized = buildHumanizedActivityLine('Agent', { subagent_type: 'researcher' })
+    expect(humanized).toBe('<b>searching and verifying sources</b>')
+    const snap: ActivitySnapshot = {
+      startedAtMs: 0,
+      calls: [{ toolName: 'Agent', detail: 'agent researcher', humanized }],
+      phase: 'tool',
+    }
+    const out = renderActivityBlock(snap, 0)
+    expect(out).toContain('▸ <b>searching and verifying sources</b>')
+  })
+
+  test('TodoWrite returns null → falls back to plain detail with single escape', () => {
+    const humanized = buildHumanizedActivityLine('TodoWrite', { todos: [] })
+    expect(humanized).toBeNull()
+    const snap: ActivitySnapshot = {
+      startedAtMs: 0,
+      calls: [{ toolName: 'TodoWrite', detail: 'todowrite', humanized }],
+      phase: 'tool',
+    }
+    const out = renderActivityBlock(snap, 0)
+    expect(out).toContain('▸ todowrite')
+  })
+
+  test('Unknown tool returns null → falls back to plain detail', () => {
+    const humanized = buildHumanizedActivityLine('Hypothetical', { a: 1 })
+    expect(humanized).toBeNull()
+    const snap: ActivitySnapshot = {
+      startedAtMs: 0,
+      calls: [{ toolName: 'Hypothetical', detail: 'hypothetical a=1', humanized }],
+      phase: 'tool',
+    }
+    const out = renderActivityBlock(snap, 0)
+    expect(out).toContain('▸ hypothetical a=1')
+  })
+
+  test('humanized line still masks long tokens after the fact', () => {
+    // buildHumanizedActivityLine applies mask at construction. Render
+    // re-masks defensively — verify a token added to humanized later still
+    // gets eaten by the render pass.
+    const tok = `abcd${'x'.repeat(20)}wxyz`
+    const snap: ActivitySnapshot = {
+      startedAtMs: 0,
+      calls: [{ toolName: 'Bash', detail: '', humanized: `running: <code>${tok}</code>` }],
+      phase: 'tool',
+    }
+    const out = renderActivityBlock(snap, 0)
+    expect(out).not.toContain(tok)
+    expect(out).toContain('abcd***wxyz')
+  })
+})
+
+describe('renderActivityBlock 4096-char cap (M2)', () => {
+  // Defensive — Telegram editMessageText rejects > 4096 chars. We cap the
+  // inner body at 3900 to leave room for the wrapping `<pre>` tags + safety.
+
+  test('50 long Bash calls truncate at line boundary with …+truncated marker', () => {
+    const big = 'x'.repeat(60)
+    const snap: ActivitySnapshot = {
+      startedAtMs: 0,
+      calls: Array.from({ length: 50 }, (_, i) => ({
+        toolName: 'Bash',
+        detail: `bash ${i.toString().padStart(3, '0')} ${big}`,
+      })),
+      phase: 'tool',
+    }
+    const out = renderActivityBlock(snap, 0)
+    expect(out.length).toBeLessThanOrEqual(4096)
+    // Truncation marker absent for short outputs — only present when we cut.
+    // 50 × 60+ = 3000+; with rolling window of 5 we only render 5 → no
+    // truncation in practice. Force a real overflow with humanized payload.
+    // Use punctuation-broken filler so the generic long-token mask (which
+    // chews ≥24-char `[A-Za-z0-9_-]` runs) doesn't collapse it.
+    const filler = ('AB. '.repeat(400)).slice(0, 1500)
+    const snap2: ActivitySnapshot = {
+      startedAtMs: 0,
+      calls: Array.from({ length: 5 }, (_, i) => ({
+        toolName: 'Bash',
+        detail: 'b',
+        humanized: `running: <code>${filler}-${i}</code>`,
+      })),
+      phase: 'tool',
+    }
+    const out2 = renderActivityBlock(snap2, 0)
+    expect(out2.length).toBeLessThanOrEqual(4096)
+    expect(out2).toContain('…+truncated')
+  })
+
+  test('normal-length output gets no truncation marker', () => {
+    const snap: ActivitySnapshot = {
+      startedAtMs: 0,
+      calls: [
+        { toolName: 'Bash', detail: 'bash one' },
+        { toolName: 'Bash', detail: 'bash two' },
+      ],
+      phase: 'tool',
+    }
+    const out = renderActivityBlock(snap, 0)
+    expect(out).not.toContain('…+truncated')
+  })
+})
+
+describe('IPv4 mask exemptions (M3)', () => {
+  test('127.x.x.x loopback is NOT masked', () => {
+    expect(maskSecrets('curl 127.0.0.1:8080')).toBe('curl 127.0.0.1:8080')
+    expect(maskSecrets('hit 127.0.0.1/health')).toBe('hit 127.0.0.1/health')
+  })
+
+  test('0.x.x.x placeholder is NOT masked', () => {
+    expect(maskSecrets('bind 0.0.0.0:80')).toBe('bind 0.0.0.0:80')
+  })
+
+  test('public IPv4 ranges still masked', () => {
+    expect(maskSecrets('curl 8.8.8.8')).toBe('curl 8.***.***.8')
+    expect(maskSecrets('connect 10.2.3.44 done')).toBe('connect 10.***.***.44 done')
+  })
+
+  test('::1 IPv6 loopback literal untouched (regex never matched it)', () => {
+    expect(maskSecrets('hit [::1]:443')).toBe('hit [::1]:443')
+  })
+
+  test('localhost literal untouched', () => {
+    expect(maskSecrets('http://localhost:8089')).toBe('http://localhost:8089')
   })
 })
 
