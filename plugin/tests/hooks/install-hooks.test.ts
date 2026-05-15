@@ -84,6 +84,47 @@ describe('install-hooks.sh — fresh settings file', () => {
   })
 })
 
+describe('install-hooks.sh — URL validation (L3)', () => {
+  function runWithUrl(badUrl: string): { code: number; stderr: string } {
+    const bunBin =
+      process.env.BUN_INSTALL_BIN ?? join(process.env.HOME ?? '', '.bun', 'bin')
+    const pathPrefix = `${bunBin}:${process.env.PATH ?? ''}`
+    const r = spawnSync(
+      'bash',
+      [
+        INSTALL_SH,
+        '--settings', settings,
+        '--chat-id', '164795011',
+        '--webhook-url', badUrl,
+        '--agent-id', 'dashi-channel',
+      ],
+      { encoding: 'utf8', env: { ...process.env, PATH: pathPrefix } },
+    )
+    return { code: r.status ?? -1, stderr: r.stderr }
+  }
+
+  test('rejects file:// scheme without writing settings', async () => {
+    const r = runWithUrl('file:///etc/passwd')
+    expect(r.code).not.toBe(0)
+    expect(r.stderr).toContain('http://')
+    const { existsSync } = await import('fs')
+    expect(existsSync(settings)).toBe(false)
+  })
+
+  test('rejects javascript: scheme', () => {
+    const r = runWithUrl('javascript:alert(1)')
+    expect(r.code).not.toBe(0)
+  })
+
+  test('accepts http:// and https:// schemes', () => {
+    expect(runWithUrl('http://127.0.0.1:8089/hooks/agent').code).toBe(0)
+    // Reset settings between runs (idempotent install is fine, but a fresh
+    // file is clearer).
+    rmSync(settings, { force: true })
+    expect(runWithUrl('https://example.com/hooks/agent').code).toBe(0)
+  })
+})
+
 describe('install-hooks.sh — idempotency', () => {
   test('second run does not duplicate hook entries', () => {
     runInstall()

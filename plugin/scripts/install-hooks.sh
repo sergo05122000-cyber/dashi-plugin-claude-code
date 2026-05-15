@@ -50,6 +50,16 @@ if [ -z "$SETTINGS" ] || [ -z "$CHAT_ID" ] || [ -z "$WEBHOOK_URL" ]; then
   exit 2
 fi
 
+# Reject non-http(s) URLs — a typo'd `file:///etc/passwd` or `javascript:`
+# would otherwise be written into settings.json and become a hook command
+# (review L3). The post-hook.ts helper uses fetch() which refuses file://
+# anyway, but stop the bad value at install time so settings.json never
+# carries it.
+if [[ ! "$WEBHOOK_URL" =~ ^https?:// ]]; then
+  echo "install-hooks.sh: --webhook-url must start with http:// or https:// (got '$WEBHOOK_URL')" >&2
+  exit 2
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PATCH_TS="$SCRIPT_DIR/patch-claude-settings.ts"
 
