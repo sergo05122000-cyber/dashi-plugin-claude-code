@@ -7,7 +7,7 @@ goal:
   slug: "tmux-channel-migration"
   kind: existing_plan
   tranche: "Validate the existing tmux migration plan, choose the first safe local work package, execute verified local progress, and continue until this tranche is audited."
-  status: done
+  status: active
   intake:
     original_request: "Поставить goal тебе и сделать задачу через эту команду для qwwiwi-channel-telegram-Claude-code."
     interpreted_outcome: "Use GoalBuddy/native /goal to execute the existing tmux-first Telegram channel migration plan safely."
@@ -63,7 +63,7 @@ visual_board:
     command: "npx goalbuddy extend github-projects"
     missing: []
 
-active_task: null
+active_task: T014
 
 tasks:
   - id: T001
@@ -510,12 +510,208 @@ tasks:
         - "No production launchd job has been changed."
         - "No production tmux session has been started."
       next_continuation: "/goal Confirm the operator's Telegram message/reply smoke test, then continue with Claude Code channel CLI/plugin discovery without touching production consumers."
+  - id: T010
+    type: scout
+    assignee: Scout
+    status: done
+    reasoning_hint: low
+    objective: "Investigate local Claude Code channel flag behavior, auth state, and canary tmux visibility before replacing the ACK canary bot."
+    inputs:
+      - "User continuation request for real Claude-generated canary replies."
+      - "Local Claude Code CLI."
+      - "Existing canary tmux session name orgrimmar-canary."
+    constraints:
+      - "Read-only."
+      - "Do not print, copy, commit, or expose the canary Telegram token value."
+      - "Do not start any new Telegram poller while the existing canary ACK consumer may own the token."
+      - "Do not touch production token files, launchd jobs, gateway config, or production tmux sessions."
+    expected_output:
+      - "Channel flag evidence."
+      - "Auth/org policy evidence."
+      - "tmux visibility evidence."
+      - "Safe continuation recommendation."
+    receipt:
+      result: done
+      summary: "Local CLI is Claude Code 2.1.141. Public help does not list channel flags, but hidden channel/dev-channel flags are accepted by the parser when a prompt is separated with `--`. Model execution and org policy probing are blocked in this sandbox because `claude auth status` reports not logged in. The default tmux socket is also inaccessible from this sandbox, so the existing `orgrimmar-canary` ACK consumer cannot be safely stopped or replaced here without a host-level tmux action."
+      evidence:
+        - "`claude --version` -> `2.1.141 (Claude Code)`."
+        - "`claude --help` lists MCP/plugin flags but not `--channels` or `--dangerously-load-development-channels`."
+        - "`claude --definitely-not-a-real-flag` returns unknown option, while `claude --channels ...` and `claude --dangerously-load-development-channels ...` pass option parsing."
+        - "`claude auth status` reports `loggedIn: false`, `authMethod: none`, `apiProvider: firstParty`."
+        - "`tmux ls` and `tmux has-session -t orgrimmar-canary` fail with `Operation not permitted` against `/private/tmp/tmux-501/default`."
+        - "`pgrep` cannot inspect host processes from this sandbox."
+  - id: T011
+    type: judge
+    assignee: Judge
+    status: done
+    reasoning_hint: high
+    objective: "Choose the safe next implementation slice after true channel startup is blocked by local auth/tmux evidence."
+    inputs:
+      - "T010 receipt."
+      - "User requirement: canary only, real Claude replies preferred, fallback bridge if channels are blocked."
+      - "Existing canary ACK runner and tests."
+    constraints:
+      - "Do not approve production token movement, launchd changes, gateway changes, or production tmux actions."
+      - "Do not approve a new live poller until the existing canary ACK consumer is stopped/replaced."
+      - "Require tests before implementation."
+    expected_output:
+      - "Decision."
+      - "Exact Worker objective."
+      - "allowed_files."
+      - "verify."
+      - "stop_if."
+    receipt:
+      result: done
+      decision: approved
+      full_outcome_complete: false
+      rationale: "The true channel path cannot be proven running from this sandbox because Claude model execution is not authenticated and tmux cannot be controlled. The largest safe local slice is to turn the canary smoke runner into an explicit canary-only Claude fallback bridge with TDD, docs, and launch gates. Launch remains gated until the ACK consumer can be stopped/replaced and Claude auth is available."
+      exact_worker_objective: "Add a canary-only Claude reply mode to the Telegram canary runner, with a subprocess-backed Claude Code reply provider, failure redaction, tests, docs, and GoalBuddy receipts."
+      allowed_files:
+        - "scripts/dashi-telegram-canary-bot"
+        - "tests/test_dashi_telegram_canary_bot.py"
+        - "docs/10-canary-telegram-smoke-bot.md"
+        - "README.md"
+        - "docs/goals/tmux-channel-migration/state.yaml"
+      verify:
+        - "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_dashi_channel_supervisor tests.test_dashi_telegram_canary_bot -v"
+        - "PYTHONPYCACHEPREFIX=/private/tmp/dashi-channel-supervisor-pycache-main python3 -m py_compile scripts/dashi-channel-supervisor scripts/dashi-telegram-canary-bot"
+        - "claude auth status"
+        - "tmux ls"
+        - "node /Users/jasonqwwen/.codex/plugins/cache/goalbuddy/goalbuddy/0.3.6/skills/goalbuddy/scripts/check-goal-state.mjs docs/goals/tmux-channel-migration/state.yaml"
+      stop_if:
+        - "Need to print, copy, or commit the canary Telegram token value."
+        - "Need production token files, launchd jobs, live gateway config, or production tmux sessions."
+        - "Need to start a new live Telegram poller while the existing `orgrimmar-canary` ACK consumer may still be running."
+        - "Need interactive Claude login or credential repair."
+        - "Tests or compile checks fail twice."
+  - id: T012
+    type: worker
+    assignee: Worker
+    status: done
+    reasoning_hint: medium
+    objective: "Add a canary-only Claude reply mode to the Telegram canary runner, with a subprocess-backed Claude Code reply provider, failure redaction, tests, docs, and GoalBuddy receipts."
+    allowed_files:
+      - "scripts/dashi-telegram-canary-bot"
+      - "tests/test_dashi_telegram_canary_bot.py"
+      - "docs/10-canary-telegram-smoke-bot.md"
+      - "README.md"
+      - "docs/goals/tmux-channel-migration/state.yaml"
+    verify:
+      - "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_dashi_channel_supervisor tests.test_dashi_telegram_canary_bot -v"
+      - "PYTHONPYCACHEPREFIX=/private/tmp/dashi-channel-supervisor-pycache-main python3 -m py_compile scripts/dashi-channel-supervisor scripts/dashi-telegram-canary-bot"
+      - "claude auth status"
+      - "tmux ls"
+      - "node /Users/jasonqwwen/.codex/plugins/cache/goalbuddy/goalbuddy/0.3.6/skills/goalbuddy/scripts/check-goal-state.mjs docs/goals/tmux-channel-migration/state.yaml"
+    stop_if:
+      - "Need to print, copy, or commit the canary Telegram token value."
+      - "Need production token files, launchd jobs, live gateway config, or production tmux sessions."
+      - "Need to start a new live Telegram poller while the existing `orgrimmar-canary` ACK consumer may still be running."
+      - "Need interactive Claude login or credential repair."
+      - "Tests or compile checks fail twice."
+    expected_output:
+      - "Canary-only Claude fallback bridge mode."
+      - "TDD tests."
+      - "Docs showing true channel vs fallback stage."
+      - "Receipt with verification and live-launch blockers."
+    receipt:
+      result: done
+      changed_files:
+        - "scripts/dashi-telegram-canary-bot"
+        - "tests/test_dashi_telegram_canary_bot.py"
+        - "docs/10-canary-telegram-smoke-bot.md"
+        - "README.md"
+        - "docs/goals/tmux-channel-migration/state.yaml"
+      commands:
+        - cmd: "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_dashi_telegram_canary_bot -v"
+          status: pass
+          note: "Red/green TDD observed: new fallback tests failed before implementation, then passed after implementation."
+        - cmd: "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_dashi_channel_supervisor tests.test_dashi_telegram_canary_bot -v"
+          status: pass
+        - cmd: "PYTHONPYCACHEPREFIX=/private/tmp/dashi-channel-supervisor-pycache-main python3 -m py_compile scripts/dashi-channel-supervisor scripts/dashi-telegram-canary-bot"
+          status: pass
+        - cmd: "git diff --check"
+          status: pass
+        - cmd: "scripts/dashi-telegram-canary-bot --help | rg -- '--reply-mode|--claude-timeout|--claude-max-budget-usd'"
+          status: pass
+      summary: "Added `--reply-mode claude` to the canary Telegram runner. In Claude mode, each canary Telegram message is converted to an inbound message object, sent to `claude --print --max-budget-usd <limit> -- <prompt>` without shell interpolation, and the model text is sent back to Telegram. Claude failures are redacted and returned as explicit canary fallback-unavailable messages. The existing ACK mode remains the default."
+      launched: false
+      remaining_blockers:
+        - "True Claude Code channel startup is not verified or running."
+        - "Fallback bridge cannot produce real Claude replies from this sandbox because Claude Code is not logged in here."
+        - "The existing `orgrimmar-canary` ACK tmux consumer could not be stopped/replaced because this sandbox cannot access the host tmux socket."
+        - "Starting another live poller would violate one-token-one-consumer while the ACK consumer may still own the canary token."
+  - id: T013
+    type: judge
+    assignee: Judge
+    status: done
+    reasoning_hint: high
+    objective: "Audit whether the canary real-reply continuation satisfies the user outcome or remains blocked."
+    inputs:
+      - "T010 receipt"
+      - "T011 receipt"
+      - "T012 receipt"
+      - "Current diff"
+      - "Fresh verification output"
+    constraints:
+      - "Do not claim true channel runtime is running unless verified."
+      - "Do not claim fallback is running unless the ACK consumer was stopped/replaced and tmux status was verified."
+      - "Do not expose token values."
+    expected_output:
+      - "complete | blocked | not_complete"
+      - "full_outcome_complete: true | false"
+      - "running path"
+      - "remaining blockers"
+    receipt:
+      result: done
+      decision: blocked
+      full_outcome_complete: false
+      true_channel_running: false
+      fallback_running: false
+      running_tmux_session: "Existing `orgrimmar-canary` ACK session may still be running; this sandbox cannot verify or replace it."
+      rationale: "The code and docs for a canary-only Claude fallback bridge are verified, but the user outcome requires a live canary bot with real Claude-generated replies. That cannot be truthfully claimed because local Claude auth is unavailable and the host tmux socket is inaccessible, so the ACK poller cannot be safely replaced under the one-token-one-consumer rule."
+      blocked_checks:
+        - cmd: "timeout 20 claude --print --max-budget-usd 0.01 -- 'Respond with exactly: fallback-auth-probe'"
+          status: blocked
+          note: "Claude Code returned `Not logged in`; no model reply could be generated from this sandbox."
+        - cmd: "claude auth status"
+          status: blocked
+          note: "Reported `loggedIn: false`, `authMethod: none`, `apiProvider: firstParty`."
+        - cmd: "tmux ls"
+          status: blocked
+          note: "Failed with `Operation not permitted` against the default tmux socket."
+      next_unblock_steps:
+        - "On the host, make `claude auth status` return logged in for the user account that will run the bot."
+        - "On the host, run `tmux kill-session -t orgrimmar-canary` to stop the ACK consumer."
+        - "Start the fallback bridge in the same session name with `scripts/dashi-telegram-canary-bot --reply-mode claude --poll-timeout 20` and the existing canary runtime root."
+        - "Send a Telegram message to the canary bot and confirm the reply is generated by Claude, not the ACK path."
+      missing_evidence:
+        - "No verified true Claude Code channel/MCP session is running."
+        - "No verified fallback bridge tmux session is running."
+        - "No Telegram real-reply smoke test has been observed."
+  - id: T014
+    type: pm
+    assignee: PM
+    status: active
+    reasoning_hint: medium
+    objective: "Wait for host-level Claude auth and tmux access so the canary ACK consumer can be safely replaced by the verified fallback bridge."
+    inputs:
+      - "T013 blocked audit."
+      - "Host-level `claude auth status`."
+      - "Host-level `tmux ls`."
+    constraints:
+      - "Do not start a second canary Telegram poller."
+      - "Do not touch production token files, launchd jobs, gateway config, or production tmux sessions."
+      - "Do not expose the canary Telegram token value."
+    expected_output:
+      - "Host-level auth/tmux evidence."
+      - "Safe replacement of `orgrimmar-canary` ACK session only, or a blocked receipt if host access remains unavailable."
+    receipt: null
 
 checks:
   dirty_fingerprint: unknown
   last_verification:
-    result: pass
-    task: T009
+    result: blocked
+    task: T013
     commands:
       - "python3 -m unittest tests.test_dashi_channel_supervisor -v"
       - "python3 -m py_compile scripts/dashi-channel-supervisor"
@@ -529,3 +725,8 @@ checks:
       - "tmux ls"
       - "DASHI_CHANNEL_RUNTIME_ROOT=/Users/jasonqwwen/.claude-lab/shared/channel-runtime scripts/dashi-channel-supervisor status canary --json"
       - "node /Users/jasonqwwen/.codex/plugins/cache/goalbuddy/goalbuddy/0.3.6/skills/goalbuddy/scripts/check-goal-state.mjs docs/goals/tmux-channel-migration/state.yaml"
+      - "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_dashi_channel_supervisor tests.test_dashi_telegram_canary_bot -v"
+      - "PYTHONPYCACHEPREFIX=/private/tmp/dashi-channel-supervisor-pycache-main python3 -m py_compile scripts/dashi-channel-supervisor scripts/dashi-telegram-canary-bot"
+      - "git diff --check"
+      - "claude auth status"
+      - "tmux ls"

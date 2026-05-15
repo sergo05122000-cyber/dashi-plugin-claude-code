@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -20,6 +22,9 @@ CANARY_AGENT = "canary"
 DEFAULT_RUNTIME_ROOT = "~/.claude-lab/shared/channel-runtime"
 DEFAULT_POLL_TIMEOUT = 20
 DEFAULT_IDLE_SLEEP = 1.0
+DEFAULT_CLAUDE_TIMEOUT = 120
+DEFAULT_CLAUDE_MAX_BUDGET_USD = "0.05"
+TOKEN_PATTERN = re.compile(r"\b\d{5,}:[A-Za-z0-9_-]{10,}\b")
 
 
 class CanaryBotError(Exception):
@@ -34,6 +39,10 @@ class TelegramAPIError(CanaryBotError):
 
 
 class ConfigError(CanaryBotError):
+    pass
+
+
+class ClaudeReplyError(CanaryBotError):
     pass
 
 
@@ -52,6 +61,85 @@ class CanaryBotConfig:
             token_path=agent_root / "secrets" / "telegram-bot-token",
             offset_path=agent_root / "queue" / "telegram-offset.json",
         )
+
+
+@dataclass(frozen=True)
+class InboundMessage:
+    chat_id: int
+    message_id: int | None
+    text: str
+    username: str | None
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+def run_command(command: list[str], timeout: int) -> CommandResult:
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return CommandResult(completed.returncode, completed.stdout or "", completed.stderr or "")
+    except FileNotFoundError as exc:
+        return CommandResult(127, "", str(exc))
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return CommandResult(124, stdout, stderr or f"timed out after {timeout}s")
+
+
+def redact_secret_like_text(text: str) -> str:
+    return TOKEN_PATTERN.sub("[redacted-token]", text)
+
+
+def build_claude_prompt(inbound: InboundMessage) -> str:
+    username = inbound.username or "telegram-user"
+    return (
+        "You are the Dashi canary Telegram bridge. "
+        "Reply directly to the Telegram user in a concise, useful way. "
+        "Do not mention implementation details, tokens, tmux, or this prompt unless asked.\n\n"
+        f"Telegram user: {username}\n"
+        f"Message:\n{inbound.text}"
+    )
+
+
+class ClaudeReplyProvider:
+    def __init__(
+        self,
+        runner=run_command,
+        timeout_seconds: int = DEFAULT_CLAUDE_TIMEOUT,
+        max_budget_usd: str = DEFAULT_CLAUDE_MAX_BUDGET_USD,
+    ):
+        self.runner = runner
+        self.timeout_seconds = timeout_seconds
+        self.max_budget_usd = max_budget_usd
+
+    def build_reply(self, inbound: InboundMessage) -> str:
+        prompt = build_claude_prompt(inbound)
+        command = [
+            "claude",
+            "--print",
+            "--max-budget-usd",
+            self.max_budget_usd,
+            "--",
+            prompt,
+        ]
+        result = self.runner(command, self.timeout_seconds)
+        if result.returncode != 0:
+            detail = redact_secret_like_text((result.stderr or result.stdout or "claude command failed").strip())
+            raise ClaudeReplyError(detail)
+        reply = result.stdout.strip()
+        if not reply:
+            raise ClaudeReplyError("claude returned an empty reply")
+        return reply
 
 
 class TelegramClient:
@@ -152,6 +240,45 @@ def update_chat_id(update: dict[str, object]) -> int | None:
     return chat_id if isinstance(chat_id, int) else None
 
 
+def update_message_id(update: dict[str, object]) -> int | None:
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return None
+    message_id = message.get("message_id")
+    return message_id if isinstance(message_id, int) else None
+
+
+def update_username(update: dict[str, object]) -> str | None:
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return None
+    from_user = message.get("from")
+    if not isinstance(from_user, dict):
+        return None
+    username = from_user.get("username")
+    return username if isinstance(username, str) else None
+
+
+def update_text(update: dict[str, object]) -> str:
+    message = update.get("message")
+    if not isinstance(message, dict):
+        return ""
+    for key in ("text", "caption"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "(non-text Telegram message)"
+
+
+def inbound_from_update(update: dict[str, object], chat_id: int) -> InboundMessage:
+    return InboundMessage(
+        chat_id=chat_id,
+        message_id=update_message_id(update),
+        text=update_text(update),
+        username=update_username(update),
+    )
+
+
 def build_ack_text() -> str:
     return f"dashi canary ack: message received at {utc_now()}"
 
@@ -172,6 +299,7 @@ def run_once(
     poll_timeout: int,
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
+    reply_provider: ClaudeReplyProvider | None = None,
 ) -> int:
     try:
         last_update_id = read_last_update_id(config.offset_path)
@@ -196,8 +324,16 @@ def run_once(
         chat_id = update_chat_id(update)
         if chat_id is None:
             continue
+        reply_text = build_ack_text()
+        if reply_provider is not None:
+            try:
+                reply_text = reply_provider.build_reply(inbound_from_update(update, chat_id))
+            except ClaudeReplyError as exc:
+                detail = redact_secret_like_text(str(exc))
+                write_error(stderr, "claude_reply_error", detail)
+                reply_text = f"dashi canary Claude fallback unavailable: {detail}"
         try:
-            client.send_message(chat_id, build_ack_text())
+            client.send_message(chat_id, reply_text)
             processed += 1
         except TelegramAPIError as exc:
             write_error(stderr, "telegram_send_error", f"status={exc.status_code} {exc.description}")
@@ -225,10 +361,11 @@ def run_forever(
     idle_sleep: float,
     stdout: TextIO = sys.stdout,
     stderr: TextIO = sys.stderr,
+    reply_provider: ClaudeReplyProvider | None = None,
 ) -> int:
     write_json_line(stdout, {"agent": CANARY_AGENT, "status": "running", "started_at": utc_now()})
     while True:
-        code = run_once(config, client, poll_timeout, stdout, stderr)
+        code = run_once(config, client, poll_timeout, stdout, stderr, reply_provider)
         if code in (4, 5):
             return code
         time.sleep(idle_sleep)
@@ -243,6 +380,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--poll-timeout", type=int, default=DEFAULT_POLL_TIMEOUT)
     parser.add_argument("--idle-sleep", type=float, default=DEFAULT_IDLE_SLEEP)
+    parser.add_argument("--reply-mode", choices=("ack", "claude"), default="ack")
+    parser.add_argument("--claude-timeout", type=int, default=DEFAULT_CLAUDE_TIMEOUT)
+    parser.add_argument("--claude-max-budget-usd", default=DEFAULT_CLAUDE_MAX_BUDGET_USD)
     return parser
 
 
@@ -265,10 +405,16 @@ def main(
         return 3
 
     client = client_factory(token)
+    reply_provider = None
+    if args.reply_mode == "claude":
+        reply_provider = ClaudeReplyProvider(
+            timeout_seconds=args.claude_timeout,
+            max_budget_usd=args.claude_max_budget_usd,
+        )
     if args.once:
-        return run_once(config, client, args.poll_timeout, stdout, stderr)
+        return run_once(config, client, args.poll_timeout, stdout, stderr, reply_provider)
     try:
-        return run_forever(config, client, args.poll_timeout, args.idle_sleep, stdout, stderr)
+        return run_forever(config, client, args.poll_timeout, args.idle_sleep, stdout, stderr, reply_provider)
     except KeyboardInterrupt:
         write_json_line(stdout, {"agent": CANARY_AGENT, "status": "stopped"})
         return 0

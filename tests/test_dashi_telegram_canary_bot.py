@@ -42,6 +42,26 @@ class FakeClient:
         self.sent_messages.append({"chat_id": chat_id, "text": text})
 
 
+@dataclass
+class FakeReplyProvider:
+    reply_text: str
+
+    def __post_init__(self):
+        self.messages = []
+
+    def build_reply(self, inbound):
+        self.messages.append(inbound)
+        return self.reply_text
+
+
+class FailingReplyProvider:
+    def __init__(self, error):
+        self.error = error
+
+    def build_reply(self, inbound):
+        raise self.error
+
+
 class CanaryBotTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -86,6 +106,108 @@ class CanaryBotTestCase(unittest.TestCase):
         self.assertEqual((self.runtime_root / "canary" / "queue" / "telegram-offset.json").read_text(), "42\n")
         self.assertIn('"processed": 1', stdout.getvalue())
         self.assertNotIn(self.token_value, stdout.getvalue() + stderr.getvalue() + json.dumps(client.sent_messages))
+
+    def test_run_once_uses_claude_reply_provider_for_text_message(self):
+        bot = load_bot()
+        client = FakeClient(
+            [
+                {
+                    "update_id": 43,
+                    "message": {
+                        "message_id": 99,
+                        "chat": {"id": 777},
+                        "from": {"id": 555, "username": "tester"},
+                        "text": "ping claude",
+                    },
+                }
+            ]
+        )
+        provider = FakeReplyProvider("claude canary reply")
+
+        code = bot.run_once(
+            bot.CanaryBotConfig.from_runtime_root(self.runtime_root),
+            client,
+            poll_timeout=1,
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+            reply_provider=provider,
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(client.sent_messages, [{"chat_id": 777, "text": "claude canary reply"}])
+        self.assertEqual(len(provider.messages), 1)
+        self.assertEqual(provider.messages[0].chat_id, 777)
+        self.assertEqual(provider.messages[0].message_id, 99)
+        self.assertEqual(provider.messages[0].text, "ping claude")
+        self.assertEqual(provider.messages[0].username, "tester")
+        self.assertNotIn("dashi canary ack", client.sent_messages[0]["text"])
+        self.assertNotIn(self.token_value, json.dumps(client.sent_messages))
+
+    def test_run_once_reports_claude_failure_without_leaking_secret_like_text(self):
+        bot = load_bot()
+        client = FakeClient(
+            [
+                {
+                    "update_id": 44,
+                    "message": {
+                        "chat": {"id": 777},
+                        "text": "ping claude",
+                    },
+                }
+            ]
+        )
+        provider = FailingReplyProvider(
+            bot.ClaudeReplyError(f"Not logged in; saw {self.token_value} in a lower layer")
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        code = bot.run_once(
+            bot.CanaryBotConfig.from_runtime_root(self.runtime_root),
+            client,
+            poll_timeout=1,
+            stdout=stdout,
+            stderr=stderr,
+            reply_provider=provider,
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(client.sent_messages), 1)
+        self.assertIn("Claude fallback unavailable", client.sent_messages[0]["text"])
+        self.assertIn("[redacted-token]", client.sent_messages[0]["text"])
+        self.assertIn("claude_reply_error", stderr.getvalue())
+        self.assertNotIn(self.token_value, stdout.getvalue() + stderr.getvalue() + json.dumps(client.sent_messages))
+
+    def test_claude_reply_provider_invokes_claude_print_without_shell_or_token(self):
+        bot = load_bot()
+        calls = []
+
+        def fake_runner(command, timeout):
+            calls.append({"command": command, "timeout": timeout})
+            return bot.CommandResult(0, "model reply\n", "")
+
+        provider = bot.ClaudeReplyProvider(
+            runner=fake_runner,
+            timeout_seconds=12,
+            max_budget_usd="0.05",
+        )
+        inbound = bot.InboundMessage(
+            chat_id=777,
+            message_id=99,
+            text="What is this canary doing?",
+            username="tester",
+        )
+
+        reply = provider.build_reply(inbound)
+
+        self.assertEqual(reply, "model reply")
+        self.assertEqual(len(calls), 1)
+        command = calls[0]["command"]
+        self.assertEqual(command[:4], ["claude", "--print", "--max-budget-usd", "0.05"])
+        self.assertIn("--", command)
+        self.assertEqual(command[-1].count("What is this canary doing?"), 1)
+        self.assertNotIn(self.token_value, " ".join(command))
+        self.assertEqual(calls[0]["timeout"], 12)
 
     def test_run_once_uses_next_offset_after_saved_update_id(self):
         bot = load_bot()
