@@ -22,13 +22,6 @@ import { open, type FileHandle } from 'node:fs/promises'
 
 const TAIL_BYTES = 256 * 1024
 
-interface TranscriptLine {
-  message?: {
-    role?: string
-    content?: Array<{ type?: string; text?: string } | unknown>
-  }
-}
-
 export async function readLastAssistantText(
   transcriptPath: string,
 ): Promise<string | null> {
@@ -50,19 +43,29 @@ export async function readLastAssistantText(
     const lines = (start > 0 ? split.slice(1) : split).filter((l) => l.length > 0)
 
     for (let i = lines.length - 1; i >= 0; i--) {
-      let obj: TranscriptLine
+      // Permissive parse: valid JSON with the wrong shape (null, a bare
+      // array, a string, …) used to bypass the per-line try/catch and
+      // throw at the next `obj.message?.role` access, escaping to the
+      // OUTER catch and short-circuiting earlier valid assistant text.
+      // Each line is now its own boundary — shape mismatch = skip, not
+      // abort.
+      let obj: unknown
       try {
-        obj = JSON.parse(lines[i]!) as TranscriptLine
+        obj = JSON.parse(lines[i]!)
       } catch {
         continue
       }
-      if (obj.message?.role !== 'assistant') continue
-      const content = obj.message?.content
+      if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) continue
+      const msg = (obj as { message?: unknown }).message
+      if (typeof msg !== 'object' || msg === null) continue
+      const role = (msg as { role?: unknown }).role
+      if (role !== 'assistant') continue
+      const content = (msg as { content?: unknown }).content
       if (!Array.isArray(content)) continue
       const parts: string[] = []
       for (const c of content) {
         if (typeof c !== 'object' || c === null) continue
-        const block = c as { type?: string; text?: string }
+        const block = c as { type?: unknown; text?: unknown }
         if (block.type === 'text' && typeof block.text === 'string') {
           parts.push(block.text)
         }

@@ -114,4 +114,46 @@ describe('readLastAssistantText', () => {
     )
     expect(await readLastAssistantText(path)).toBe('final')
   })
+
+  // ───────────────────────────────────────────────────────────────
+  // Permissive shape guard (review MEDIUM):
+  // before the fix, a valid JSON line with the wrong shape (e.g. `null`,
+  // a bare array, a string) bypassed the per-line try/catch and threw at
+  // the next `obj.message?.role` access, escaping to the OUTER catch and
+  // short-circuiting ALL earlier assistant text. After the fix every
+  // shape mismatch is a `continue`, not an abort.
+  // ───────────────────────────────────────────────────────────────
+
+  test('skips JSON `null` line between two valid assistant messages', async () => {
+    const path = write('t.jsonl',
+      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'older' }] } }) +
+      'null\n' +
+      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'newer' }] } }),
+    )
+    expect(await readLastAssistantText(path)).toBe('newer')
+  })
+
+  test('skips JSON array line (valid JSON, wrong shape)', async () => {
+    const path = write('t.jsonl',
+      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'keep me' }] } }) +
+      '[1,2,3]\n',
+    )
+    expect(await readLastAssistantText(path)).toBe('keep me')
+  })
+
+  test('skips JSON string line (valid JSON, wrong shape)', async () => {
+    const path = write('t.jsonl',
+      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'survives' }] } }) +
+      '"just a string"\n',
+    )
+    expect(await readLastAssistantText(path)).toBe('survives')
+  })
+
+  test('skips line whose `message` is itself null', async () => {
+    const path = write('t.jsonl',
+      line({ message: { role: 'assistant', content: [{ type: 'text', text: 'good' }] } }) +
+      line({ message: null }),
+    )
+    expect(await readLastAssistantText(path)).toBe('good')
+  })
 })
