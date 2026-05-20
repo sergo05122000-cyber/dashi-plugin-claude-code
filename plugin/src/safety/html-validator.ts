@@ -304,7 +304,7 @@ export function validateTelegramHtml(input: string): ValidatedHtml {
       return downgrade(input, 'malformed tag')
     }
     if (!ALLOWED_TAGS.has(parsed.name)) {
-      return downgrade(input, `unsupported tag: ${parsed.name}`)
+      return downgrade(input, `unsupported tag <${parsed.name}>`)
     }
     // Per-tag attribute allowlist. Closing tags must have no attributes.
     const allowedAttrs = TAG_ATTR_ALLOWLIST.get(parsed.name) ?? new Set<string>()
@@ -326,7 +326,7 @@ export function validateTelegramHtml(input: string): ValidatedHtml {
     // Void tag rules: br must NOT have a closing form.
     if (VOID_TAGS.has(parsed.name)) {
       if (parsed.closing) {
-        return downgrade(input, `void tag has closing form: ${parsed.name}`)
+        return downgrade(input, `void tag </${parsed.name}> has closing form`)
       }
       // self-closing or bare both fine; no stack work.
       continue
@@ -334,7 +334,7 @@ export function validateTelegramHtml(input: string): ValidatedHtml {
     if (parsed.closing) {
       const top = stack.pop()
       if (top !== parsed.name) {
-        return downgrade(input, `mismatched closing tag: </${parsed.name}>`)
+        return downgrade(input, `mismatched closing tag </${parsed.name}>`)
       }
       continue
     }
@@ -346,7 +346,6 @@ export function validateTelegramHtml(input: string): ValidatedHtml {
       }
       if (!SAFE_HREF_RE.test(href)) {
         // Reason is payload-free — we never include the href value here.
-        // See M4 commit for further reason-string cleanup across all paths.
         return downgrade(input, 'unsafe href protocol on <a>')
       }
     }
@@ -359,7 +358,7 @@ export function validateTelegramHtml(input: string): ValidatedHtml {
   }
 
   if (stack.length > 0) {
-    return downgrade(input, `unclosed tag: <${stack[stack.length - 1]}>`)
+    return downgrade(input, `unclosed tag <${stack[stack.length - 1]}>`)
   }
 
   return { html: input, downgraded: false }

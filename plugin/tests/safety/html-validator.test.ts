@@ -212,3 +212,40 @@ describe('validateTelegramHtml — per-tag attribute allowlist', () => {
     }
   })
 })
+
+describe('validateTelegramHtml — clean reason strings (M4)', () => {
+  test('unsupported tag reason uses <tag> classification, no colon prefix', () => {
+    const r = validateTelegramHtml('<div>x</div>')
+    expect(r.downgraded).toBe(true)
+    expect(r.reason).toBe('unsupported tag <div>')
+  })
+
+  test('mismatched closing tag reason has clean form', () => {
+    const r = validateTelegramHtml('<b>x</i>')
+    expect(r.downgraded).toBe(true)
+    expect(r.reason).toBe('mismatched closing tag </i>')
+  })
+
+  test('unclosed tag reason has clean form', () => {
+    const r = validateTelegramHtml('<b>x')
+    expect(r.downgraded).toBe(true)
+    expect(r.reason).toBe('unclosed tag <b>')
+  })
+
+  test('unsafe href reason is classification-only — no URL fragment', () => {
+    const r = validateTelegramHtml('<a href="javascript:alert(1)">x</a>')
+    expect(r.downgraded).toBe(true)
+    expect(r.reason).toBe('unsafe href protocol on <a>')
+    // Critically: the reason must NOT have a colon-separated payload.
+    expect(r.reason).not.toContain('javascript')
+    expect(r.reason).not.toContain('alert')
+  })
+
+  test('void tag closing form reason is clean', () => {
+    const r = validateTelegramHtml('text</br>')
+    expect(r.downgraded).toBe(true)
+    expect(r.reason).toBe('void tag </br> has closing form')
+    // Critically: no `: name` payload-leak shape.
+    expect(r.reason).not.toMatch(/: \w+$/)
+  })
+})

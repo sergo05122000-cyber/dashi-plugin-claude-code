@@ -110,18 +110,23 @@ describe('createSafeTelegramApi — HTML validation', () => {
     const { api, calls } = makeStubApi()
     const { log, entries } = makeLog()
     const safe = createSafeTelegramApi(api, log)
-    await safe.sendMessage('1', '<script>x</script>', { parse_mode: 'HTML' })
+    // Use a body that contains a recognisable substring so we can prove the
+    // body itself never reaches the log ctx — only a classification reason
+    // (which legitimately names the offending tag).
+    const body = '<script>SECRET_BODY_TOKEN_XYZ</script>'
+    await safe.sendMessage('1', body, { parse_mode: 'HTML' })
     expect((calls[0]!.opts as SendMessageOpts).parse_mode).toBeUndefined()
     expect(calls[0]!.text).not.toContain('<script>')
     expect(calls[0]!.text).toContain('&lt;script&gt;')
-    // Warn log fired without leaking original text.
+    // Warn log fired without leaking original body content.
     const warns = entries.filter((e) => e.level === 'warn')
     expect(warns.length).toBeGreaterThan(0)
     const w = warns[0]!
     expect(w.msg).toContain('downgrade')
-    // The original text MUST NOT appear in the log ctx — only the reason.
+    // The original body content MUST NOT appear in the log ctx —
+    // only the classification reason (`unsupported tag <script>`).
     const ctxStr = JSON.stringify(w.ctx ?? {})
-    expect(ctxStr).not.toContain('<script>')
+    expect(ctxStr).not.toContain('SECRET_BODY_TOKEN_XYZ')
   })
 
   test('no parse_mode → no HTML validation runs', async () => {
