@@ -111,6 +111,12 @@ export const RuntimeEnvSchema = z.object({
   TELEGRAM_CONFIG_FILE: z.string().optional(),
   TELEGRAM_EXPECTED_BOT_ID: z.coerce.number().int().positive().optional(),
   TELEGRAM_ALLOWED_USER_IDS: z.string().optional(), // CSV
+  // CSV of chat ids; entries may be integers (user/group/channel id, possibly
+  // negative for supergroups) or @username strings. In a Telegram DM
+  // `chat.id == user.id`, so a DM-only deployment typically sets this to the
+  // same value as TELEGRAM_ALLOWED_USER_IDS — without this, gate.ts:
+  // chat_not_allowed silently drops every inbound DM.
+  TELEGRAM_ALLOWED_CHAT_IDS: z.string().optional(),
   TELEGRAM_WORKSPACE_ROOT: z.string().optional(),
   TELEGRAM_STATUS_INTERVAL_MS: z.coerce.number().int().positive().optional(),
   TELEGRAM_ALBUM_FLUSH_MS: z.coerce.number().int().positive().optional(),
@@ -187,6 +193,28 @@ function parseCsvUserIds(csv: string): number[] {
   return ids
 }
 
+// Chat ids are heterogeneous: groups/supergroups are negative ints, users
+// are positive ints, channels can be referenced as @username strings. We
+// keep @-prefixed entries as strings and require everything else to be a
+// non-zero integer.
+function parseCsvChatIds(csv: string): Array<number | string> {
+  const ids: Array<number | string> = []
+  for (const raw of csv.split(',')) {
+    const trimmed = raw.trim()
+    if (!trimmed) continue
+    if (trimmed.startsWith('@')) {
+      ids.push(trimmed)
+      continue
+    }
+    const n = Number(trimmed)
+    if (!Number.isInteger(n) || n === 0) {
+      throw new Error(`invalid chat id in CSV: ${JSON.stringify(trimmed)}`)
+    }
+    ids.push(n)
+  }
+  return ids
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   let parsedEnv: RuntimeEnv
   try {
@@ -226,6 +254,9 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   }
   if (parsedEnv.TELEGRAM_ALLOWED_USER_IDS !== undefined) {
     merged.allowed_user_ids = parseCsvUserIds(parsedEnv.TELEGRAM_ALLOWED_USER_IDS)
+  }
+  if (parsedEnv.TELEGRAM_ALLOWED_CHAT_IDS !== undefined) {
+    merged.allowed_chat_ids = parseCsvChatIds(parsedEnv.TELEGRAM_ALLOWED_CHAT_IDS)
   }
   if (parsedEnv.TELEGRAM_WORKSPACE_ROOT !== undefined) {
     merged.workspace_root = parsedEnv.TELEGRAM_WORKSPACE_ROOT

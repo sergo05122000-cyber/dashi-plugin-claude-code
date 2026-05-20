@@ -42,6 +42,32 @@ describe('loadConfig', () => {
     expect(cfg.allowed_user_ids).toEqual([111, 222, 333])
   })
 
+  test('parses CSV TELEGRAM_ALLOWED_CHAT_IDS into mixed int/string array', () => {
+    // Mix: positive int (user/private chat), negative int (supergroup),
+    // @username (channel reference). All three are valid chat-id shapes
+    // per the Bot API.
+    const cfg = loadConfig(env({
+      TELEGRAM_ALLOWED_CHAT_IDS: '111, -1001234567890 , @my_channel',
+    }))
+    expect(cfg.allowed_chat_ids).toEqual([111, -1001234567890, '@my_channel'])
+  })
+
+  test('TELEGRAM_ALLOWED_CHAT_IDS rejects zero and non-integers', () => {
+    expect(() => loadConfig(env({ TELEGRAM_ALLOWED_CHAT_IDS: '0' })))
+      .toThrow(/invalid chat id/i)
+    expect(() => loadConfig(env({ TELEGRAM_ALLOWED_CHAT_IDS: 'abc' })))
+      .toThrow(/invalid chat id/i)
+  })
+
+  test('TELEGRAM_ALLOWED_CHAT_IDS env wins over config.json', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+      allowed_user_ids: [999],
+      allowed_chat_ids: [999],
+    }))
+    const cfg = loadConfig(env({ TELEGRAM_ALLOWED_CHAT_IDS: '888,-100777' }))
+    expect(cfg.allowed_chat_ids).toEqual([888, -100777])
+  })
+
   test('env overrides win over config.json', () => {
     writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
       bot_id: 11111,
