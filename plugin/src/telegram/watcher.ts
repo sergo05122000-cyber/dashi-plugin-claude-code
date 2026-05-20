@@ -79,19 +79,33 @@ export class InboundWatcher {
    * Fire-and-forget entry point — caller MUST schedule via `void` so
    * channel-notification latency never depends on Telegram round-trips.
    * The method itself never throws: send failures are caught and logged.
+   *
+   * Race-safe debounce: lastReplyMs is set BEFORE the await on sendMessage,
+   * so a second invocation arriving in the same event-loop turn observes the
+   * marker and short-circuits as `debounced`. On send failure we roll the
+   * marker back to its previous value, so the next retry can still proceed
+   * iff the prior successful send (if any) is now out of window.
    */
   async maybeAutoReply(input: AutoReplyInput): Promise<AutoReplyResult> {
     try {
       if (!this.config.watcher.enabled) {
         return { replied: false, reason: 'disabled' }
       }
-      if (!this.progressReporter.isBusy(input.chatId)) {
+      if (!this.progressReporter.isBusy(input.chatId, this.config.watcher.busy_threshold_ms)) {
         return { replied: false, reason: 'not-busy' }
       }
-      const last = this.lastReplyMs.get(input.chatId)
-      if (last !== undefined && this.now() - last < this.config.watcher.debounce_ms) {
+      const now = this.now()
+      const prev = this.lastReplyMs.get(input.chatId)
+      if (prev !== undefined && now - prev < this.config.watcher.debounce_ms) {
         return { replied: false, reason: 'debounced' }
       }
+
+      // Set the marker FIRST so a concurrent invocation (same event-loop
+      // turn) sees the debounce window and returns reason='debounced' before
+      // it even reaches the Telegram round-trip. Without this, two messages
+      // arriving in the same tick could both pass the debounce guard and
+      // both call sendMessage — duplicate auto-replies on bursts.
+      this.lastReplyMs.set(input.chatId, now)
 
       const toolName = this.progressReporter.getActiveToolName(input.chatId)
       const text = composeAutoReply(toolName)
@@ -102,6 +116,14 @@ export class InboundWatcher {
           reply_to_message_id: input.messageId,
         })
       } catch (err) {
+        // Rollback the optimistic marker so the next message can retry. If
+        // there was no prior successful send for this chat, remove the entry
+        // entirely (the next call will be a true first-send).
+        if (prev === undefined) {
+          this.lastReplyMs.delete(input.chatId)
+        } else {
+          this.lastReplyMs.set(input.chatId, prev)
+        }
         this.log.warn('watcher sendMessage failed (ignored)', {
           chat_id: input.chatId,
           error: err instanceof Error ? err.message : String(err),
@@ -109,7 +131,6 @@ export class InboundWatcher {
         return { replied: false, reason: 'send-failed' }
       }
 
-      this.lastReplyMs.set(input.chatId, this.now())
       return { replied: true }
     } catch (err) {
       // Outer safety net — never escape recordEvent-style guard.
@@ -119,6 +140,18 @@ export class InboundWatcher {
       })
       return { replied: false, reason: 'send-failed' }
     }
+  }
+
+  /**
+   * Clear the debounce marker for a chat. Used by the webhook server when a
+   * `session_stop` hook fires for the chat: a fresh session should be able
+   * to receive the first auto-reply immediately, without waiting for the
+   * debounce window of the previous session to expire.
+   *
+   * Idempotent — no-op if no marker exists.
+   */
+  clearDebounce(chatId: string): void {
+    this.lastReplyMs.delete(chatId)
   }
 }
 

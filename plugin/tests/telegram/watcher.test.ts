@@ -212,7 +212,7 @@ describe('InboundWatcher', () => {
     expect(api.calls.length).toBe(0)
   })
 
-  test('send failure → { replied: false, reason: "send-failed" }, lastReplyMs not updated', async () => {
+  test('send failure → { replied: false, reason: "send-failed" }, lastReplyMs rolls back', async () => {
     const api = makeFakeApi()
     api.failSendWith = new Error('telegram down')
     const { watcher, clock } = makeWatcher({
@@ -223,11 +223,100 @@ describe('InboundWatcher', () => {
     expect(res).toEqual({ replied: false, reason: 'send-failed' })
 
     // Recovery: next call within debounce window must STILL retry, because
-    // the failed call did not update lastReplyMs.
+    // the failed call rolled the marker back to its previous value
+    // (`undefined`, since this was the very first attempt for the chat).
     delete api.failSendWith
     clock.advance(100)
     const second = await watcher.maybeAutoReply({ chatId: '111', messageId: 43, text: 'retry' })
     expect(second).toEqual({ replied: true })
+  })
+
+  test('send failure after a successful send rolls back to the previous timestamp', async () => {
+    const api = makeFakeApi()
+    const { watcher, clock } = makeWatcher({
+      api,
+      progress: makeFakeProgress({ busy: true, toolName: 'Bash' }),
+    })
+    // First call succeeds — establishes lastReplyMs.
+    const first = await watcher.maybeAutoReply({ chatId: '111', messageId: 1, text: 'a' })
+    expect(first).toEqual({ replied: true })
+    // Advance past the debounce window so the next call would otherwise pass.
+    clock.advance(15_000)
+    // Second call fails — marker must NOT advance to the failed-call time,
+    // it must stay at the timestamp of the prior successful send.
+    api.failSendWith = new Error('telegram down')
+    const second = await watcher.maybeAutoReply({ chatId: '111', messageId: 2, text: 'b' })
+    expect(second).toEqual({ replied: false, reason: 'send-failed' })
+    // Recovery: a third call right after the failure should succeed (the
+    // previous successful send is now ~15s old, past the 10s debounce).
+    delete api.failSendWith
+    const third = await watcher.maybeAutoReply({ chatId: '111', messageId: 3, text: 'c' })
+    expect(third).toEqual({ replied: true })
+    // Sanity: api recorded two successful sends.
+    expect(api.calls.length).toBe(2)
+  })
+
+  test('concurrent calls collapse to exactly one sendMessage (debounce race)', async () => {
+    // Critical race regression test: two messages arriving in the same
+    // event-loop turn must NOT both trigger sendMessage. The marker is set
+    // before the await — the second invocation observes it and short-circuits.
+    let resolveSend: (() => void) | undefined
+    const api: FakeApi = makeFakeApi()
+    // Replace sendMessage with a version that parks on the first call so we
+    // can stage a true concurrent invocation. The second invocation must
+    // observe the marker BEFORE the parked send resolves.
+    api.api = {
+      ...api.api,
+      sendMessage: async (chatId: string, text: string, opts) => {
+        await new Promise<void>((resolve) => {
+          resolveSend = resolve
+        })
+        const entry: ApiCall = { chatId, text }
+        if (opts.parse_mode !== undefined) entry.parse_mode = opts.parse_mode
+        if (opts.reply_to_message_id !== undefined) {
+          entry.reply_to_message_id = opts.reply_to_message_id
+        }
+        api.calls.push(entry)
+        return { message_id: 999 }
+      },
+    } as TelegramApi
+    const { watcher } = makeWatcher({
+      api,
+      progress: makeFakeProgress({ busy: true, toolName: 'Bash' }),
+    })
+
+    const [r1, r2] = await Promise.all([
+      // Kick the parked send.
+      watcher
+        .maybeAutoReply({ chatId: 'X', messageId: 1, text: 'a' })
+        .finally(() => undefined),
+      // Stage the second call in the same tick. Microtask ordering: r2
+      // schedules synchronously before the parked send resolves.
+      (async () => {
+        const res = await watcher.maybeAutoReply({ chatId: 'X', messageId: 2, text: 'b' })
+        // Release the parked send only after the second result is observed,
+        // proving the second call short-circuited without waiting on Telegram.
+        resolveSend?.()
+        return res
+      })(),
+    ])
+    expect(r2).toEqual({ replied: false, reason: 'debounced' })
+    expect(r1).toEqual({ replied: true })
+    expect(api.calls.length).toBe(1)
+  })
+
+  test('clearDebounce resets the marker so a debounced chat can reply again', async () => {
+    const { watcher, api, clock } = makeWatcher({
+      progress: makeFakeProgress({ busy: true, toolName: 'Bash' }),
+    })
+    const first = await watcher.maybeAutoReply({ chatId: '111', messageId: 1, text: 'a' })
+    expect(first).toEqual({ replied: true })
+    // Within debounce window → would normally be blocked.
+    clock.advance(100)
+    watcher.clearDebounce('111')
+    const second = await watcher.maybeAutoReply({ chatId: '111', messageId: 2, text: 'b' })
+    expect(second).toEqual({ replied: true })
+    expect(api.calls.length).toBe(2)
   })
 
   test('HTML special chars in tool name are escaped', async () => {
