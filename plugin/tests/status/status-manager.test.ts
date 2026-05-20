@@ -45,6 +45,17 @@ function makeConfig(overrides: Partial<AppConfig['status']> = {}): AppConfig {
       recent_buffer: 10,
       session_ttl_ms: 600000,
     },
+    task_mirror: {
+      enabled: true,
+      edit_throttle_ms: 3000,
+      session_ttl_ms: 600000,
+      collapse_completed_after: 5,
+    },
+    watcher: {
+      enabled: true,
+      debounce_ms: 10_000,
+      busy_threshold_ms: 30_000,
+    },
   }
 }
 

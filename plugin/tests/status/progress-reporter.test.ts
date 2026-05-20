@@ -71,6 +71,17 @@ function makeConfig(overrides: Partial<AppConfig['progress']> = {}): AppConfig {
       session_ttl_ms: 10 * 60 * 1000,
       ...overrides,
     },
+    task_mirror: {
+      enabled: true,
+      edit_throttle_ms: 3000,
+      session_ttl_ms: 10 * 60 * 1000,
+      collapse_completed_after: 5,
+    },
+    watcher: {
+      enabled: true,
+      debounce_ms: 10_000,
+      busy_threshold_ms: 30_000,
+    },
   }
 }
 
