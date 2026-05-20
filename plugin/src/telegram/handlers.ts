@@ -48,6 +48,7 @@ import {
   type PermissionRelayHooks,
 } from '../channel/permissions.js'
 import { AlbumBuffer, type Album } from './album-buffer.js'
+import type { InboundWatcher } from './watcher.js'
 
 // A single buffered album item — one Telegram update that belongs to an
 // album. We capture everything needed to emit a combined channel notification
@@ -103,6 +104,13 @@ export interface HandlerDeps {
   // tests still compile — when absent, every media message goes through
   // the single-media path (no album merging).
   albumBuffer?: AlbumBuffer<AlbumEntry>
+  // PR-A3 (2026-05-20): InboundWatcher fires an auto-reply «Тралл занят»
+  // when the warchief sends plain text mid-tool. Optional so older tests
+  // compile — when absent, the watcher branch is skipped and behaviour
+  // matches the pre-A3 path. Insertion point in handleInboundText sits
+  // AFTER OOB resolution and BEFORE gateAndNotify: OOB still wins, and
+  // Claude still receives the channel notification regardless.
+  watcher?: InboundWatcher
 }
 
 // Coerce grammY's reply_to_message Message shape into the narrower
@@ -127,6 +135,45 @@ function adaptReply(
   if (reply.text !== undefined) out.text = reply.text
   if (reply.caption !== undefined) out.caption = reply.caption
   return out
+}
+
+// PR-A3 — auto-reply gate. The InboundWatcher must never fire for
+// senders/chats that aren't on the allowlist: a future group-chat use of
+// the bot would otherwise leak bot activity to non-allowed senders. We
+// mirror the OOB short-circuit's allowlist check (allowed_user_ids AND
+// allowed_chat_ids — defence in depth even when the gate lets the message
+// through). DM-only is NOT required here; auto-reply makes sense in any
+// allowlisted chat. Returns true when the watcher is permitted to fire.
+function watcherAllowed(ctx: Context, config: AppConfig): boolean {
+  const senderNum = ctx.from?.id
+  const chatNum = ctx.chat?.id
+  if (senderNum === undefined || chatNum === undefined) return false
+  if (!config.allowed_user_ids.includes(senderNum)) return false
+  // allowed_chat_ids may be a mix of strings and numbers — coerce both
+  // sides to string for comparison, same as the OOB block does.
+  const allowedChatSet = new Set(config.allowed_chat_ids.map((v) => String(v)))
+  if (!allowedChatSet.has(String(chatNum))) return false
+  return true
+}
+
+// Fire-and-forget watcher trigger. Encapsulates the allowlist gate +
+// `void`/`.catch` boilerplate so every inbound handler (text + media) can
+// invoke the watcher with one call. Optional `deps.watcher` makes this a
+// no-op when the watcher isn't configured — older tests stay compatible.
+function maybeTriggerWatcher(ctx: Context, deps: HandlerDeps): void {
+  if (!deps.watcher) return
+  if (!watcherAllowed(ctx, deps.config)) return
+  const chatNum = ctx.chat?.id
+  const msgId = ctx.message?.message_id
+  if (chatNum === undefined || msgId === undefined) return
+  void deps.watcher
+    .maybeAutoReply({ chatId: String(chatNum), messageId: msgId })
+    .catch((err) => {
+      deps.log.warn('watcher auto-reply error (ignored)', {
+        chat_id: String(chatNum),
+        error: err instanceof Error ? err.message : String(err),
+      })
+    })
 }
 
 // Extract the four fields the gate cares about from a grammY Context. Kept
@@ -495,6 +542,15 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
       return
     }
   }
+
+  // PR-A3 watcher hook (after OOB resolution, before gate/notify): if Claude
+  // is mid-tool for this chat, auto-reply «Тралл занят». Gated on the
+  // allowlist — only allowed senders in allowed chats can trigger it.
+  // Fire-and-forget — channel-notification latency must NOT depend on the
+  // auto-reply round-trip. Auto-reply does NOT replace the channel notification
+  // — gateAndNotify still runs below so Claude sees the message normally.
+  maybeTriggerWatcher(ctx, deps)
+
   await gateAndNotify(ctx, deps, () => text, undefined, 'text')
 }
 
@@ -503,6 +559,9 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
 // ─────────────────────────────────────────────────────────────────────
 
 export async function handleInboundPhoto(ctx: Context, deps: HandlerDeps): Promise<void> {
+  // PR-A3: same watcher hook as text. Media handlers must surface
+  // «Тралл занят» too — otherwise a busy-session photo/voice silently waits.
+  maybeTriggerWatcher(ctx, deps)
   const buildPhoto = async (): Promise<MediaDescriptor[]> => {
     const sizes = ctx.message?.photo
     if (!sizes || sizes.length === 0) return []
@@ -538,6 +597,7 @@ export async function handleInboundPhoto(ctx: Context, deps: HandlerDeps): Promi
 // ─────────────────────────────────────────────────────────────────────
 
 export async function handleInboundDocument(ctx: Context, deps: HandlerDeps): Promise<void> {
+  maybeTriggerWatcher(ctx, deps)
   const buildDoc = async (): Promise<MediaDescriptor[]> => {
     const doc = ctx.message?.document
     if (!doc) return []
@@ -560,6 +620,7 @@ export async function handleInboundDocument(ctx: Context, deps: HandlerDeps): Pr
 // ─────────────────────────────────────────────────────────────────────
 
 export async function handleInboundVoice(ctx: Context, deps: HandlerDeps): Promise<void> {
+  maybeTriggerWatcher(ctx, deps)
   await gateAndNotify(
     ctx,
     deps,
@@ -610,6 +671,7 @@ export async function handleInboundVoice(ctx: Context, deps: HandlerDeps): Promi
 // ─────────────────────────────────────────────────────────────────────
 
 export async function handleInboundAudio(ctx: Context, deps: HandlerDeps): Promise<void> {
+  maybeTriggerWatcher(ctx, deps)
   const buildAudio = async (): Promise<MediaDescriptor[]> => {
     const audio = ctx.message?.audio
     if (!audio) return []
@@ -634,6 +696,7 @@ export async function handleInboundAudio(ctx: Context, deps: HandlerDeps): Promi
 // ─────────────────────────────────────────────────────────────────────
 
 export async function handleInboundVideo(ctx: Context, deps: HandlerDeps): Promise<void> {
+  maybeTriggerWatcher(ctx, deps)
   const buildVideo = async (): Promise<MediaDescriptor[]> => {
     const video = ctx.message?.video
     if (!video) return []
@@ -659,6 +722,7 @@ export async function handleInboundVideo(ctx: Context, deps: HandlerDeps): Promi
 // ─────────────────────────────────────────────────────────────────────
 
 export async function handleInboundVideoNote(ctx: Context, deps: HandlerDeps): Promise<void> {
+  maybeTriggerWatcher(ctx, deps)
   await gateAndNotify(
     ctx,
     deps,
@@ -683,6 +747,7 @@ export async function handleInboundVideoNote(ctx: Context, deps: HandlerDeps): P
 // ─────────────────────────────────────────────────────────────────────
 
 export async function handleInboundSticker(ctx: Context, deps: HandlerDeps): Promise<void> {
+  maybeTriggerWatcher(ctx, deps)
   await gateAndNotify(
     ctx,
     deps,

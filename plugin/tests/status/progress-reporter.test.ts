@@ -71,6 +71,17 @@ function makeConfig(overrides: Partial<AppConfig['progress']> = {}): AppConfig {
       session_ttl_ms: 10 * 60 * 1000,
       ...overrides,
     },
+    task_mirror: {
+      enabled: true,
+      edit_throttle_ms: 3000,
+      session_ttl_ms: 10 * 60 * 1000,
+      collapse_completed_after: 5,
+    },
+    watcher: {
+      enabled: true,
+      debounce_ms: 10_000,
+      busy_threshold_ms: 30_000,
+    },
   }
 }
 
@@ -439,6 +450,94 @@ describe('ProgressReporter', () => {
     // Masked form keeps first 4 / last 4 chars of the token only — the
     // 32-X middle must be gone.
     expect(sends[0]!.text).not.toContain('XXXXXXXX')
+  })
+
+  // ───────────────────────────────────────────────────────────────────
+  // Public read API for the watcher (PR-A3 prerequisite).
+  // ───────────────────────────────────────────────────────────────────
+
+  test('isBusy returns false for an unknown chat', () => {
+    const { reporter } = makeReporter()
+    expect(reporter.isBusy('unknown-chat', 30_000)).toBe(false)
+  })
+
+  test('isBusy returns true within thresholdMs after a tool_start', async () => {
+    const { reporter, clock } = makeReporter()
+    await reporter.recordEvent('chat-busy', bashStart('t1'))
+    // At t+10ms with a 30s threshold we must still be busy.
+    clock.advance(10)
+    expect(reporter.isBusy('chat-busy', 30_000)).toBe(true)
+  })
+
+  test('isBusy returns false after thresholdMs with no further activity', async () => {
+    const { reporter, clock } = makeReporter()
+    await reporter.recordEvent('chat-cooling', bashStart('t1'))
+    // At t+30_001ms with a 30s threshold we must look idle.
+    clock.advance(30_001)
+    expect(reporter.isBusy('chat-cooling', 30_000)).toBe(false)
+  })
+
+  test('isBusy uses strict < for boundary: elapsed === threshold is NOT busy', async () => {
+    const { reporter, clock } = makeReporter()
+    await reporter.recordEvent('chat-edge', bashStart('t1'))
+    clock.advance(30_000)
+    expect(reporter.isBusy('chat-edge', 30_000)).toBe(false)
+    // One tick under the boundary — still busy.
+    const { reporter: r2, clock: c2 } = makeReporter()
+    await r2.recordEvent('chat-edge2', bashStart('t1'))
+    c2.advance(29_999)
+    expect(r2.isBusy('chat-edge2', 30_000)).toBe(true)
+  })
+
+  test('isBusy returns false after session_stop even within the threshold', async () => {
+    const { reporter, clock } = makeReporter()
+    await reporter.recordEvent('chat-stopping', bashStart('t1'))
+    clock.advance(100)
+    await reporter.recordEvent('chat-stopping', STOP)
+    // Entry is fully evicted on stop — same observable outcome as a
+    // never-seen chat.
+    expect(reporter.isBusy('chat-stopping', 30_000)).toBe(false)
+  })
+
+  test('isBusy with tight threshold marks a recent chat as idle', async () => {
+    const { reporter, clock } = makeReporter()
+    await reporter.recordEvent('chat-tight', bashStart('t1'))
+    clock.advance(100)
+    // 50ms threshold; we are at t+100, so the chat is past the override.
+    expect(reporter.isBusy('chat-tight', 50)).toBe(false)
+    // 30s threshold still considers it busy.
+    expect(reporter.isBusy('chat-tight', 30_000)).toBe(true)
+  })
+
+  test('getActiveToolName returns the most recent tool', async () => {
+    const { reporter } = makeReporter()
+    await reporter.recordEvent('chat-tools', bashStart('t1'))
+    await reporter.recordEvent('chat-tools', readStart('t2'))
+    expect(reporter.getActiveToolName('chat-tools')).toBe('Read')
+  })
+
+  test('getActiveToolName returns undefined when no entry exists', () => {
+    const { reporter } = makeReporter()
+    expect(reporter.getActiveToolName('nobody')).toBeUndefined()
+  })
+
+  test('getActiveToolName stays populated after a matching tool_end (semantic pin)', async () => {
+    // Documented intentional behaviour: tool_end does NOT clear the active
+    // tool. The brief idle gap between tool_end and the next tool_start
+    // would otherwise cause false-negative auto-replies (watcher sees
+    // «not busy» even though Claude is in the middle of a multi-step chain).
+    const { reporter } = makeReporter()
+    await reporter.recordEvent('chat-x', bashStart('t1'))
+    expect(reporter.getActiveToolName('chat-x')).toBe('Bash')
+    await reporter.recordEvent('chat-x', {
+      kind: 'tool_end',
+      toolName: 'Bash',
+      toolInput: { command: 'echo hi' },
+      toolUseId: 't1',
+    })
+    // After tool_end, the name is unchanged — calls window is render-only
+    // for non-start events.
+    expect(reporter.getActiveToolName('chat-x')).toBe('Bash')
   })
 
   test('editMessageText failure is swallowed; next event still produces a successful edit', async () => {

@@ -40,22 +40,13 @@ import {
   type ActivitySnapshot,
 } from './activity-renderer.js'
 
-// Minimal Telegram surface we touch. Defined as a structural interface
-// so tests can stub without grammY. Compatible with the production
-// TelegramApi from src/channel/tools.ts via structural typing.
-export interface TelegramApiForProgress {
-  sendMessage(
-    chatId: string,
-    text: string,
-    opts: { parse_mode?: 'HTML' | 'MarkdownV2'; reply_to_message_id?: number },
-  ): Promise<{ message_id: number }>
-  editMessageText(
-    chatId: string,
-    messageId: number,
-    text: string,
-    opts: { parse_mode?: 'HTML' | 'MarkdownV2' },
-  ): Promise<void>
-}
+// Telegram surface shared with task-mirror. Canonical definition lives in
+// `./telegram-api.ts` so both modules depend on it instead of on each
+// other. Re-exported here for back-compat with existing imports
+// (`from './progress-reporter.js'` is still legal but new code should
+// import from `./telegram-api.js` directly).
+export type { TelegramApiForProgress } from './telegram-api.js'
+import type { TelegramApiForProgress } from './telegram-api.js'
 
 export interface ProgressReporterDeps {
   telegramApi: TelegramApiForProgress
@@ -145,6 +136,55 @@ export class ProgressReporter {
         error: err instanceof Error ? err.message : String(err),
       })
     }
+  }
+
+  /**
+   * Read-only: returns true if a Claude session is actively running tools
+   * for this chat — used by InboundWatcher to decide whether to auto-reply
+   * «Тралл занят». Definition:
+   *   entry exists AND !entry.stopped AND (now - lastActivityMs) < threshold
+   *
+   * `thresholdMs` is REQUIRED — the watcher owns the threshold via its
+   * own config slice and passes it in. This module deliberately does NOT
+   * reach into `config.watcher` to keep the dependency direction one-way
+   * (status module is upstream of watcher; watcher reads from us, not the
+   * other way around).
+   *
+   * Boundary semantics: strict `<` so a tick at exactly the threshold is
+   * already considered idle — matches the natural «more than N ms idle =
+   * not busy» reading.
+   */
+  isBusy(chatId: string, thresholdMs: number): boolean {
+    const entry = this.chats.get(chatId)
+    if (!entry || entry.stopped) return false
+    return this.now() - entry.lastActivityMs < thresholdMs
+  }
+
+  /**
+   * Returns the most recently OBSERVED tool name from the calls window for
+   * this chat, or `undefined` if no entry exists / no tools have been
+   * recorded. Used by InboundWatcher to compose the auto-reply body —
+   * «активный инструмент: Bash».
+   *
+   * Important semantic note for future maintainers:
+   *   The name STAYS POPULATED after `tool_end`. We do NOT clear it on
+   *   tool completion. This is intentional — the watcher's busy-threshold
+   *   accounts for the gap between `tool_end` and the next `tool_start`.
+   *   Returning `undefined` here during that brief idle window would cause
+   *   false-negative auto-replies (the watcher would see «not busy» and
+   *   suppress the «Тралл занят» message even though Claude is about to
+   *   call the next tool any millisecond now).
+   *
+   *   `tool_end` is render-only inside this module (see applyEvent) — it
+   *   moves the elapsed counter forward without mutating `entry.calls`.
+   *   The latest call therefore continues to anchor the «active tool»
+   *   answer until either (a) a fresh `tool_start` overwrites it or
+   *   (b) the chat is evicted by session_stop / TTL.
+   */
+  getActiveToolName(chatId: string): string | undefined {
+    const entry = this.chats.get(chatId)
+    if (!entry || entry.calls.length === 0) return undefined
+    return entry.calls[entry.calls.length - 1]?.toolName
   }
 
   /**

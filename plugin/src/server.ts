@@ -39,6 +39,8 @@ import { createSafeTelegramApi } from './safety/safe-telegram-api.js'
 import { redactSecrets } from './safety/redact.js'
 import { StatusManager } from './status/status-manager.js'
 import { ProgressReporter } from './status/progress-reporter.js'
+import { TaskMirror } from './status/task-mirror.js'
+import { InboundWatcher } from './telegram/watcher.js'
 import { MemoryWriter, type MemoryConfig } from './memory/writer.js'
 import { dirname as pathDirname } from 'path'
 import {
@@ -264,6 +266,24 @@ const statusManager = new StatusManager({ telegramApi, config, log })
 // survives. Both fire in parallel from the webhook handler.
 const progressReporter = new ProgressReporter({ telegramApi, config, log })
 
+// TaskMirror (PR-A2, 2026-05-20) — third rolling Telegram message per chat
+// showing Claude's TodoWrite milestones. Independent of the two surfaces
+// above; uses the same safe-wrapped telegramApi so every text/edit goes
+// through redact + HTML validation before leaving the process.
+const taskMirror = new TaskMirror({ telegramApi, config, log })
+
+// InboundWatcher (PR-A3, 2026-05-20) — auto-reply «Тралл занят» when the
+// warchief sends plain text while ProgressReporter says the session is
+// mid-tool. The watcher receives `progressReporter` for read-only busy
+// detection — never mutates reporter state. Debounce + safe-api enforced
+// inside the watcher.
+const inboundWatcher = new InboundWatcher({
+  telegramApi,
+  config,
+  log,
+  progressReporter,
+})
+
 // Phase 8 / T7: MemoryWriter persists turns to <workspace>/core/hot/recent.md
 // and <workspace_parent>/logs/verbose-YYYY-MM-DD.jsonl. Only instantiated
 // when config.memory.enabled === true AND workspace_path is set — schema
@@ -405,6 +425,7 @@ const handlerDeps: HandlerDeps = {
   permissionHooks,
   statusManager,
   albumBuffer,
+  watcher: inboundWatcher,
 }
 
 bot.on('message:text', ctx => handleInboundText(ctx, handlerDeps))
@@ -546,6 +567,8 @@ try {
     log,
     statusManager,
     progressReporter,
+    taskMirror,
+    watcher: inboundWatcher,
     ...(memoryWriter !== undefined ? { memoryWriter } : {}),
   })
 } catch (err) {

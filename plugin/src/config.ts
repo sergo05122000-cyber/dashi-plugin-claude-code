@@ -98,6 +98,35 @@ export const AppConfigSchema = z.object({
     recent_buffer: z.number().int().positive().default(10),
     session_ttl_ms: z.number().int().positive().default(10 * 60 * 1000),
   }).default({}),
+  // TaskMirror (PR-A2, 2026-05-20) — third rolling Telegram message per chat,
+  // showing Claude's TodoWrite milestones (in-progress / pending / completed).
+  // Coexists with StatusManager bubble and ProgressReporter activity thread —
+  // never shares state. Single-slot queue + throttle + TTL exactly mirror
+  // ProgressReporter so behaviour stays predictable.
+  //
+  // collapse_completed_after: keep last N completed items in the rendered
+  // list, older ones collapse to «+M завершено ранее» — the warchief wants
+  // to see the active milestone, not a wall of done items.
+  task_mirror: z.object({
+    enabled: z.boolean().default(true),
+    edit_throttle_ms: z.number().int().nonnegative().default(3000),
+    session_ttl_ms: z.number().int().positive().default(10 * 60 * 1000),
+    collapse_completed_after: z.number().int().nonnegative().default(5),
+  }).default({}),
+  // InboundWatcher (PR-A3, 2026-05-20) — auto-reply «Тралл занят» when the
+  // warchief sends plain text while a Claude session is mid-tool. Debounced
+  // per chat (debounce_ms = 10s by default) so a burst of messages doesn't
+  // bury the conversation in auto-acks. Busy threshold is the ProgressReporter
+  // lastActivityMs window — anything more recent than busy_threshold_ms
+  // counts as «still working».
+  //
+  // The watcher NEVER replaces the channel notification — it auto-replies
+  // AND lets the original message flow to Claude through the normal path.
+  watcher: z.object({
+    enabled: z.boolean().default(true),
+    debounce_ms: z.number().int().nonnegative().default(10_000),
+    busy_threshold_ms: z.number().int().positive().default(30_000),
+  }).default({}),
 })
 export type AppConfig = z.infer<typeof AppConfigSchema>
 

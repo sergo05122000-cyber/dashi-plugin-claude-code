@@ -92,6 +92,35 @@ const ClaudeHookCommonShape = {
 // downstream without forcing schema churn on every Claude version bump.
 const ToolInputSchema = z.record(z.unknown())
 
+// TodoWrite tool_input shape. Used by TaskMirror to render Claude's
+// in-progress / pending / completed milestone list as a rolling Telegram
+// thread. The wire `ClaudePostToolUseSchema.tool_input` stays as the
+// permissive `ToolInputSchema` (opaque record) so we don't reject unknown
+// TodoWrite shape variants at the webhook boundary — instead, the mapper
+// in `src/hooks/claude-events.ts` calls `TodoWriteInputSchema.safeParse`
+// on `tool_input` when `tool_name === 'TodoWrite'` and degrades gracefully
+// when parsing fails.
+//
+// `.passthrough()` is mandatory on both schemas so the Claude Code harness
+// can add fields (e.g. metadata, scheduling hints) without breaking parsing.
+export const TodoItemSchema = z
+  .object({
+    id: z.string().optional(),
+    content: z.string(),
+    status: z.enum(['pending', 'in_progress', 'completed']),
+    priority: z.enum(['high', 'medium', 'low']).optional(),
+    activeForm: z.string().optional(),
+  })
+  .passthrough()
+export type TodoItem = z.infer<typeof TodoItemSchema>
+
+export const TodoWriteInputSchema = z
+  .object({
+    todos: z.array(TodoItemSchema),
+  })
+  .passthrough()
+export type TodoWriteInput = z.infer<typeof TodoWriteInputSchema>
+
 export const ClaudePreToolUseSchema = z
   .object({
     ...ClaudeHookCommonShape,
