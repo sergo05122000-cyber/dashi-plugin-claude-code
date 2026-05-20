@@ -440,6 +440,90 @@ describe('handleInboundText — InboundWatcher (PR-A3)', () => {
     rmSync(statePaths.root, { recursive: true, force: true })
   })
 
+  test('plain text from NOT allowed sender + busy session → watcher does NOT fire', async () => {
+    // Sender NOT in allowed_user_ids. The watcher must NOT auto-reply
+    // even though the session is «busy», because the warchief explicitly
+    // gated the watcher on the allowlist (Fix #3 — prevents future group-chat
+    // bot activity from leaking to non-allowed senders).
+    const sendCalls: Array<{ chatId: string; text: string }> = []
+    const tg = makeTelegramApi()
+    const api: TelegramApi = {
+      ...tg.api,
+      sendMessage: async (chatId, text) => {
+        sendCalls.push({ chatId, text })
+        return { message_id: 500 }
+      },
+    }
+    const watcher = new InboundWatcher({
+      telegramApi: api,
+      config: makeConfig(),
+      log: silentLog,
+      progressReporter: makeFakeProgress(true, 'Bash'),
+    })
+    const serverSpy = makeServerSpy()
+    const { deps, statePaths } = makeDeps({
+      server: serverSpy.server,
+      telegramApi: api,
+      watcher,
+    })
+    // Sender id NOT in default allowed_user_ids ([164795011]).
+    const ctx = makeCtx({
+      text: 'hi from random user',
+      chatId: 164795011,
+      chatType: 'private',
+      fromId: 99999,
+    })
+
+    await handleInboundText(ctx, deps)
+    // Drain the fire-and-forget watcher microtask.
+    await new Promise((r) => setTimeout(r, 0))
+
+    // Watcher did NOT fire — no auto-reply.
+    expect(sendCalls.length).toBe(0)
+    // The channel notification path is gated independently — gateAndNotify
+    // also drops a non-allowed sender, so serverSpy is empty too.
+    expect(serverSpy.calls.length).toBe(0)
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+
+  test('plain text from allowed sender + chat NOT in allowlist + busy → watcher does NOT fire', async () => {
+    const sendCalls: Array<{ chatId: string; text: string }> = []
+    const tg = makeTelegramApi()
+    const api: TelegramApi = {
+      ...tg.api,
+      sendMessage: async (chatId, text) => {
+        sendCalls.push({ chatId, text })
+        return { message_id: 600 }
+      },
+    }
+    const watcher = new InboundWatcher({
+      telegramApi: api,
+      config: makeConfig(),
+      log: silentLog,
+      progressReporter: makeFakeProgress(true, 'Bash'),
+    })
+    const serverSpy = makeServerSpy()
+    const { deps, statePaths } = makeDeps({
+      server: serverSpy.server,
+      telegramApi: api,
+      watcher,
+    })
+    // Sender is allowed but chat id 88888 is NOT.
+    const ctx = makeCtx({
+      text: 'hi from allowed user in wrong chat',
+      chatId: 88888,
+      chatType: 'private',
+      fromId: 164795011,
+    })
+
+    await handleInboundText(ctx, deps)
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(sendCalls.length).toBe(0)
+    expect(serverSpy.calls.length).toBe(0)
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+
   test('plain text + NOT busy → watcher no-ops, channel notify still runs', async () => {
     const sendCalls: Array<{ chatId: string; text: string }> = []
     const tg = makeTelegramApi()
