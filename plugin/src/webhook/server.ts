@@ -23,9 +23,10 @@ import type { Logger } from '../log.js'
 import { writeDeadLetter } from '../state/store.js'
 import { WebhookPayloadSchema, type WebhookPayload } from '../schemas.js'
 import { sendChannelNotification, normalizeMeta } from '../channel/notify.js'
-import { toActivityEvent } from '../hooks/claude-events.js'
+import { toActivityEvent, toTodoWriteEvent } from '../hooks/claude-events.js'
 import type { MemoryWriter } from '../memory/writer.js'
 import type { ProgressReporter } from '../status/progress-reporter.js'
+import type { TaskMirror } from '../status/task-mirror.js'
 
 const BODY_LIMIT_BYTES = 256 * 1024
 const DEFAULT_AGENT_ID = 'dashi-channel'
@@ -58,6 +59,12 @@ export interface WebhookDeps {
   // can omit it. Failures inside the reporter never propagate (it logs
   // and swallows) so no error handling is required at the call site.
   progressReporter?: ProgressReporter
+  // TaskMirror (PR-A2, 2026-05-20): third sibling that owns a rolling
+  // TodoWrite milestone message per chat. Optional — when absent, the
+  // dispatch block below is skipped. Errors inside `recordEvent` are
+  // logged and swallowed; we still defensively wrap in try/catch here
+  // to match the statusManager / progressReporter pattern.
+  taskMirror?: TaskMirror
 }
 
 export interface WebhookServerHandle {
@@ -180,7 +187,7 @@ async function handleRequest(
   deps: WebhookDeps,
   webhookToken: string | undefined,
 ): Promise<void> {
-  const { config, statePaths, log, mcpServer, statusManager, memoryWriter, progressReporter } = deps
+  const { config, statePaths, log, mcpServer, statusManager, memoryWriter, progressReporter, taskMirror } = deps
   const method = req.method ?? 'GET'
   const url = req.url ?? '/'
 
@@ -331,6 +338,24 @@ async function handleRequest(
           hook: payload.hook_event_name,
           error: err instanceof Error ? err.message : String(err),
         })
+      }
+    }
+
+    // PR-A2 (2026-05-20): TaskMirror handles TodoWrite + Stop hooks. The
+    // mapper returns null for every other event, so the cost when no
+    // TodoWrite is in flight is one schema test per hook — negligible.
+    if (taskMirror) {
+      const todoEvent = toTodoWriteEvent(payload, log)
+      if (todoEvent !== null) {
+        try {
+          await taskMirror.recordEvent(payload.chatId, todoEvent)
+        } catch (err) {
+          log.warn('hook event task mirror update failed (ignored)', {
+            chat_id: payload.chatId,
+            hook: payload.hook_event_name,
+            error: err instanceof Error ? err.message : String(err),
+          })
+        }
       }
     }
 
