@@ -521,6 +521,25 @@ describe('ProgressReporter', () => {
     expect(reporter.getActiveToolName('nobody')).toBeUndefined()
   })
 
+  test('getActiveToolName stays populated after a matching tool_end (semantic pin)', async () => {
+    // Documented intentional behaviour: tool_end does NOT clear the active
+    // tool. The brief idle gap between tool_end and the next tool_start
+    // would otherwise cause false-negative auto-replies (watcher sees
+    // «not busy» even though Claude is in the middle of a multi-step chain).
+    const { reporter } = makeReporter()
+    await reporter.recordEvent('chat-x', bashStart('t1'))
+    expect(reporter.getActiveToolName('chat-x')).toBe('Bash')
+    await reporter.recordEvent('chat-x', {
+      kind: 'tool_end',
+      toolName: 'Bash',
+      toolInput: { command: 'echo hi' },
+      toolUseId: 't1',
+    })
+    // After tool_end, the name is unchanged — calls window is render-only
+    // for non-start events.
+    expect(reporter.getActiveToolName('chat-x')).toBe('Bash')
+  })
+
   test('editMessageText failure is swallowed; next event still produces a successful edit', async () => {
     const api = makeFakeApi()
     const { reporter, clock } = makeReporter({ api })

@@ -170,10 +170,25 @@ export class ProgressReporter {
   }
 
   /**
-   * Read-only: returns the most recent tool name in the rolling activity
-   * window for this chat, or `undefined` if no entry exists / no tools
-   * have been recorded. Used by InboundWatcher to compose the auto-reply
-   * body — «активный инструмент: Bash».
+   * Returns the most recently OBSERVED tool name from the calls window for
+   * this chat, or `undefined` if no entry exists / no tools have been
+   * recorded. Used by InboundWatcher to compose the auto-reply body —
+   * «активный инструмент: Bash».
+   *
+   * Important semantic note for future maintainers:
+   *   The name STAYS POPULATED after `tool_end`. We do NOT clear it on
+   *   tool completion. This is intentional — the watcher's busy-threshold
+   *   accounts for the gap between `tool_end` and the next `tool_start`.
+   *   Returning `undefined` here during that brief idle window would cause
+   *   false-negative auto-replies (the watcher would see «not busy» and
+   *   suppress the «Тралл занят» message even though Claude is about to
+   *   call the next tool any millisecond now).
+   *
+   *   `tool_end` is render-only inside this module (see applyEvent) — it
+   *   moves the elapsed counter forward without mutating `entry.calls`.
+   *   The latest call therefore continues to anchor the «active tool»
+   *   answer until either (a) a fresh `tool_start` overwrites it or
+   *   (b) the chat is evicted by session_stop / TTL.
    */
   getActiveToolName(chatId: string): string | undefined {
     const entry = this.chats.get(chatId)
