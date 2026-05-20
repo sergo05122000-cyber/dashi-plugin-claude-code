@@ -458,23 +458,35 @@ describe('ProgressReporter', () => {
 
   test('isBusy returns false for an unknown chat', () => {
     const { reporter } = makeReporter()
-    expect(reporter.isBusy('unknown-chat')).toBe(false)
+    expect(reporter.isBusy('unknown-chat', 30_000)).toBe(false)
   })
 
-  test('isBusy returns true within busy_threshold_ms after a tool_start', async () => {
+  test('isBusy returns true within thresholdMs after a tool_start', async () => {
     const { reporter, clock } = makeReporter()
     await reporter.recordEvent('chat-busy', bashStart('t1'))
-    // Default busy_threshold_ms is 30_000 — at t+10ms we must still be busy.
+    // At t+10ms with a 30s threshold we must still be busy.
     clock.advance(10)
-    expect(reporter.isBusy('chat-busy')).toBe(true)
+    expect(reporter.isBusy('chat-busy', 30_000)).toBe(true)
   })
 
-  test('isBusy returns false after busy_threshold_ms with no further activity', async () => {
+  test('isBusy returns false after thresholdMs with no further activity', async () => {
     const { reporter, clock } = makeReporter()
     await reporter.recordEvent('chat-cooling', bashStart('t1'))
-    // Default threshold = 30_000ms — at t+30_001ms we must look idle.
+    // At t+30_001ms with a 30s threshold we must look idle.
     clock.advance(30_001)
-    expect(reporter.isBusy('chat-cooling')).toBe(false)
+    expect(reporter.isBusy('chat-cooling', 30_000)).toBe(false)
+  })
+
+  test('isBusy uses strict < for boundary: elapsed === threshold is NOT busy', async () => {
+    const { reporter, clock } = makeReporter()
+    await reporter.recordEvent('chat-edge', bashStart('t1'))
+    clock.advance(30_000)
+    expect(reporter.isBusy('chat-edge', 30_000)).toBe(false)
+    // One tick under the boundary — still busy.
+    const { reporter: r2, clock: c2 } = makeReporter()
+    await r2.recordEvent('chat-edge2', bashStart('t1'))
+    c2.advance(29_999)
+    expect(r2.isBusy('chat-edge2', 30_000)).toBe(true)
   })
 
   test('isBusy returns false after session_stop even within the threshold', async () => {
@@ -484,17 +496,17 @@ describe('ProgressReporter', () => {
     await reporter.recordEvent('chat-stopping', STOP)
     // Entry is fully evicted on stop — same observable outcome as a
     // never-seen chat.
-    expect(reporter.isBusy('chat-stopping')).toBe(false)
+    expect(reporter.isBusy('chat-stopping', 30_000)).toBe(false)
   })
 
-  test('isBusy accepts an explicit threshold override', async () => {
+  test('isBusy with tight threshold marks a recent chat as idle', async () => {
     const { reporter, clock } = makeReporter()
     await reporter.recordEvent('chat-tight', bashStart('t1'))
     clock.advance(100)
-    // Override to 50ms; we are at t+100, so the chat is past the override.
+    // 50ms threshold; we are at t+100, so the chat is past the override.
     expect(reporter.isBusy('chat-tight', 50)).toBe(false)
-    // Default 30s still considers it busy.
-    expect(reporter.isBusy('chat-tight')).toBe(true)
+    // 30s threshold still considers it busy.
+    expect(reporter.isBusy('chat-tight', 30_000)).toBe(true)
   })
 
   test('getActiveToolName returns the most recent tool', async () => {

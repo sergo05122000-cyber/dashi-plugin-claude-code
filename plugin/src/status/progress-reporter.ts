@@ -150,18 +150,23 @@ export class ProgressReporter {
   /**
    * Read-only: returns true if a Claude session is actively running tools
    * for this chat — used by InboundWatcher to decide whether to auto-reply
-   * «Тралл занят». Definition (per PR-A3 spec):
+   * «Тралл занят». Definition:
    *   entry exists AND !entry.stopped AND (now - lastActivityMs) < threshold
    *
-   * `thresholdMs` defaults to `config.watcher.busy_threshold_ms` so the
-   * watcher can call this without re-resolving the config every time, but
-   * the explicit override remains for tests and future callers.
+   * `thresholdMs` is REQUIRED — the watcher owns the threshold via its
+   * own config slice and passes it in. This module deliberately does NOT
+   * reach into `config.watcher` to keep the dependency direction one-way
+   * (status module is upstream of watcher; watcher reads from us, not the
+   * other way around).
+   *
+   * Boundary semantics: strict `<` so a tick at exactly the threshold is
+   * already considered idle — matches the natural «more than N ms idle =
+   * not busy» reading.
    */
-  isBusy(chatId: string, thresholdMs?: number): boolean {
+  isBusy(chatId: string, thresholdMs: number): boolean {
     const entry = this.chats.get(chatId)
     if (!entry || entry.stopped) return false
-    const limit = thresholdMs ?? this.config.watcher.busy_threshold_ms
-    return this.now() - entry.lastActivityMs <= limit
+    return this.now() - entry.lastActivityMs < thresholdMs
   }
 
   /**

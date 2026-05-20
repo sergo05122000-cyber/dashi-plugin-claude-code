@@ -29,8 +29,11 @@ import { escapeHtml } from '../format/html.js'
 // Narrow read-only view of ProgressReporter — watcher must not mutate
 // reporter state. Both methods are implemented in `progress-reporter.ts`
 // as plain accessors over `chats: Map<string, ChatProgressEntry>`.
+// `thresholdMs` on isBusy is REQUIRED: ProgressReporter never reads
+// `config.watcher` (dependency direction is one-way), so the watcher
+// owns the threshold and passes it in every call.
 export interface ProgressReporterForWatcher {
-  isBusy(chatId: string, thresholdMs?: number): boolean
+  isBusy(chatId: string, thresholdMs: number): boolean
   getActiveToolName(chatId: string): string | undefined
 }
 
