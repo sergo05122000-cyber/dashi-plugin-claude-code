@@ -23,7 +23,7 @@ import {
   TaskMirror,
   renderTodoList,
 } from '../../src/status/task-mirror.js'
-import type { TelegramApiForProgress } from '../../src/status/progress-reporter.js'
+import type { TelegramApiForProgress } from '../../src/status/telegram-api.js'
 import type { AppConfig } from '../../src/config.js'
 import type { TaskMirrorEvent } from '../../src/hooks/claude-events.js'
 import type { TodoItem } from '../../src/schemas.js'

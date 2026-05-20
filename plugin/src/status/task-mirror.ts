@@ -25,7 +25,7 @@ import type { AppConfig } from '../config.js'
 import type { Logger } from '../log.js'
 import type { TaskMirrorEvent } from '../hooks/claude-events.js'
 import type { TodoItem } from '../schemas.js'
-import type { TelegramApiForProgress } from './progress-reporter.js'
+import type { TelegramApiForProgress } from './telegram-api.js'
 import { escapeHtml } from '../format/html.js'
 
 // Telegram editMessageText cap (4096 chars). Default render budget below it

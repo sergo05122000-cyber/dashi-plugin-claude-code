@@ -40,22 +40,13 @@ import {
   type ActivitySnapshot,
 } from './activity-renderer.js'
 
-// Minimal Telegram surface we touch. Defined as a structural interface
-// so tests can stub without grammY. Compatible with the production
-// TelegramApi from src/channel/tools.ts via structural typing.
-export interface TelegramApiForProgress {
-  sendMessage(
-    chatId: string,
-    text: string,
-    opts: { parse_mode?: 'HTML' | 'MarkdownV2'; reply_to_message_id?: number },
-  ): Promise<{ message_id: number }>
-  editMessageText(
-    chatId: string,
-    messageId: number,
-    text: string,
-    opts: { parse_mode?: 'HTML' | 'MarkdownV2' },
-  ): Promise<void>
-}
+// Telegram surface shared with task-mirror. Canonical definition lives in
+// `./telegram-api.ts` so both modules depend on it instead of on each
+// other. Re-exported here for back-compat with existing imports
+// (`from './progress-reporter.js'` is still legal but new code should
+// import from `./telegram-api.js` directly).
+export type { TelegramApiForProgress } from './telegram-api.js'
+import type { TelegramApiForProgress } from './telegram-api.js'
 
 export interface ProgressReporterDeps {
   telegramApi: TelegramApiForProgress
