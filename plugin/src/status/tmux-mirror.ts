@@ -35,6 +35,7 @@ import { promisify } from 'util'
 
 import type { Logger } from '../log.js'
 import type { TelegramApi } from '../channel/tools.js'
+import type { MultichatPolicy } from '../chats/policy-loader.js'
 import {
   filterPane,
   capLines,
@@ -42,6 +43,31 @@ import {
   type RenderMode,
   type SegmentType,
 } from './tmux-pane-filter.js'
+
+/**
+ * Multichat policy gate for the tmux pane mirror.
+ *
+ * Returns whether a chat should receive the rolling tmux mirror message.
+ * The mirror surfaces the master claude session's pane to Telegram and
+ * is appropriate only for the warchief's DM (chat 164795011 in the
+ * canonical policy). Public/group chats opt out via `tmux_mirror=false`
+ * in `chats/policy.yaml` — leaking pane content into a group would
+ * expose internal tool calls, file paths, and reasoning to strangers.
+ *
+ * When no policy is provided (legacy single-chat deployments) the
+ * default is `true` so existing callers keep their mirror without
+ * touching wiring code.
+ *
+ * @param chatId stringified Telegram chat id
+ * @param policy loaded multichat policy, or `undefined` for legacy mode
+ * @returns `true` when the mirror should run for this chat
+ */
+export function shouldEnableMirror(
+  chatId: string,
+  policy?: MultichatPolicy,
+): boolean {
+  return policy?.chats[chatId]?.tmux_mirror ?? true
+}
 
 export interface TmuxExecResult {
   stdout: string
@@ -93,6 +119,12 @@ export interface TmuxMirrorOptions {
   // Set to 0 to disable. Trimming removes from the top (oldest content)
   // and prepends a `… +N lines` marker; see `capLines`.
   maxLines?: number
+  // Optional: multichat policy gate. Default `true` keeps existing
+  // callers behaviour-identical. `false` makes the mirror a complete
+  // no-op — start(), onPoll(), bump(), and stop() all return early
+  // without spawning timers or touching Telegram. Wire from
+  // `shouldEnableMirror(chatId, policy)` at construction time.
+  enabled?: boolean
 }
 
 export interface TmuxMirrorStatus {
@@ -169,14 +201,13 @@ async function defaultTmuxExec(args: readonly string[]): Promise<TmuxExecResult>
   }
 }
 
-// Render the body. Wraps content in a `<pre>` block, prepends a small
-// header so it's clear what is being mirrored, and enforces the body cap
-// by trimming from the TOP (oldest lines) — the warchief almost always
-// cares about the most recent output.
+// Render the body. Wraps content in a `<pre>` block and enforces the body
+// cap by trimming from the TOP (oldest lines) — the warchief almost always
+// cares about the most recent output. No header: the mirror opens as just
+// the terminal window. An error, when present, surfaces as a single italic
+// line above the pane so failures stay visible.
 function renderBody(rawPane: string, errorMsg: string | undefined, maxChars: number): string {
-  const header = errorMsg
-    ? `<b>terminal mirror</b> — <i>${htmlEscape(errorMsg)}</i>\n`
-    : `<b>terminal mirror</b>\n`
+  const header = errorMsg ? `<i>${htmlEscape(errorMsg)}</i>\n` : ''
   const footer = '' // reserved for future state lines
   const overhead = '<pre></pre>'.length
   const reserved = header.length + footer.length + overhead + 32 // safety
@@ -214,6 +245,11 @@ export class TmuxMirror {
 
   private timer: ReturnType<typeof setInterval> | null = null
   private enabled = false
+  // Multichat policy gate. Distinct from `enabled`, which tracks the
+  // runtime "is the polling loop currently armed" state. `policyEnabled
+  // === false` means the entire mirror is a no-op for this chat — set
+  // at construction time and never flipped at runtime.
+  private readonly policyEnabled: boolean
   private messageId: number | undefined
   private lastHash: string | undefined
   private lastError: string | undefined
@@ -238,6 +274,7 @@ export class TmuxMirror {
     this.hideSegments = opts.hideSegments ?? DEFAULT_HIDDEN_SEGMENTS
     this.mode = opts.mode ?? 'latest_inbound_only'
     this.maxLines = opts.maxLines ?? 14
+    this.policyEnabled = opts.enabled ?? true
   }
 
   // Pure rendering: turn a tmux exec result into the final body. Side
@@ -306,6 +343,15 @@ export class TmuxMirror {
   }
 
   async start(): Promise<void> {
+    if (!this.policyEnabled) {
+      // Policy says no mirror for this chat (typically a public group).
+      // Log once on the first start() so an operator can see why the
+      // pane never appears, then return — no timers, no Telegram I/O.
+      this.log.info('tmux mirror disabled for this chat (policy)', {
+        chat_id: this.chatId,
+      })
+      return
+    }
     if (this.enabled) return
     this.enabled = true
     // First poll runs synchronously inside start() so the caller can
@@ -345,6 +391,7 @@ export class TmuxMirror {
   // degrade bump() to "delete now, recreate on next interval tick",
   // breaking the «immediately re-send» contract (review 2026-05-20).
   async bump(): Promise<void> {
+    if (!this.policyEnabled) return
     if (!this.enabled) return
     // Debounce: skip if we just bumped. Note: we DO clear the inbound
     // signal even when skipping — the goal is just to coalesce.
@@ -387,6 +434,12 @@ export class TmuxMirror {
   }
 
   async stop(): Promise<void> {
+    if (!this.policyEnabled) {
+      // Mirror was never armed; nothing to clean up. Keep the early
+      // exit so callers can call stop() unconditionally in shutdown
+      // paths without an `if` ladder per chat.
+      return
+    }
     this.enabled = false
     if (this.timer) {
       clearInterval(this.timer)
@@ -409,6 +462,7 @@ export class TmuxMirror {
   }
 
   async onPoll(): Promise<void> {
+    if (!this.policyEnabled) return
     if (!this.enabled) return
     if (this.inFlight) return
     this.inFlight = true

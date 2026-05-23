@@ -19,6 +19,7 @@
 import type { AppConfig } from '../config.js'
 import type { Logger } from '../log.js'
 import type { ChatAction, TelegramApi } from '../channel/tools.js'
+import type { MultichatPolicy } from '../chats/policy-loader.js'
 import { escapeHtml } from '../format/html.js'
 import type { ActivityStatusEvent } from '../hooks/claude-events.js'
 import {
@@ -29,6 +30,32 @@ import {
   type ActivityCall,
   type ActivitySnapshot,
 } from './activity-renderer.js'
+
+/**
+ * Multichat policy gate for progress streaming.
+ *
+ * Returns whether the StatusManager should emit interim "Печатает..." /
+ * activity edits for a chat. Public groups configured with
+ * `streaming: 'off'` get the final reply from the router's outbox
+ * loop only — no rolling status, no tool-by-tool edits, no chat
+ * action pulses.
+ *
+ * When no policy is provided (legacy single-chat deployments) the
+ * default is `true` so existing callers keep their streaming without
+ * touching wiring code.
+ *
+ * @param chatId stringified Telegram chat id
+ * @param policy loaded multichat policy, or `undefined` for legacy mode
+ * @returns `true` when interim progress edits should be sent
+ */
+export function shouldStream(
+  chatId: string,
+  policy?: MultichatPolicy,
+): boolean {
+  const entry = policy?.chats[chatId]
+  if (entry === undefined) return true
+  return entry.streaming === 'progress'
+}
 
 // Telegram's `sendChatAction` indicator expires after 5 s; re-pulse on a 4 s
 // timer to keep the header animation continuous without spamming the API.
@@ -96,6 +123,13 @@ export interface StatusManagerDeps {
   now?: () => number
   setTimer?: (cb: () => void, ms: number) => NodeJS.Timeout
   clearTimer?: (handle: NodeJS.Timeout) => void
+  // Optional: multichat policy gate. Default `true` keeps existing
+  // callers behaviour-identical. `false` turns the manager into a
+  // no-op shell — start/update/cancel/complete and the activity hook
+  // path all return early without sending or editing any messages.
+  // Final replies in public chats arrive via the router's outbox
+  // loop, not StatusManager, so leaving this off is safe.
+  streamingEnabled?: boolean
 }
 
 interface InternalEntry {
@@ -160,6 +194,12 @@ export class StatusManager {
   private readonly setTimer: (cb: () => void, ms: number) => NodeJS.Timeout
   private readonly clearTimer: (handle: NodeJS.Timeout) => void
   private readonly entries: Map<string, InternalEntry>
+  // When `false`, every public mutation is a no-op. Distinct from any
+  // per-chat streaming flag — this is a global construction-time gate
+  // typically wired from `shouldStream(chatId, policy)`. We do not flip
+  // it at runtime; callers construct a separate StatusManager per chat
+  // when behaviour must differ.
+  private readonly streamingEnabled: boolean
 
   constructor(deps: StatusManagerDeps) {
     this.telegramApi = deps.telegramApi
@@ -171,6 +211,7 @@ export class StatusManager {
     this.setTimer = deps.setTimer ?? ((cb, ms) => setTimeout(cb, ms))
     this.clearTimer = deps.clearTimer ?? ((h) => clearTimeout(h))
     this.entries = new Map()
+    this.streamingEnabled = deps.streamingEnabled ?? true
   }
 
   isActive(chatId: string): boolean {
@@ -187,6 +228,18 @@ export class StatusManager {
     replyToMessageId: number | undefined,
     initialState: StatusState = { kind: 'typing' },
   ): Promise<StatusHandle> {
+    if (!this.streamingEnabled) {
+      // No-op shell: return a sentinel handle that does not correspond
+      // to any real Telegram message. update()/cancel()/complete() all
+      // bail out because `entries.get(chatId)` will be undefined.
+      // Callers that store the handle and later mutate it observe the
+      // same idempotent silence — defence-in-depth for misuse.
+      return {
+        chatId,
+        messageId: 0,
+        startedAt: this.now(),
+      }
+    }
     // Only one active status per chat at a time: finalise the previous one
     // (edit the old message to "Остановлено: superseded" and clear timers)
     // so we don't leak a stale "Печатает…" message on top of the new one.
@@ -307,6 +360,12 @@ export class StatusManager {
    * flushes the buffer (mirrors gateway.py:1738 `_last_tool_render`).
    */
   async recordActivityByChatId(chatId: string, event: ActivityStatusEvent): Promise<void> {
+    if (!this.streamingEnabled) {
+      // Hook events arrive whether or not we want to surface them; the
+      // policy decides whether the chat sees streaming. Drop silently
+      // — final reply ships via the router outbox loop, not here.
+      return
+    }
     // Stop closes the session. Use existing complete() so delete_on_complete
     // semantics + timer cleanup stay in one place.
     if (event.kind === 'session_stop') {
