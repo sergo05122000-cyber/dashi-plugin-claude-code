@@ -50,6 +50,12 @@ export const AppConfigSchema = z.object({
     interval_ms: z.number().int().positive().default(700),
     ttl_ms: z.number().int().positive().default(300_000),
     delete_on_complete: z.boolean().default(true),
+    // Warchief request 2026-05-27: the bare «Печатает...» bubble is visual
+    // noise on top of the TmuxMirror status card. When true, StatusManager
+    // skips the initial sendMessage while state is `typing` — the bubble is
+    // created lazily on the first thinking/tool/activity transition. Native
+    // sendChatAction (header animation) is unaffected.
+    suppress_typing_bubble: z.boolean().default(true),
   }).default({}),
   album: z.object({
     flush_ms: z.number().int().positive().default(2000),

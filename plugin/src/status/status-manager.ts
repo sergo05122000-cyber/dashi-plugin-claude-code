@@ -132,8 +132,17 @@ export interface StatusManagerDeps {
   streamingEnabled?: boolean
 }
 
+// Internal mirror of StatusHandle without the `readonly` modifiers — we
+// mutate messageId lazily when the bubble is created after a typing-only
+// start. The public StatusHandle (returned to callers) stays readonly.
+interface MutableHandle {
+  chatId: string
+  messageId: number
+  startedAt: number
+}
+
 interface InternalEntry {
-  handle: StatusHandle
+  handle: MutableHandle
   state: StatusState
   // Cycle index used to advance the dot animation on each tick.
   tick: number
@@ -142,6 +151,14 @@ interface InternalEntry {
   ttlHandle: NodeJS.Timeout | null
   // Separate cadence from the message edit ticker — see CHAT_ACTION_PULSE_MS.
   chatActionHandle: NodeJS.Timeout | null
+  // Original reply target captured from start(). Re-used when the bubble is
+  // created lazily on the first non-typing transition so it threads under
+  // the same inbound message the user originally sent.
+  replyToMessageId: number | undefined
+  // True when sendMessage has not been called yet because state is still
+  // typing and suppress_typing_bubble is on. Lazy-create path flips this on
+  // first non-typing transition.
+  bubbleSuppressed: boolean
   // Rolling activity state — kept on the entry even while state.kind!=
   // 'activity' so a Stop after a non-tool reasoning phase still has the
   // recorded history. Last-tool-render timestamp throttles non-Agent edits.
@@ -249,39 +266,48 @@ export class StatusManager {
       await this.cancel(chatId, 'superseded')
     }
 
+    const suppressBubble =
+      this.config.status.suppress_typing_bubble && initialState.kind === 'typing'
+
     const text = renderState(initialState, 0, this.now())
-    const sendOpts: { parse_mode: 'HTML'; reply_to_message_id?: number } = {
-      parse_mode: 'HTML',
-    }
-    if (replyToMessageId !== undefined) sendOpts.reply_to_message_id = replyToMessageId
+    let messageId = 0
+    if (!suppressBubble) {
+      const sendOpts: { parse_mode: 'HTML'; reply_to_message_id?: number } = {
+        parse_mode: 'HTML',
+      }
+      if (replyToMessageId !== undefined) sendOpts.reply_to_message_id = replyToMessageId
 
-    let sent: { message_id: number }
-    try {
-      sent = await this.telegramApi.sendMessage(chatId, text, sendOpts)
-    } catch (err) {
-      // If we can't even send the initial status, log and rethrow — caller
-      // can decide whether to proceed without status. (handlers.ts treats
-      // status as best-effort and will catch this.)
-      this.log.warn('status start failed', {
-        chat_id: chatId,
-        error: err instanceof Error ? err.message : String(err),
-      })
-      throw err
+      let sent: { message_id: number }
+      try {
+        sent = await this.telegramApi.sendMessage(chatId, text, sendOpts)
+      } catch (err) {
+        // If we can't even send the initial status, log and rethrow — caller
+        // can decide whether to proceed without status. (handlers.ts treats
+        // status as best-effort and will catch this.)
+        this.log.warn('status start failed', {
+          chat_id: chatId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+        throw err
+      }
+      messageId = sent.message_id
     }
 
-    const handle: StatusHandle = {
+    const handle: MutableHandle = {
       chatId,
-      messageId: sent.message_id,
+      messageId,
       startedAt: this.now(),
     }
     const entry: InternalEntry = {
       handle,
       state: initialState,
       tick: 0,
-      lastText: text,
+      lastText: suppressBubble ? '' : text,
       intervalHandle: null,
       ttlHandle: null,
       chatActionHandle: null,
+      replyToMessageId,
+      bubbleSuppressed: suppressBubble,
       activityCalls: [],
       activityPhase: 'reasoning',
       activityStartedAt: this.now(),
@@ -293,48 +319,102 @@ export class StatusManager {
     this.entries.set(chatId, entry)
 
     // Fire-and-forget initial chat action so the Telegram header shows
-    // `typing…` immediately, not on the first pulse 4 s in.
+    // `typing…` immediately, not on the first pulse 4 s in. Keeps firing
+    // even when the message bubble is suppressed — the native indicator
+    // is what the warchief still wants to see.
     void this.pulseChatAction(entry)
     entry.chatActionHandle = this.setTimer(
-      () => this.chatActionTick(chatId, handle.messageId),
+      () => this.chatActionTick(chatId),
       CHAT_ACTION_PULSE_MS,
     )
 
     // Periodic tick — re-edit with advanced ellipsis (typing/thinking only)
     // or keep the same text for tool/stopped/error states. Same-text edits
     // collapse via the "message is not modified" swallow path below.
+    //
+    // While the bubble is suppressed we still advance the tick counter so
+    // animation timing stays continuous when the bubble eventually appears,
+    // but `editSafely` short-circuits because messageId is 0.
     const tick = (): void => {
       const live = this.entries.get(chatId)
-      if (!live || live.handle.messageId !== handle.messageId) return
+      if (!live) return
       live.tick += 1
-      const next = renderState(live.state, live.tick, this.now())
-      void this.editSafely(live, next)
+      if (!live.bubbleSuppressed) {
+        const next = renderState(live.state, live.tick, this.now())
+        void this.editSafely(live, next)
+      }
       // Re-arm next tick.
       live.intervalHandle = this.setTimer(tick, this.config.status.interval_ms)
     }
     entry.intervalHandle = this.setTimer(tick, this.config.status.interval_ms)
 
     // TTL guard. On expiry we cancel with reason='ttl' so the message turns
-    // into "Остановлено: ttl" rather than vanishing silently.
+    // into "Остановлено: ttl" rather than vanishing silently. When the
+    // bubble was suppressed end-to-end (pure typing session that timed
+    // out) cancel() turns into a quiet cleanup with no Telegram edit.
     entry.ttlHandle = this.setTimer(() => {
       const live = this.entries.get(chatId)
-      if (!live || live.handle.messageId !== handle.messageId) return
+      if (!live) return
       void this.cancel(chatId, 'ttl')
     }, this.config.status.ttl_ms)
 
-    return handle
+    return {
+      chatId: handle.chatId,
+      messageId: handle.messageId,
+      startedAt: handle.startedAt,
+    }
+  }
+
+  // Lazy-create the Telegram message bubble when state advances from typing
+  // to anything else (thinking/tool/activity/stopped/error). No-op when the
+  // bubble already exists. Used by update() and recordActivityByChatId().
+  private async ensureBubble(entry: InternalEntry, state: StatusState): Promise<void> {
+    if (!entry.bubbleSuppressed) return
+    if (state.kind === 'typing') return
+    const text = renderState(state, 0, this.now())
+    const sendOpts: { parse_mode: 'HTML'; reply_to_message_id?: number } = {
+      parse_mode: 'HTML',
+    }
+    if (entry.replyToMessageId !== undefined) {
+      sendOpts.reply_to_message_id = entry.replyToMessageId
+    }
+    try {
+      const sent = await this.telegramApi.sendMessage(entry.handle.chatId, text, sendOpts)
+      entry.handle.messageId = sent.message_id
+      entry.lastText = text
+      entry.bubbleSuppressed = false
+    } catch (err) {
+      // Best-effort — log and leave bubble suppressed. Next non-typing
+      // event will retry the send.
+      this.log.warn('status lazy-send failed (ignored)', {
+        chat_id: entry.handle.chatId,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
   }
 
   async update(handle: StatusHandle, state: StatusState): Promise<void> {
     const entry = this.entries.get(handle.chatId)
-    if (!entry || entry.handle.messageId !== handle.messageId) {
+    if (!entry) return
+    // Staleness check is messageId-based, but a still-suppressed entry has
+    // messageId 0 in both the caller's handle (returned from start) and the
+    // internal entry, so the comparison still passes. Once the bubble has
+    // been created lazily, callers using the original 0-handle drift into
+    // staleness — by then they should be using updateByChatId, which is the
+    // documented path for late edits.
+    if (entry.handle.messageId !== handle.messageId && !entry.bubbleSuppressed) {
       // Stale handle — caller is editing something already completed.
-      // Drop silently; the original status is gone.
       return
     }
     entry.state = state
     // Reset tick on state change so the ellipsis animation restarts at 1.
     entry.tick = 0
+    if (entry.bubbleSuppressed) {
+      await this.ensureBubble(entry, state)
+      // ensureBubble already wrote the rendered text for non-typing states
+      // and flipped bubbleSuppressed off. Nothing else to edit on this turn.
+      return
+    }
     const text = renderState(state, 0, this.now())
     await this.editSafely(entry, text)
   }
@@ -486,6 +566,12 @@ export class StatusManager {
     )
     entry.state = { kind: 'activity', snapshot }
     entry.tick = 0
+    if (entry.bubbleSuppressed) {
+      // First non-typing event creates the bubble with the activity render
+      // directly — no «Печатает.» preamble.
+      await this.ensureBubble(entry, entry.state)
+      return
+    }
     const text = renderState(entry.state, 0, now)
     await this.editSafely(entry, text)
   }
@@ -508,6 +594,8 @@ export class StatusManager {
     if (!entry) return
     this.stopTimers(entry)
     this.entries.delete(chatId)
+    // Suppressed bubble = never sent a Telegram message, nothing to delete.
+    if (entry.bubbleSuppressed) return
     if (this.config.status.delete_on_complete && this.telegramApi.deleteMessage) {
       try {
         await this.telegramApi.deleteMessage(chatId, entry.handle.messageId)
@@ -527,6 +615,9 @@ export class StatusManager {
     if (!entry) return
     this.stopTimers(entry)
     this.entries.delete(chatId)
+    // Pure typing session that ended without ever transitioning — no bubble
+    // exists on Telegram, so there is nothing to mark as «Остановлено».
+    if (entry.bubbleSuppressed) return
     const text = renderState({ kind: 'stopped', reason }, 0, this.now())
     try {
       await this.telegramApi.editMessageText(
@@ -549,6 +640,10 @@ export class StatusManager {
   // ───── internals ─────
 
   private async editSafely(entry: InternalEntry, text: string): Promise<void> {
+    // Bubble suppressed — no Telegram message to edit. Caller is expected to
+    // go through ensureBubble() instead. Guard defends timer-driven ticks
+    // that fire before the first non-typing transition.
+    if (entry.bubbleSuppressed || entry.handle.messageId === 0) return
     if (text === entry.lastText) {
       // Skip the network roundtrip; Telegram would respond with "message is
       // not modified" anyway and we'd swallow it.
@@ -609,12 +704,12 @@ export class StatusManager {
     }
   }
 
-  private chatActionTick(chatId: string, messageId: number): void {
+  private chatActionTick(chatId: string): void {
     const live = this.entries.get(chatId)
-    if (!live || live.handle.messageId !== messageId) return
+    if (!live) return
     void this.pulseChatAction(live)
     live.chatActionHandle = this.setTimer(
-      () => this.chatActionTick(chatId, messageId),
+      () => this.chatActionTick(chatId),
       CHAT_ACTION_PULSE_MS,
     )
   }
