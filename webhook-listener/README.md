@@ -44,7 +44,7 @@ single-host install; override anything that is host-specific.
 | `WEBHOOK_LOG_DIR`             | `/var/log/dashi-plugin-webhook`            | no       | Where per-invocation stdout/stderr lands.                            |
 | `INVOCATION_TIMEOUT_SEC`      | `1800`                                     | no       | Hard kill ceiling for a spawned Claude.                              |
 | `WEBHOOK_GBRAIN_TOKEN_FILE`   | `$HOME/.secrets/dashi-gbrain.token`        | conditional | gbrain swarm token. Required only if `WEBHOOK_GBRAIN_SWARM_URL` is set. |
-| `WEBHOOK_GBRAIN_SWARM_URL`    | _(unset — enrichment disabled)_            | no       | JSON-RPC endpoint of your swarm MCP. Leave empty to disable the v6.3 enrichment fallback. |
+| `WEBHOOK_GBRAIN_SWARM_URL`    | _(unset — enrichment disabled)_            | no       | JSON-RPC endpoint of **your own** swarm MCP (see «Bring-your-own swarm endpoint» below). Leave empty to disable the v6.3 enrichment fallback. |
 | `WEBHOOK_OWNER_CHAT_ID`       | _(unset — feature off)_                    | no       | Telegram chat id that receives pre-ack pings. Empty → notification disabled. |
 | `WEBHOOK_TG_BOT_TOKEN_FILE`   | `$HOME/.secrets/telegram-bot-token`        | conditional | Required only if `WEBHOOK_OWNER_CHAT_ID` is set.                  |
 | `WEBHOOK_NOTIFY_TTL_SEC`      | `300`                                      | no       | Dedup window for repeated owner pings on the same task.              |
@@ -72,6 +72,32 @@ sudo cp examples/webhook-listener.env.example /etc/dashi-plugin/webhook.env
 sudo systemctl daemon-reload
 sudo systemctl enable --now dashi-plugin-webhook
 ```
+
+## Bring-your-own swarm endpoint
+
+The v6.3 enrichment fallback expects `WEBHOOK_GBRAIN_SWARM_URL` to point at
+**your own** [dashi-gbrain](https://github.com/qwwiwi/dashi-gbrain) instance.
+This repo intentionally ships no default — you stand up your own swarm
+coordinator and expose it over HTTPS. Two common patterns:
+
+1. **Cloudflare Tunnel** (no public IP, no inbound firewall rule):
+   - Run gbrain on your own host (LAN, Tailscale, anywhere reachable from
+     itself). Bind the MCP servers to `127.0.0.1:<port>`.
+   - Install `cloudflared`, run `cloudflared tunnel login`, then
+     `cloudflared tunnel create <name>`.
+   - Add an `ingress` mapping `mcp.<your-domain>` → `http://127.0.0.1:<port>`
+     in `~/.cloudflared/config.yml` and route the tunnel:
+     `cloudflared tunnel route dns <name> mcp.<your-domain>`.
+   - Start the tunnel via systemd unit (`cloudflared service install`).
+   - Set `WEBHOOK_GBRAIN_SWARM_URL=https://mcp.<your-domain>/swarm/mcp`.
+
+2. **Tailscale + caddy/nginx**: terminate TLS on a host inside the tailnet
+   and reach it via the MagicDNS name. Same env shape — point
+   `WEBHOOK_GBRAIN_SWARM_URL` at your tailnet hostname.
+
+Either way: the URL you set in `WEBHOOK_GBRAIN_SWARM_URL` is yours, never
+a third-party endpoint. The listener also redacts Bearer tokens from log
+records so the token does not surface in journal output.
 
 ## Security
 
