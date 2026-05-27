@@ -46,10 +46,25 @@ function redactReplyMarkup(
   markup: InlineKeyboardLike,
   extraSecrets: ReadonlyArray<string> | undefined,
 ): InlineKeyboardLike {
+  // FIX-T1 F4 (PRX-1 Phase 5, 2026-05-27): non-inline markups (ForceReply,
+  // ReplyKeyboardMarkup, ReplyKeyboardRemove) carry no inline_keyboard
+  // field — only `force_reply`, `selective`, `input_field_placeholder`,
+  // or `keyboard`/`remove_keyboard` flags. The previous implementation
+  // discarded everything but inline_keyboard, silently breaking the
+  // AskUserQuestion «Other» force_reply prompt. Pass these through
+  // verbatim (no string fields to redact) by typeof-probing the field.
+  const maybeInline = (markup as { inline_keyboard?: unknown }).inline_keyboard
+  if (!Array.isArray(maybeInline)) {
+    // ForceReply / ReplyKeyboardRemove / ReplyKeyboardMarkup. None of
+    // their primitive fields carry caller text that needs redaction
+    // (input_field_placeholder is bot-author controlled), so a shallow
+    // clone keeps grammY's shape intact.
+    return { ...(markup as object) } as unknown as InlineKeyboardLike
+  }
   // Defensive: the array may be missing, malformed, or contain unknown
   // cells. We copy row by row, cell by cell, redacting only string-typed
   // `text` and `url` fields.
-  const rows = Array.isArray(markup.inline_keyboard) ? markup.inline_keyboard : []
+  const rows = maybeInline
   const safeRows: { text: string; callback_data?: string }[][] = rows.map((row) => {
     if (!Array.isArray(row)) return []
     return row.map((cell) => {
@@ -134,6 +149,21 @@ export function createSafeTelegramApi(
         delete safeOpts.parse_mode
       } else {
         safeOpts.parse_mode = parseMode
+      }
+      // PRX-1 TASK-2 (2026-05-27): edit-time reply_markup mutation needs
+      // the same secret-redaction treatment as the send path. Without
+      // this an inline keyboard re-render (multi-select toggle, etc.)
+      // could ship raw button text/url straight to Telegram.
+      //
+      // FIX-T1 F2 (Phase 5, 2026-05-27): be explicit about the copy.
+      // The spread `{ ...opts }` already brings `reply_markup` across at
+      // runtime, but tying redaction to `opts.reply_markup` (the caller's
+      // canonical source) instead of `safeOpts.reply_markup` makes the
+      // intent obvious and prevents a future drift where someone strips
+      // the spread or narrows the EditOpts type — the keyboard would
+      // silently stop propagating without this assignment.
+      if (opts?.reply_markup !== undefined) {
+        safeOpts.reply_markup = redactReplyMarkup(opts.reply_markup, extraSecrets)
       }
       return raw.editMessageText(chatId, messageId, safeText, safeOpts)
     },

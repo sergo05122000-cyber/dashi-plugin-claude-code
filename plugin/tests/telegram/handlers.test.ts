@@ -176,6 +176,7 @@ function makeDeps(
     telegramApi?: TelegramApi
     server?: ServerSpy['server']
     watcher?: InboundWatcher
+    askUserQuestionUi?: HandlerDeps['askUserQuestionUi']
   } = {},
 ): { deps: HandlerDeps; statePaths: StatePaths } {
   const config = overrides.config ?? makeConfig()
@@ -195,6 +196,7 @@ function makeDeps(
     env: {},
     ...(overrides.permissionHooks ? { permissionHooks: overrides.permissionHooks } : {}),
     ...(overrides.watcher ? { watcher: overrides.watcher } : {}),
+    ...(overrides.askUserQuestionUi ? { askUserQuestionUi: overrides.askUserQuestionUi } : {}),
   }
   return { deps, statePaths }
 }
@@ -690,6 +692,171 @@ describe('handleInboundText — InboundWatcher (PR-A3)', () => {
     expect(sendCalls.length).toBe(0)
     // Channel notification still fired.
     expect(serverSpy.calls.length).toBe(1)
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// FIX-T1 F3 (PRX-1 Phase 5, 2026-05-27) — permission verdicts ALWAYS
+// take priority over AskUserQuestion «Other» text consumer.
+//
+// Pre-fix: tryHandleOtherText ran FIRST and would swallow a perfectly
+// valid `yes <id>` reply, leaving the permission relay to time out.
+// SECURITY: the approve/deny channel cannot be hijacked by a parallel
+// AskUserQuestion prompt.
+//
+// Test wires both `permissionHooks` AND a stubbed `askUserQuestionUi`
+// whose `tryHandleOtherText` records whether it was called. With F3 in
+// place, a `yes abcde` text with a pending permission id MUST:
+//   - consume + emit the permission verdict
+//   - NOT call askUserQuestionUi.tryHandleOtherText
+// ─────────────────────────────────────────────────────────────────────
+
+describe('handleInboundText — F3 permission-priority gate', () => {
+  test('"yes <id>" reply during pending AskUserQuestion + pending permission: permission consumes, Other untouched', async () => {
+    const pending = new Set(['abcde'])
+    const spy = makePermissionSpy(pending)
+    const tg = makeTelegramApi()
+    const otherCalls: Array<{
+      chatId: string
+      fromUserId: number
+      text: string
+      replyToMessageId?: number
+    }> = []
+    // Stub the UI: record any tryHandleOtherText call. Returning false
+    // (not consumed) is the right behaviour anyway since the inbound
+    // text doesn't carry a matching reply_to (FIX-T1 F4) — but with F3
+    // we should not even reach this point.
+    const askUserQuestionUi = {
+      startQuestion: async () => {},
+      handleAskCallback: async () => {},
+      tryHandleOtherText: async (input: {
+        chatId: string
+        fromUserId: number
+        text: string
+        replyToMessageId?: number
+      }) => {
+        otherCalls.push(input)
+        return false
+      },
+      awaitingOtherCount: () => 0,
+    } as unknown as HandlerDeps['askUserQuestionUi']
+    const { deps, statePaths } = makeDeps({
+      permissionHooks: spy.hooks,
+      telegramApi: tg.api,
+      askUserQuestionUi,
+    })
+    const ctx = makeCtx({
+      text: 'yes abcde',
+      chatId: 164795011,
+      chatType: 'private',
+      fromId: 164795011,
+    })
+
+    await handleInboundText(ctx, deps)
+
+    // Permission consumed + verdict emitted.
+    expect(spy.consumed).toEqual(['abcde'])
+    expect(spy.emitted).toEqual([{ behavior: 'allow', requestId: 'abcde' }])
+    // Other-text consumer never called — permission gate short-circuited.
+    expect(otherCalls.length).toBe(0)
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+
+  test('freeform text WITHOUT a pending permission falls through to Other consumer (still gated by F4)', async () => {
+    // No pending permission ids — even `yes whatever` should fall through
+    // to the Other consumer (which then rejects on FIX-T1 F4 because no
+    // replyToMessageId), then onward to channel forward.
+    const spy = makePermissionSpy(new Set())
+    const tg = makeTelegramApi()
+    const otherCalls: Array<{ text: string; replyToMessageId: number | undefined }> = []
+    const askUserQuestionUi = {
+      startQuestion: async () => {},
+      handleAskCallback: async () => {},
+      tryHandleOtherText: async (input: {
+        chatId: string
+        fromUserId: number
+        text: string
+        replyToMessageId?: number
+      }) => {
+        otherCalls.push({ text: input.text, replyToMessageId: input.replyToMessageId })
+        return false
+      },
+      awaitingOtherCount: () => 0,
+    } as unknown as HandlerDeps['askUserQuestionUi']
+    const serverSpy = makeServerSpy()
+    const { deps, statePaths } = makeDeps({
+      permissionHooks: spy.hooks,
+      telegramApi: tg.api,
+      server: serverSpy.server,
+      askUserQuestionUi,
+    })
+    const ctx = makeCtx({
+      text: 'hello bot',
+      chatId: 164795011,
+      chatType: 'private',
+      fromId: 164795011,
+    })
+
+    await handleInboundText(ctx, deps)
+
+    // Permission not triggered (no pending), Other consumer was reached.
+    expect(spy.consumed).toEqual([])
+    expect(otherCalls.length).toBe(1)
+    expect(otherCalls[0]!.text).toBe('hello bot')
+    // reply_to absent → Other rejects, message reaches channel forward.
+    expect(otherCalls[0]!.replyToMessageId).toBeUndefined()
+    expect(serverSpy.calls.length).toBe(1)
+    rmSync(statePaths.root, { recursive: true, force: true })
+  })
+
+  test('Other consumer receives replyToMessageId from message.reply_to_message', async () => {
+    // When the inbound message IS a reply (e.g. swiped-reply to the
+    // «Введи ответ» prompt), the handler MUST forward the message_id so
+    // F4's gate can match it against promptMessageId. This locks the
+    // wiring contract between handlers.ts and ask-user-question.ts.
+    const tg = makeTelegramApi()
+    const otherCalls: Array<{ text: string; replyToMessageId: number | undefined }> = []
+    const askUserQuestionUi = {
+      startQuestion: async () => {},
+      handleAskCallback: async () => {},
+      tryHandleOtherText: async (input: {
+        chatId: string
+        fromUserId: number
+        text: string
+        replyToMessageId?: number
+      }) => {
+        otherCalls.push({ text: input.text, replyToMessageId: input.replyToMessageId })
+        return true // consumed — should short-circuit channel forward
+      },
+      awaitingOtherCount: () => 0,
+    } as unknown as HandlerDeps['askUserQuestionUi']
+    const serverSpy = makeServerSpy()
+    const { deps, statePaths } = makeDeps({
+      telegramApi: tg.api,
+      server: serverSpy.server,
+      askUserQuestionUi,
+    })
+    // Build a Context with reply_to_message attached.
+    const ctx = {
+      chat: { id: 164795011, type: 'private' as const },
+      from: { id: 164795011, is_bot: false, first_name: 'x' },
+      message: {
+        message_id: 100,
+        date: 1700000000,
+        text: 'my answer',
+        chat: { id: 164795011, type: 'private' as const },
+        from: { id: 164795011, is_bot: false, first_name: 'x' },
+        reply_to_message: { message_id: 77, date: 1700000000 },
+      },
+    } as unknown as Context
+
+    await handleInboundText(ctx, deps)
+
+    expect(otherCalls.length).toBe(1)
+    expect(otherCalls[0]!.replyToMessageId).toBe(77)
+    // Consumed → channel forward must NOT fire.
+    expect(serverSpy.calls.length).toBe(0)
     rmSync(statePaths.root, { recursive: true, force: true })
   })
 })

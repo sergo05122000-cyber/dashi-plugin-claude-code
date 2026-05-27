@@ -2,7 +2,13 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { loadConfig, redactToken } from '../src/config.js'
+import {
+  getStatePaths,
+  loadConfig,
+  redactToken,
+  resolveAskUserQuestionAllowedUserIds,
+  RuntimeEnvSchema,
+} from '../src/config.js'
 
 let stateDir: string
 
@@ -273,5 +279,162 @@ describe('loadConfig', () => {
       const cfg = loadConfig(env())
       expect(cfg.tmux_mirror.mode).toBe(mode)
     }
+  })
+
+  // ─── PRX-1 TASK-6: ask_user_question schema ────────────────────────
+
+  test('ask_user_question: defaults are off-by-default with sane field values', () => {
+    const cfg = loadConfig(env())
+    expect(cfg.ask_user_question.enabled).toBe(false)
+    expect(cfg.ask_user_question.timeout_ms).toBe(300_000)
+    expect(cfg.ask_user_question.allowed_user_ids).toBeUndefined()
+    expect(cfg.ask_user_question.max_preview_chars).toBe(1000)
+  })
+
+  test('ask_user_question: TELEGRAM_ASK_USER_QUESTION_ENABLED=1 → enabled=true', () => {
+    const cfg = loadConfig(env({ TELEGRAM_ASK_USER_QUESTION_ENABLED: '1' }))
+    expect(cfg.ask_user_question.enabled).toBe(true)
+  })
+
+  test('ask_user_question: TELEGRAM_ASK_USER_QUESTION_ENABLED accepts truthy strings', () => {
+    for (const truthy of ['1', 'true', 'TRUE', 'yes', 'On']) {
+      const cfg = loadConfig(env({ TELEGRAM_ASK_USER_QUESTION_ENABLED: truthy }))
+      expect(cfg.ask_user_question.enabled).toBe(true)
+    }
+    for (const falsy of ['0', 'false', 'no', 'off', '']) {
+      const cfg = loadConfig(env({ TELEGRAM_ASK_USER_QUESTION_ENABLED: falsy }))
+      expect(cfg.ask_user_question.enabled).toBe(false)
+    }
+  })
+
+  test('ask_user_question: TELEGRAM_ASK_USER_QUESTION_TIMEOUT_MS=180000 → timeout_ms=180000', () => {
+    const cfg = loadConfig(env({ TELEGRAM_ASK_USER_QUESTION_TIMEOUT_MS: '180000' }))
+    expect(cfg.ask_user_question.timeout_ms).toBe(180_000)
+  })
+
+  test('ask_user_question: TELEGRAM_ASK_USER_QUESTION_ALLOWED_USER_IDS parses CSV into number array', () => {
+    const cfg = loadConfig(env({ TELEGRAM_ASK_USER_QUESTION_ALLOWED_USER_IDS: '164795011, 99999 ,42' }))
+    expect(cfg.ask_user_question.allowed_user_ids).toEqual([164795011, 99999, 42])
+  })
+
+  test('ask_user_question: TELEGRAM_ASK_USER_QUESTION_MAX_PREVIEW_CHARS overrides default', () => {
+    const cfg = loadConfig(env({ TELEGRAM_ASK_USER_QUESTION_MAX_PREVIEW_CHARS: '2048' }))
+    expect(cfg.ask_user_question.max_preview_chars).toBe(2048)
+  })
+
+  test('ask_user_question: negative timeout in env throws Zod error', () => {
+    let caught: unknown
+    try {
+      loadConfig(env({ TELEGRAM_ASK_USER_QUESTION_TIMEOUT_MS: '-1000' }))
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeInstanceOf(Error)
+    const msg = (caught as Error).message
+    // Zod's `positive()` fails with "Number must be greater than 0" / too_small.
+    // Token redaction may obscure the env var name in the path, so anchor on
+    // the failure code/wording instead.
+    expect(msg).toMatch(/too_small|greater than 0|positive/i)
+  })
+
+  test('ask_user_question: non-integer user id in CSV throws clear error', () => {
+    let caught: unknown
+    try {
+      loadConfig(env({ TELEGRAM_ASK_USER_QUESTION_ALLOWED_USER_IDS: '164795011,abc' }))
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeInstanceOf(Error)
+    const msg = (caught as Error).message
+    expect(msg).toMatch(/invalid user id|abc/i)
+  })
+
+  test('ask_user_question: negative timeout in config.json throws Zod error with path', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+      ask_user_question: { timeout_ms: -5 },
+    }))
+    let caught: unknown
+    try {
+      loadConfig(env())
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeInstanceOf(Error)
+    const msg = (caught as Error).message
+    expect(msg).toMatch(/ask_user_question|timeout_ms|positive/i)
+  })
+
+  test('ask_user_question: env overrides win over config.json', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+      ask_user_question: { enabled: false, timeout_ms: 60_000, max_preview_chars: 500 },
+    }))
+    const cfg = loadConfig(env({
+      TELEGRAM_ASK_USER_QUESTION_ENABLED: 'true',
+      TELEGRAM_ASK_USER_QUESTION_TIMEOUT_MS: '120000',
+      TELEGRAM_ASK_USER_QUESTION_MAX_PREVIEW_CHARS: '1500',
+    }))
+    expect(cfg.ask_user_question.enabled).toBe(true)
+    expect(cfg.ask_user_question.timeout_ms).toBe(120_000)
+    expect(cfg.ask_user_question.max_preview_chars).toBe(1500)
+  })
+
+  test('ask_user_question: config.json values are loaded when no env override', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+      ask_user_question: {
+        enabled: true,
+        timeout_ms: 600_000,
+        allowed_user_ids: [42, 43],
+        max_preview_chars: 2000,
+      },
+    }))
+    const cfg = loadConfig(env())
+    expect(cfg.ask_user_question.enabled).toBe(true)
+    expect(cfg.ask_user_question.timeout_ms).toBe(600_000)
+    expect(cfg.ask_user_question.allowed_user_ids).toEqual([42, 43])
+    expect(cfg.ask_user_question.max_preview_chars).toBe(2000)
+  })
+
+  test('resolveAskUserQuestionAllowedUserIds: undefined → falls back to permission_relay.allowed_user_ids', () => {
+    const cfg = loadConfig(env())
+    expect(cfg.ask_user_question.allowed_user_ids).toBeUndefined()
+
+    const calls: Array<{ msg: string; fields?: Record<string, unknown> }> = []
+    const logger = { info: (msg: string, fields?: Record<string, unknown>) => calls.push({ msg, fields }) }
+    const resolved = resolveAskUserQuestionAllowedUserIds(cfg, logger)
+    expect(resolved).toEqual(cfg.permission_relay.allowed_user_ids)
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.msg).toMatch(/inheriting from permission_relay/)
+    expect(calls[0]!.fields?.fallback).toBe(true)
+  })
+
+  test('resolveAskUserQuestionAllowedUserIds: explicit list is used and fallback log is not emitted', () => {
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+      ask_user_question: { allowed_user_ids: [555, 666] },
+    }))
+    const cfg = loadConfig(env())
+    expect(cfg.ask_user_question.allowed_user_ids).toEqual([555, 666])
+
+    const calls: Array<{ msg: string; fields?: Record<string, unknown> }> = []
+    const logger = { info: (msg: string, fields?: Record<string, unknown>) => calls.push({ msg, fields }) }
+    const resolved = resolveAskUserQuestionAllowedUserIds(cfg, logger)
+    expect(resolved).toEqual([555, 666])
+    expect(calls.length).toBe(1)
+    expect(calls[0]!.fields?.fallback).toBe(false)
+  })
+
+  test('resolveAskUserQuestionAllowedUserIds: works without a logger argument', () => {
+    const cfg = loadConfig(env())
+    const resolved = resolveAskUserQuestionAllowedUserIds(cfg)
+    expect(resolved).toEqual(cfg.permission_relay.allowed_user_ids)
+  })
+
+  test('paths.logs.ask_user_question resolves to ${state_dir}/logs/ask-user-question.jsonl', () => {
+    const cfg = loadConfig(env())
+    const parsedEnv = RuntimeEnvSchema.parse({
+      TELEGRAM_BOT_TOKEN: FAKE_TOKEN,
+      TELEGRAM_STATE_DIR: stateDir,
+    })
+    const paths = getStatePaths(cfg, parsedEnv)
+    expect(paths.logs.ask_user_question).toBe(join(stateDir, 'logs', 'ask-user-question.jsonl'))
   })
 })

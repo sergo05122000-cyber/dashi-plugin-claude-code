@@ -57,6 +57,12 @@ import {
   type CallbackQueryLike,
   type PermissionDeps,
 } from './channel/permissions.js'
+import { createAskUserQuestionRelay } from './channel/ask-user-question.js'
+import {
+  createAskUserQuestionUi,
+  type AskCallbackContext,
+  type AskUserQuestionUi,
+} from './telegram/ask-user-question.js'
 import { TelegramPoller, tokenLock } from './telegram/poller.js'
 import { describePidHolder, readLockHolder } from './telegram/pid-inspect.js'
 import { BOT_COMMANDS } from './commands/oob.js'
@@ -603,10 +609,56 @@ const callbackDeps = {
   pending: pendingPermissions,
   log,
 }
+
+// PRX-1 TASK-2 (2026-05-27): AskUserQuestion relay + Telegram UX.
+// The relay (TASK-1) is the per-request state machine; the UI (TASK-2)
+// owns the keyboard render + callback dispatch. TASK-3 (webhook routes)
+// reads `askUserQuestionRelay` to submit new requests; TASK-2's UI is
+// invoked from the callback_query handler below and the text-reply
+// path in handlers.ts (Other follow-up).
+const askUserQuestionRelay = createAskUserQuestionRelay({
+  log,
+  defaultTimeoutMs: config.ask_user_question.timeout_ms,
+})
+const askUserQuestionUi: AskUserQuestionUi = createAskUserQuestionUi({
+  config,
+  log,
+  telegramApi,
+  relay: askUserQuestionRelay,
+})
 // Adapt grammY's Context to our structural CallbackQueryLike. grammY's
 // answerCallbackQuery returns Promise<true>; the structural type expects
 // Promise<void>. We wrap to drop the boolean and decouple from grammY types.
+//
+// PRX-1 TASK-2 (2026-05-27): the dispatcher routes by callback_data prefix:
+//   * `ask:*`  → AskUserQuestion Telegram UX (one keyboard per question).
+//   * default  → permission relay (perm:allow / perm:deny / perm:more).
+// Both share the same auth check (resolveAskUserQuestionAllowedUserIds
+// vs isPermissionApprover); the silent-ack on unknown payloads at the
+// bottom of each handler keeps a foreign callback from leaving a spinner
+// in the chat.
 bot.on('callback_query:data', async ctx => {
+  const data = ctx.callbackQuery.data ?? ''
+  if (data.startsWith('ask:')) {
+    const askCtx: AskCallbackContext = {
+      callbackQuery: { data },
+      from: { id: ctx.from.id },
+      chatId:
+        ctx.chat?.id !== undefined ? String(ctx.chat.id) : String(ctx.from.id),
+      answerCallbackQuery: async arg => {
+        if (arg) await ctx.answerCallbackQuery(arg)
+        else await ctx.answerCallbackQuery()
+      },
+    }
+    try {
+      await askUserQuestionUi.handleAskCallback(askCtx)
+    } catch (err) {
+      log.error('ask callback_query handler threw', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+    return
+  }
   const adapted: CallbackQueryLike = {
     callbackQuery: {
       data: ctx.callbackQuery.data,
@@ -770,6 +822,10 @@ const handlerDeps: HandlerDeps = {
   // (handlers.ts treats the pair atomically).
   ...(multichatRouter !== undefined ? { router: multichatRouter } : {}),
   ...(multichatPolicy !== undefined ? { policy: multichatPolicy } : {}),
+  // PRX-1 TASK-2: ask UI consumes follow-up `Другое` text replies BEFORE
+  // the permission-reply short-circuit. Always wired — feature gate lives
+  // inside the relay itself (callbacks no-op when no pending request).
+  askUserQuestionUi,
 }
 
 bot.on('message:text', ctx => handleInboundText(ctx, handlerDeps))
@@ -916,6 +972,13 @@ try {
     taskMirror,
     watcher: inboundWatcher,
     ...(memoryWriter !== undefined ? { memoryWriter } : {}),
+    // PRX-1 TASK-3 (2026-05-27): AskUserQuestion HTTP relay routes.
+    // Always wired here — the per-request feature gate lives inside the
+    // route handler (config.ask_user_question.enabled). Passing the
+    // relay + UI unconditionally lets an operator flip the feature on
+    // at runtime via env without a restart.
+    askRelay: askUserQuestionRelay,
+    askUi: askUserQuestionUi,
   })
 } catch (err) {
   log.error('webhook server failed to start', {

@@ -51,6 +51,7 @@ import {
   parsePermissionTextReply,
   type PermissionRelayHooks,
 } from '../channel/permissions.js'
+import type { AskUserQuestionUi } from './ask-user-question.js'
 import { AlbumBuffer, type Album } from './album-buffer.js'
 import {
   compositeAlbumKey,
@@ -157,6 +158,13 @@ export interface HandlerDeps {
   // `router` to flip the dispatch path; passing one without the other
   // is a wiring bug at the server.ts level (Batch 5 enforces this).
   policy?: MultichatPolicy
+  // PRX-1 TASK-2 (2026-05-27): AskUserQuestion Telegram UX. The text
+  // handler consults `tryHandleOtherText` BEFORE the permission-reply
+  // short-circuit so a follow-up «Другое» text answer never gets
+  // mis-parsed as `yes <id>` / `no <id>`. Optional — when absent (old
+  // wiring / tests that predate TASK-2), the consumption is skipped
+  // and inbound text flows through the existing paths unchanged.
+  askUserQuestionUi?: AskUserQuestionUi
 }
 
 // Coerce grammY's reply_to_message Message shape into the narrower
@@ -1003,16 +1011,18 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
     } catch (_e) { /* react best-effort */ }
   }
 
-  // Permission-text short-circuit. BEFORE the OOB check: when the sender is
-  // an approver AND text matches `yes <id>` / `no <id>` AND that id is
-  // currently pending, emit the verdict and DO NOT forward as a channel
-  // notification. If the id is unknown, fall through so the text still
-  // reaches the agent — a normal message like "yes abcde fix it" would
-  // otherwise be lost. Mirrors refs/telegram-official/server.ts:412-443.
-  // DM-only guard: permission verdicts (`yes <id>` / `no <id>`) MUST come
-  // from a private chat. In a group/supergroup/channel we fall through to the
-  // normal channel forward so the agent still sees the text — we never emit
-  // a verdict from a non-DM context.
+  // FIX-T1 F3 (PRX-1 Phase 5, 2026-05-27): permission verdicts ALWAYS take
+  // priority over the AskUserQuestion «Other» text consumer. Previously the
+  // Other-text path ran first and would swallow a perfectly-formed
+  // `yes <id>` / `no <id>` reply — the permission relay timed out and the
+  // warchief's intent was lost. SECURITY gate: live permission verdict
+  // wins so the approve/deny channel cannot be hijacked by a parallel
+  // AskUserQuestion prompt.
+  //
+  // DM-only guard: permission verdicts MUST come from a private chat. In a
+  // group/supergroup/channel we fall through to the normal channel forward
+  // so the agent still sees the text — we never emit a verdict from a
+  // non-DM context.
   if (deps.permissionHooks && ctx.from?.id !== undefined && ctx.chat?.type === 'private') {
     const decision = parsePermissionTextReply(text)
     if (decision && isPermissionApprover(ctx.from.id, deps.config)) {
@@ -1045,6 +1055,29 @@ export async function handleInboundText(ctx: Context, deps: HandlerDeps): Promis
       // fall through — text might genuinely be "yes abcde fix it" if the user
       // ever starts a sentence that way. Channel sees the message.
     }
+  }
+
+  // PRX-1 TASK-2 (2026-05-27): AskUserQuestion «Other» text-reply
+  // consumption. Runs AFTER the permission-reply gate so a live `yes <id>`
+  // / `no <id>` verdict is never swallowed (FIX-T1 F3). The UI itself
+  // enforces:
+  //   - approver allowlist (only the warchief may answer)
+  //   - reply_to_message_id matches the awaiting prompt (FIX-T1 F4 — narrow
+  //     hijack surface; only an explicit reply to «Введи ответ» consumes
+  //     the awaiting slot, freeform text falls through to channel forward)
+  if (
+    deps.askUserQuestionUi
+    && ctx.from?.id !== undefined
+    && ctx.chat?.id !== undefined
+  ) {
+    const replyToId = ctx.message?.reply_to_message?.message_id
+    const consumed = await deps.askUserQuestionUi.tryHandleOtherText({
+      chatId: String(ctx.chat.id),
+      fromUserId: ctx.from.id,
+      text,
+      ...(replyToId !== undefined ? { replyToMessageId: replyToId } : {}),
+    })
+    if (consumed) return
   }
   // OOB short-circuit: when the sender is allowed AND the chat is a DM AND
   // the text parses as a known /command, handle it inline and DO NOT fall

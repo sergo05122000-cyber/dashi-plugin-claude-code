@@ -279,3 +279,102 @@ describe('createSafeTelegramApi — inline keyboard redaction', () => {
     expect(sent!.inline_keyboard).toHaveLength(3)
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────
+// FIX-T1 F2 (PRX-1 Phase 5, 2026-05-27) — editMessageText propagates
+// reply_markup to the underlying api call. Locks the contract so a
+// future spread-drop or EditOpts type narrowing never silently breaks
+// inline-keyboard toggle re-renders. Codex review #1 traced multi-select
+// stale-button bugs to a missing copy on this path.
+// ─────────────────────────────────────────────────────────────────────
+
+describe('createSafeTelegramApi — editMessageText reply_markup propagation (F2)', () => {
+  test('caller-supplied inline_keyboard reaches the underlying raw.editMessageText', async () => {
+    const { api, calls } = makeStubApi()
+    const { log } = makeLog()
+    const safe = createSafeTelegramApi(api, log)
+    const reply_markup = {
+      inline_keyboard: [[{ text: 'Toggle A', callback_data: 'tgl:A' }]],
+    }
+    await safe.editMessageText('1', 42, 'new body', {
+      parse_mode: 'HTML',
+      reply_markup,
+    })
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.method).toBe('editMessageText')
+    const sentMarkup = (calls[0]!.opts as EditOpts).reply_markup
+    expect(sentMarkup).toBeDefined()
+    expect(sentMarkup!.inline_keyboard).toHaveLength(1)
+    expect(sentMarkup!.inline_keyboard[0]).toHaveLength(1)
+    expect(sentMarkup!.inline_keyboard[0]![0]!.text).toBe('Toggle A')
+    expect(sentMarkup!.inline_keyboard[0]![0]!.callback_data).toBe('tgl:A')
+  })
+
+  test('empty inline_keyboard (keyboard clearing) propagates', async () => {
+    const { api, calls } = makeStubApi()
+    const { log } = makeLog()
+    const safe = createSafeTelegramApi(api, log)
+    await safe.editMessageText('1', 42, 'final state', {
+      reply_markup: { inline_keyboard: [] },
+    })
+    const sent = (calls[0]!.opts as EditOpts).reply_markup
+    expect(sent).toBeDefined()
+    expect(sent!.inline_keyboard).toEqual([])
+  })
+
+  test('reply_markup with secrets in button text is redacted, but markup still propagates', async () => {
+    const { api, calls } = makeStubApi()
+    const { log } = makeLog()
+    const safe = createSafeTelegramApi(api, log)
+    const tok = '8507713167:AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRR'
+    await safe.editMessageText('1', 42, 'body', {
+      reply_markup: {
+        inline_keyboard: [[{ text: `tap ${tok}`, callback_data: 'cb' }]],
+      },
+    })
+    const sent = (calls[0]!.opts as EditOpts).reply_markup
+    expect(sent).toBeDefined()
+    expect(sent!.inline_keyboard[0]![0]!.text).not.toContain(tok)
+    expect(sent!.inline_keyboard[0]![0]!.callback_data).toBe('cb')
+  })
+
+  test('absent reply_markup → opts has no reply_markup (no spurious empty keyboard)', async () => {
+    const { api, calls } = makeStubApi()
+    const { log } = makeLog()
+    const safe = createSafeTelegramApi(api, log)
+    await safe.editMessageText('1', 42, 'body', { parse_mode: 'HTML' })
+    expect((calls[0]!.opts as EditOpts).reply_markup).toBeUndefined()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
+// FIX-T1 F4 (PRX-1 Phase 5, 2026-05-27) — non-inline reply_markup
+// (ForceReply / ReplyKeyboardRemove) passes through unmodified. Before
+// the fix redactReplyMarkup unconditionally returned `{inline_keyboard:[]}`
+// which silently broke the AskUserQuestion «Other» force_reply prompt.
+// ─────────────────────────────────────────────────────────────────────
+
+describe('createSafeTelegramApi — non-inline reply_markup passthrough', () => {
+  test('force_reply markup survives the safe wrapper intact', async () => {
+    const { api, calls } = makeStubApi()
+    const { log } = makeLog()
+    const safe = createSafeTelegramApi(api, log)
+    const forceReply = {
+      force_reply: true,
+      selective: true,
+      input_field_placeholder: 'Введи ответ',
+    }
+    await safe.sendMessage('1', 'prompt', {
+      reply_markup: forceReply as unknown as NonNullable<SendMessageOpts['reply_markup']>,
+    })
+    const sent = calls[0]!.opts.reply_markup as unknown as Record<string, unknown>
+    expect(sent).toBeDefined()
+    expect(sent.force_reply).toBe(true)
+    expect(sent.selective).toBe(true)
+    expect(sent.input_field_placeholder).toBe('Введи ответ')
+    // CRITICAL: no inline_keyboard field is injected by the wrapper —
+    // grammy would interpret an empty inline_keyboard as a removal of
+    // the force_reply behaviour.
+    expect(sent.inline_keyboard).toBeUndefined()
+  })
+})

@@ -280,3 +280,76 @@ export const PermissionRequestParamsSchema = z.object({
   input_preview: z.string().max(200),
 })
 export type PermissionRequestParams = z.infer<typeof PermissionRequestParamsSchema>
+
+// ─────────────────────────────────────────────────────────────────────
+// AskUserQuestion HTTP relay (PRX-1 TASK-3, 2026-05-27).
+//
+// Shapes mirror the Claude Code AskUserQuestion tool_input plus the
+// transport-only fields the hook wrapper adds (session_id, tool_use_id,
+// transcript_path, timeout_ms). Constraints below are intentionally
+// strict so a malformed `/request` payload returns a clean 400 instead
+// of being silently coerced into a degenerate prompt that wastes the
+// warchief's attention.
+//
+// Caps come from CC docs (1..4 questions, 2..4 options/question) and
+// the body-limit budget reserved for AskUserQuestion (~64 KB). Total
+// JSON payload size is enforced separately at the HTTP layer (the
+// generic 256 KB cap; the per-route 64 KB check lives in server.ts so
+// we can short-circuit before paying Zod's parse cost on giant blobs).
+// ─────────────────────────────────────────────────────────────────────
+
+export const AskUserQuestionOptionSchema = z.object({
+  label: z.string().min(1).max(200),
+  description: z.string().min(1).max(1000),
+  // Preview is optional per CC's AskUserQuestion contract — when absent
+  // TASK-2 renders only label + description. Cap mirrors the upper
+  // bound on `max_preview_chars` we'd realistically configure in
+  // ask_user_question.max_preview_chars (1000 default → 8000 hard cap).
+  preview: z.string().max(8000).optional(),
+})
+export type AskUserQuestionOption = z.infer<typeof AskUserQuestionOptionSchema>
+
+export const AskUserQuestionItemSchema = z.object({
+  question: z.string().min(1).max(2000),
+  header: z.string().min(1).max(200),
+  multiSelect: z.boolean(),
+  options: z.array(AskUserQuestionOptionSchema).min(2).max(4),
+})
+export type AskUserQuestionItem = z.infer<typeof AskUserQuestionItemSchema>
+
+export const AskUserQuestionRequestSchema = z.object({
+  session_id: z.string().min(1).max(200),
+  tool_use_id: z.string().min(1).max(200),
+  transcript_path: z.string().max(2048).optional(),
+  // Optional override; server clamps against config.ask_user_question.timeout_ms.
+  timeout_ms: z.number().int().positive().max(60 * 60 * 1000).optional(),
+  questions: z.array(AskUserQuestionItemSchema).min(1).max(4),
+})
+export type AskUserQuestionRequest = z.infer<typeof AskUserQuestionRequestSchema>
+
+// Short-id regex shared with the permission relay — keeps audit grep
+// patterns uniform. `SHORT_ID_RE` itself lives in channel/short-id.ts;
+// we duplicate it here as a Zod-side guard so the schema fails fast.
+const SHORT_ID_PATTERN = /^[a-km-z]{5}$/
+
+// Index caps mirror AskUserQuestionRequestSchema: questions.min(1).max(4)
+// and options.min(2).max(4). Indices are 0-based ⇒ max valid index = 3.
+// A wider cap (the original .max(10)) would accept indices that can only
+// ever index out of range, wasting a relay round-trip and polluting the
+// audit log with rejected callbacks (Codex webhook #5).
+export const AskUserQuestionAnswerSchema = z.object({
+  request_id: z.string().regex(SHORT_ID_PATTERN, 'must be a 5-letter short id'),
+  action: z.enum(['choose', 'toggle', 'done', 'other']),
+  question_index: z.number().int().min(0).max(3).optional(),
+  selected_option_index: z.number().int().min(0).max(3).optional(),
+  selected_label: z.string().min(1).max(2000).optional(),
+  user_id: z.number().int().positive(),
+  // Coerce numeric chat ids (Telegram returns numbers for callback
+  // `chat.id`) to string before length-check so callers can post
+  // either form. Matches the WebhookMessagePayloadSchema convention.
+  chat_id: z.union([z.number(), z.string()])
+    .transform((v) => String(v))
+    .refine((v) => v.length <= 64, { message: 'chat_id too long' })
+    .optional(),
+})
+export type AskUserQuestionAnswer = z.infer<typeof AskUserQuestionAnswerSchema>

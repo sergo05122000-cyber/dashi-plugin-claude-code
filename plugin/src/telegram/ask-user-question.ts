@@ -1,0 +1,1015 @@
+// AskUserQuestion Telegram UX (PRX-1 TASK-2, 2026-05-27).
+//
+// Renders one question at a time as a Telegram message + inline keyboard,
+// dispatches `ask:*` callback_query payloads, and feeds the warchief's
+// answers back into the AskUserQuestion relay (TASK-1).
+//
+// Scope:
+//   * Pure UI/dispatch — relay state machine (TASK-1) owns lifecycle.
+//   * Talks ONLY through the safe-wrapped TelegramApi (redact + HTML
+//     validate). Never reach into grammy directly.
+//   * Auth check on every callback: ctx.from.id MUST be in
+//     resolveAskUserQuestionAllowedUserIds(config). Otherwise reply
+//     «Не авторизован» and log audit event `request_unauthorized`.
+//
+// Callback payload taxonomy (per Codex plan, fits in Telegram's 64-byte
+// callback_data budget):
+//
+//   ask:choose:<reqId>:<qIdx>:<optIdx>   single-select pick
+//   ask:toggle:<reqId>:<qIdx>:<optIdx>   multiSelect toggle
+//   ask:done:<reqId>:<qIdx>              multiSelect commit
+//   ask:other:<reqId>:<qIdx>             open «Other» text-entry prompt
+//
+// Worst-case length: `ask:toggle:abcde:99:99` = 22 bytes. The qIdx /
+// optIdx caps mean we MUST refuse to render keyboards with > 99 options
+// per question — `MAX_KEYBOARD_OPTIONS = 99` is the hard ceiling.
+// Same applies to question count: `MAX_QUESTIONS_PER_REQUEST = 99`.
+//
+// «Other» text-entry flow (FIX-T1 F4, PRX-1 Phase 5, 2026-05-27):
+//   1. Warchief taps «Другое» → we send «Введи ответ текстом» with
+//      `force_reply: true, selective: true` (Telegram clients auto-quote
+//      the prompt for the warchief). The returned message_id is stored
+//      in `awaitingOtherFor[chatId] = {requestId, questionIndex,
+//      promptMessageId, expiresAt}`.
+//   2. tryHandleOtherText consumes the next text ONLY when its
+//      `reply_to_message_id` matches `promptMessageId`. Without this
+//      gate ANY text typed in the chat would be eaten — a `yes <id>`
+//      permission reply, a normal channel message, even a stray emoji —
+//      blocking the warchief's intent and silently consuming sensitive
+//      input into the Other slot. Texts without the matching reply_to
+//      fall through to the normal handlers (permission, OOB, channel
+//      forward).
+//   3. The pending map is pruned on every read and bounded by TTL so a
+//      forgotten tap doesn't leak state.
+
+import type { Logger } from '../log.js'
+import type { AppConfig } from '../config.js'
+import { resolveAskUserQuestionAllowedUserIds } from '../config.js'
+import type {
+  AskUserQuestionRelay,
+  PendingAskRequest,
+} from '../channel/ask-user-question.js'
+import type { InlineKeyboardLike, TelegramApi } from '../channel/tools.js'
+import { escapeHtml } from '../format/html.js'
+import { classifyEditError } from '../safety/telegram-edit-classifier.js'
+
+// ─────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────
+
+// Hard caps tied to the 64-byte callback_data budget. With the longest
+// payload pattern `ask:toggle:<5>:<2>:<2>` we have 22 bytes — well under
+// 64 — but we still cap the renderable counts so an oversized incoming
+// request degrades gracefully (truncated to N options + an «overflow»
+// note) rather than producing payloads we cannot parse back.
+export const MAX_KEYBOARD_OPTIONS = 99
+export const MAX_QUESTIONS_PER_REQUEST = 99
+
+// Telegram button text cap is ~30 chars in practice (4 lines of compact
+// display on mobile clients). Beyond that the label truncates ugly.
+const MAX_BUTTON_LABEL = 30
+
+// Telegram inline-button text limit is 64 bytes per Bot API docs; we cap
+// well under to keep room for the checkbox prefix («[x] » = 4 bytes).
+const MULTISELECT_PREFIX_CHECKED = '[x] '
+const MULTISELECT_PREFIX_UNCHECKED = '[ ] '
+
+// Soft cap for the rendered message body. Telegram itself caps at 4096
+// but our chunker (format/chunk.ts) targets 4000 — staying under that
+// avoids any need to split a question card across two messages, which
+// would break the «one keyboard per question» invariant.
+const MAX_BODY_CHARS = 3800
+
+// FIX-T2 F2 — per-field raw caps applied BEFORE HTML rendering. The
+// pre-fix path sliced the rendered HTML at MAX_BODY_CHARS, which could
+// cut inside `<pre>`, `<b>`, or a `&lt;` entity and produce Telegram
+// parse errors. Capping the raw fields up-front + piecewise assembly
+// guarantees we only ever slice between completed tag pairs.
+const MAX_HEADER_CHARS = 80
+const MAX_QUESTION_CHARS = 1000
+const MAX_OPTION_DESCRIPTION_CHARS = 500
+// Marker appended when the assembled body would overflow MAX_BODY_CHARS.
+// Self-contained HTML — no open tags, never sliced.
+const OVERFLOW_MARKER = '\n<i>… (обрезано)</i>'
+
+// ─────────────────────────────────────────────────────────────────────
+// Public types
+// ─────────────────────────────────────────────────────────────────────
+
+export interface AskUserQuestionUiDeps {
+  config: AppConfig
+  log: Logger
+  telegramApi: TelegramApi
+  relay: AskUserQuestionRelay
+  /** Override clock for tests. */
+  now?: () => number
+}
+
+export interface AskUserQuestionUi {
+  /**
+   * Render the current question of the request to the chat stored on
+   * the pending record. Called by TASK-3 after a fresh request is
+   * submitted, and recursively by `handleAskCallback` after a `choose`
+   * / `done` advances the relay to the next question.
+   *
+   * No-op when:
+   *   * the request is no longer pending (resolved/timed out), or
+   *   * the pending record has no chatId (defensive — relay would have
+   *     returned pass_through on submit).
+   */
+  startQuestion(requestId: string): Promise<void>
+
+  /**
+   * Dispatch one `callback_query:data` event whose `data` starts with
+   * `ask:`. Caller (server.ts callback_query handler) is responsible
+   * for forwarding non-`ask:` payloads to the permission relay.
+   *
+   * Always answers the callback (Telegram spinner) even on errors so
+   * the warchief's UI doesn't appear stuck.
+   */
+  handleAskCallback(ctx: AskCallbackContext): Promise<void>
+
+  /**
+   * Consume an inbound text message as the answer to a pending
+   * «Other» prompt. Returns true if the text was consumed (caller
+   * MUST NOT continue with the normal channel-forward flow), false
+   * otherwise.
+   *
+   * FIX-T1 F4 (PRX-1 Phase 5): `replyToMessageId` MUST equal the stored
+   * `promptMessageId` for consumption. When absent or mismatched the
+   * caller is told to fall through so a parallel `yes <id>` or normal
+   * channel message is not silently swallowed.
+   */
+  tryHandleOtherText(input: {
+    chatId: string
+    fromUserId: number
+    text: string
+    replyToMessageId?: number
+  }): Promise<boolean>
+
+  /** Test/inspection — pending «Other» prompts. */
+  awaitingOtherCount(): number
+}
+
+/**
+ * Subset of grammy's callback_query Context the handler reads. Kept
+ * structural so tests can stub without pulling grammy.
+ */
+export interface AskCallbackContext {
+  callbackQuery: { data?: string }
+  from: { id: number }
+  /** ID of the chat the keyboard message lives in (matches `from.id`
+   *  for DM callbacks, group/channel id for group keyboards). */
+  chatId: string
+  /**
+   * Phase 5 FIX-T3 F4 (2026-05-27): message_id of the Telegram message
+   * the inline keyboard belongs to (`ctx.callback_query.message.message_id`).
+   * Used to reject stale callbacks that target a keyboard older than the
+   * relay's currently-anchored message (e.g. a re-render advanced the
+   * anchor and Telegram replayed an old tap from the cleared message).
+   * Optional — clients that can't supply it skip the message-id check
+   * but still benefit from the questionIndex + chatId guards below.
+   */
+  callbackMessageId?: number | undefined
+  answerCallbackQuery(arg?: { text?: string }): Promise<void>
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Module-level helpers — pure, exported for tests
+// ─────────────────────────────────────────────────────────────────────
+
+export type AskCallbackPayload =
+  | { kind: 'choose'; requestId: string; questionIndex: number; optionIndex: number }
+  | { kind: 'toggle'; requestId: string; questionIndex: number; optionIndex: number }
+  | { kind: 'done'; requestId: string; questionIndex: number }
+  | { kind: 'other'; requestId: string; questionIndex: number }
+
+const REQ_ID_RE = /^[a-km-z]{5}$/
+// Numeric segments are bounded by MAX_KEYBOARD_OPTIONS/MAX_QUESTIONS_PER_REQUEST
+// (max 2 digits). Allow 1-2 digits, no leading zeros (so we cannot mint
+// duplicates from `01` vs `1`).
+const INDEX_RE = /^(?:0|[1-9][0-9]?)$/
+
+/** Parse one `ask:*` callback payload. Returns null on any malformed
+ *  shape — caller silently acks the spinner without touching relay state. */
+export function parseAskCallback(data: string): AskCallbackPayload | null {
+  if (!data.startsWith('ask:')) return null
+  const parts = data.split(':')
+  // ['ask', '<kind>', '<reqId>', '<qIdx>', '<optIdx>?']
+  if (parts.length < 4 || parts.length > 5) return null
+  const kind = parts[1]
+  const requestId = parts[2] ?? ''
+  const qIdxStr = parts[3] ?? ''
+  if (!REQ_ID_RE.test(requestId)) return null
+  if (!INDEX_RE.test(qIdxStr)) return null
+  const questionIndex = Number.parseInt(qIdxStr, 10)
+  if (questionIndex > MAX_QUESTIONS_PER_REQUEST) return null
+
+  if (kind === 'choose' || kind === 'toggle') {
+    if (parts.length !== 5) return null
+    const optIdxStr = parts[4] ?? ''
+    if (!INDEX_RE.test(optIdxStr)) return null
+    const optionIndex = Number.parseInt(optIdxStr, 10)
+    if (optionIndex > MAX_KEYBOARD_OPTIONS) return null
+    return { kind, requestId, questionIndex, optionIndex }
+  }
+  if (kind === 'done' || kind === 'other') {
+    if (parts.length !== 4) return null
+    return { kind, requestId, questionIndex }
+  }
+  return null
+}
+
+/** Truncate a button label to the safe display width. Ellipsis with a
+ *  Unicode horizontal ellipsis to keep byte cost low (3 bytes). */
+function truncateLabel(label: string, max: number = MAX_BUTTON_LABEL): string {
+  if (label.length <= max) return label
+  return label.slice(0, Math.max(1, max - 1)) + '…'
+}
+
+/** Cap a raw (un-escaped) field to N chars. The cap is applied to the
+ *  raw user-supplied text BEFORE escaping; this guarantees we never slice
+ *  a multi-byte `&lt;` entity or a `<pre>`/`<b>` tag in half. Appends a
+ *  Unicode ellipsis (3 bytes, render-safe) when truncated. */
+function clipRaw(text: string, max: number): string {
+  if (text.length <= max) return text
+  return text.slice(0, Math.max(1, max - 1)) + '…'
+}
+
+/**
+ * Render the message body for one question. Pure — returns the HTML
+ * string ready for sendMessage(parse_mode: HTML). Exported for tests.
+ *
+ * FIX-T2 F2 — tag-safe rendering. The pre-fix implementation rendered
+ * the full body to a single string and then sliced it at MAX_BODY_CHARS,
+ * which could cut inside `<pre>`, `<b>`, or an HTML entity like `&lt;`
+ * and crash Telegram's parser. The new strategy:
+ *
+ *   1. Cap each RAW (un-escaped) field up-front: header, question,
+ *      option labels, option descriptions, option previews.
+ *   2. Assemble the body piecewise, tracking the running length. If the
+ *      next piece would push us past MAX_BODY_CHARS, stop and append
+ *      a self-contained `<i>… (обрезано)</i>` marker — never slice
+ *      inside an open tag or entity.
+ *
+ * Slicing inside `escapeHtml`'s output (e.g. partial `&amp;`) is now
+ * structurally impossible: every field is escaped AFTER its raw cap, and
+ * the only place we still slice strings (`clipRaw`) operates on raw
+ * un-escaped text. Telegram receives well-formed HTML in all cases.
+ */
+export function renderQuestionBody(
+  pending: Readonly<PendingAskRequest>,
+  maxPreviewChars: number,
+): string {
+  const q = pending.questions[pending.currentIndex]
+  if (!q) return ''
+
+  // Cap per-field caller-supplied raw text BEFORE rendering. After this
+  // point we only escape + assemble — no in-tag slicing possible.
+  const header = clipRaw(
+    `Вопрос ${pending.currentIndex + 1}/${pending.questions.length}`,
+    MAX_HEADER_CHARS,
+  )
+  const questionRaw = clipRaw(q.question, MAX_QUESTION_CHARS)
+  const opts = q.options.slice(0, MAX_KEYBOARD_OPTIONS)
+
+  // Assemble piecewise. `pieces` is the running list of fully-formed
+  // HTML chunks (no half-open tags). `running` is the assembled length.
+  // Budget = MAX_BODY_CHARS minus the overflow marker so we always have
+  // room to append it cleanly if we hit the cap.
+  const budget = MAX_BODY_CHARS - OVERFLOW_MARKER.length
+  const pieces: string[] = []
+  let running = 0
+  let truncated = false
+
+  // Try to append a fully-formed HTML chunk. Returns true if appended,
+  // false if we hit the budget (and sets truncated=true). The newline
+  // separator between chunks is accounted for so the joined body stays
+  // under `budget`.
+  function tryPush(chunk: string): boolean {
+    if (truncated) return false
+    const sep = pieces.length === 0 ? 0 : 1 // '\n' join cost
+    const need = running + sep + chunk.length
+    if (need > budget) {
+      truncated = true
+      return false
+    }
+    pieces.push(chunk)
+    running = need
+    return true
+  }
+
+  // 1) Header + question text.
+  tryPush(`<b>${escapeHtml(header)}</b>`)
+  tryPush(escapeHtml(questionRaw))
+  tryPush('') // blank line separator (cheap: 0-length chunk + join newline)
+
+  // 2) Option list. Each entry is its own self-contained chunk — if we
+  //    run out of budget mid-list the loop bails cleanly, no half tags.
+  const optsCount = opts.length
+  for (let i = 0; i < optsCount; i++) {
+    const opt = opts[i]!
+    const label = escapeHtml(clipRaw(opt.label, MAX_BUTTON_LABEL))
+    const descRaw = typeof opt.description === 'string' ? opt.description : ''
+    let line: string
+    if (descRaw.length > 0) {
+      const desc = escapeHtml(clipRaw(descRaw, MAX_OPTION_DESCRIPTION_CHARS))
+      line = `${i + 1}. <b>${label}</b> — ${desc}`
+    } else {
+      line = `${i + 1}. ${label}`
+    }
+    if (!tryPush(line)) break
+  }
+
+  // 3) Keyboard-overflow note (only meaningful if the option list itself
+  //    overflowed MAX_KEYBOARD_OPTIONS — same rule as the keyboard builder).
+  if (!truncated && q.options.length > MAX_KEYBOARD_OPTIONS) {
+    tryPush('')
+    tryPush(
+      `<i>(показаны первые ${MAX_KEYBOARD_OPTIONS} из ${q.options.length} — обрезано)</i>`,
+    )
+  }
+
+  // 4) Optional `preview` field on options — Claude's AskUserQuestion
+  //    API exposes it; our local type doesn't model it strictly
+  //    (caller-supplied shape). Probe defensively, clip raw to
+  //    config.max_preview_chars, then escape inside `<pre>`.
+  if (!truncated) {
+    let openedPreviewSection = false
+    for (let i = 0; i < opts.length; i++) {
+      const opt = opts[i]!
+      const previewCandidate = (opt as { preview?: unknown }).preview
+      if (typeof previewCandidate !== 'string' || previewCandidate.length === 0) continue
+      const clipped = clipRaw(previewCandidate, maxPreviewChars)
+      const labelHtml = escapeHtml(clipRaw(opt.label, MAX_BUTTON_LABEL))
+      const previewChunk = `<b>${labelHtml}:</b>\n<pre>${escapeHtml(clipped)}</pre>`
+      if (!openedPreviewSection) {
+        if (!tryPush('')) break
+        openedPreviewSection = true
+      }
+      if (!tryPush(previewChunk)) break
+    }
+  }
+
+  let body = pieces.join('\n')
+  if (truncated) {
+    // Self-contained marker — never sliced, never inside another tag.
+    body += OVERFLOW_MARKER
+  }
+  return body
+}
+
+/** Build the inline keyboard for one question. Multi-select rows show
+ *  a checkbox prefix reflecting `multiSelectInFlight`. Exported for tests. */
+export function buildQuestionKeyboard(
+  pending: Readonly<PendingAskRequest>,
+): InlineKeyboardLike {
+  const q = pending.questions[pending.currentIndex]
+  if (!q) return { inline_keyboard: [] }
+  const rows: { text: string; callback_data?: string }[][] = []
+  const opts = q.options.slice(0, MAX_KEYBOARD_OPTIONS)
+  const multiSelect = q.multiSelect === true
+
+  for (let i = 0; i < opts.length; i++) {
+    const opt = opts[i]!
+    let buttonText: string
+    if (multiSelect) {
+      const checked = pending.multiSelectInFlight.includes(opt.label)
+      const prefix = checked ? MULTISELECT_PREFIX_CHECKED : MULTISELECT_PREFIX_UNCHECKED
+      buttonText = prefix + truncateLabel(opt.label, MAX_BUTTON_LABEL - prefix.length)
+    } else {
+      buttonText = truncateLabel(opt.label)
+    }
+    const verb = multiSelect ? 'toggle' : 'choose'
+    rows.push([
+      {
+        text: buttonText,
+        callback_data: `ask:${verb}:${pending.requestId}:${pending.currentIndex}:${i}`,
+      },
+    ])
+  }
+
+  // Footer row(s): «Другое» always; «Готово» for multiSelect.
+  const footer: { text: string; callback_data?: string }[] = [
+    {
+      text: 'Другое',
+      callback_data: `ask:other:${pending.requestId}:${pending.currentIndex}`,
+    },
+  ]
+  if (multiSelect) {
+    footer.push({
+      text: 'Готово',
+      callback_data: `ask:done:${pending.requestId}:${pending.currentIndex}`,
+    })
+  }
+  rows.push(footer)
+  return { inline_keyboard: rows }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Factory
+// ─────────────────────────────────────────────────────────────────────
+
+interface AwaitingOtherEntry {
+  requestId: string
+  questionIndex: number
+  expiresAt: number
+  // FIX-T1 F4 (PRX-1 Phase 5): Telegram message_id of the «Введи ответ»
+  // prompt. tryHandleOtherText REQUIRES the inbound message's
+  // reply_to_message_id to equal this value before consuming, so a
+  // freeform text typed at top level cannot hijack the slot. When the
+  // sendMessage failed (network blip, Telegram 5xx) the entry is left
+  // out — without a prompt id we cannot safely consume any reply.
+  promptMessageId?: number
+}
+
+export function createAskUserQuestionUi(
+  deps: AskUserQuestionUiDeps,
+): AskUserQuestionUi {
+  const { config, log, telegramApi, relay } = deps
+  const now = deps.now ?? (() => Date.now())
+
+  // chatId → pending «Other» state. TTL aligned with the relay's own
+  // timeout so we cannot outlive the request itself by more than ~1s.
+  // Pruned on every read.
+  const awaitingOther = new Map<string, AwaitingOtherEntry>()
+  const otherTtlMs = config.ask_user_question.timeout_ms
+
+  function pruneOther(): void {
+    const t = now()
+    for (const [chatId, entry] of awaitingOther) {
+      if (entry.expiresAt <= t) awaitingOther.delete(chatId)
+    }
+  }
+
+  function isAuthorized(userId: number): boolean {
+    const allowed = resolveAskUserQuestionAllowedUserIds(config)
+    return allowed.includes(userId)
+  }
+
+  // FIX-T2 F1 (PRX-1 Phase 5): per-request «recovered once» marker for the
+  // message_gone path in rerenderCurrent. The first time Telegram tells us
+  // the anchor message no longer exists (warchief deleted it, 48h edit
+  // window expired, etc.) we re-anchor by calling startQuestion. If a
+  // SECOND message_gone arrives for the same request, repeated re-anchor
+  // would loop until timeout — so we hard-expire the relay instead. The
+  // set is keyed by requestId; on settle the relay drops the request and
+  // we never touch the marker again, so leakage is bounded by the lifetime
+  // of the relay (process restart clears).
+  const recoveredOnce = new Set<string>()
+
+  async function clearKeyboard(
+    requestId: string | undefined,
+    chatId: string,
+    messageId: number,
+    terminalNote: string,
+  ): Promise<void> {
+    // Telegram doesn't have a single «clear keyboard» edit when the
+    // body text doesn't change. We re-send the body with a one-line
+    // terminal note appended and an empty inline_keyboard so the
+    // buttons disappear. This mirrors the permission relay's «edit on
+    // verdict» behaviour (channel/permissions.ts:319-326).
+    try {
+      await telegramApi.editMessageText(
+        chatId,
+        messageId,
+        terminalNote,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+      )
+    } catch (err) {
+      // FIX-T2 F1: classify instead of swallowing at warn. For
+      // clearKeyboard specifically, message_gone is benign (we wanted
+      // the keyboard gone anyway); forbidden indicates the bot lost
+      // access to the chat and any further edits/sends would also fail
+      // — expire the relay so the hook wrapper gets a clean verdict.
+      const cls = classifyEditError(err)
+      switch (cls.kind) {
+        case 'benign':
+        case 'message_gone':
+          // Already-gone or already-in-sync — both achieve the intent.
+          log.debug('ask_user_question clearKeyboard edit no-op', {
+            chat_id: chatId,
+            message_id: messageId,
+            kind: cls.kind,
+          })
+          return
+        case 'forbidden':
+          log.warn('ask_user_question clearKeyboard forbidden — expiring relay', {
+            chat_id: chatId,
+            message_id: messageId,
+            code: cls.code,
+            request_id: requestId,
+          })
+          if (requestId !== undefined) {
+            relay.expire(requestId, `telegram forbidden ${cls.code}: ${cls.description}`)
+          }
+          return
+        case 'parse':
+          log.error('ask_user_question clearKeyboard parse error', {
+            chat_id: chatId,
+            message_id: messageId,
+            description: cls.description,
+            request_id: requestId,
+          })
+          if (requestId !== undefined) {
+            relay.expire(requestId, `telegram parse error: ${cls.description}`)
+          }
+          return
+        case 'flood':
+        case 'transient':
+          // Rate-limit wrapper already retried 429 transparently; reaching
+          // here means retries exhausted or unrelated transient. The
+          // keyboard stays orphaned until the next state change — not
+          // ideal but recoverable; logging at warn is the right level.
+          log.warn('ask_user_question clearKeyboard transient failure', {
+            chat_id: chatId,
+            message_id: messageId,
+            kind: cls.kind,
+            description: cls.description,
+          })
+          return
+      }
+    }
+  }
+
+  async function startQuestion(requestId: string): Promise<void> {
+    pruneOther()
+    const pending = relay.getPending(requestId)
+    if (!pending) {
+      log.debug('ask_user_question startQuestion no pending', { request_id: requestId })
+      return
+    }
+    if (!pending.chatId) {
+      log.warn('ask_user_question startQuestion missing chatId', { request_id: requestId })
+      return
+    }
+    // Phase 5 FIX-T3 F3 (2026-05-27): replay protection. When the webhook
+    // submits the same toolUseId twice in a tight window, the relay
+    // returns the same requestId from both `.submit()` calls, and the
+    // route would call `startQuestion(requestId)` twice. Without this
+    // guard the second call would send a fresh message and overwrite
+    // the relay's `telegramMessageId`, orphaning the first keyboard
+    // (still tappable) and creating a double-anchor. If we already have
+    // a message id stashed, re-render the existing anchor instead of
+    // minting a new one. rerenderCurrent is owned by FIX-T2 and is
+    // idempotent on a no-op edit (Telegram «message is not modified»
+    // is swallowed there).
+    if (pending.telegramMessageId !== undefined) {
+      log.info('ask_user_question startQuestion replay — rerendering anchor', {
+        request_id: requestId,
+        message_id: pending.telegramMessageId,
+      })
+      await rerenderCurrent(requestId)
+      return
+    }
+    const body = renderQuestionBody(pending, config.ask_user_question.max_preview_chars)
+    const keyboard = buildQuestionKeyboard(pending)
+    try {
+      const sent = await telegramApi.sendMessage(pending.chatId, body, {
+        parse_mode: 'HTML',
+        reply_markup: keyboard,
+      })
+      relay.setTelegramMessageId(requestId, sent.message_id)
+      log.info('ask_user_question rendered', {
+        request_id: requestId,
+        chat_id: pending.chatId,
+        question_index: pending.currentIndex,
+        question_count: pending.questions.length,
+        message_id: sent.message_id,
+      })
+    } catch (err) {
+      // FIX-T2 F1: classify send error. The original implementation
+      // logged and dropped silently, leaving the relay pending until
+      // TTL. For permanent failures (bot kicked, parse error) that's
+      // 5min of wasted wall-clock and a useless «timeout» verdict.
+      const cls = classifyEditError(err)
+      switch (cls.kind) {
+        case 'forbidden':
+          log.warn('ask_user_question render forbidden — expiring relay', {
+            request_id: requestId,
+            chat_id: pending.chatId,
+            code: cls.code,
+          })
+          relay.expire(
+            requestId,
+            `telegram forbidden ${cls.code}: bot kicked or unauthorized for chat`,
+          )
+          return
+        case 'parse':
+          log.error('ask_user_question render parse error — expiring relay', {
+            request_id: requestId,
+            chat_id: pending.chatId,
+            description: cls.description,
+          })
+          relay.expire(requestId, `telegram parse error: ${cls.description}`)
+          return
+        case 'flood':
+          // Rate-limit wrapper exhausted retries. Retain pending; the
+          // next interaction (user submits same toolUseId) will trigger
+          // the replay path, OR the timeout fires.
+          log.warn('ask_user_question render flood retry exhausted', {
+            request_id: requestId,
+            chat_id: pending.chatId,
+            retry_after_s: cls.retryAfterSec,
+          })
+          return
+        case 'benign':
+        case 'message_gone':
+        case 'transient':
+          // benign / message_gone can't happen for a fresh sendMessage —
+          // no anchor existed. We still log defensively so an unexpected
+          // classifier hit is visible.
+          log.error('ask_user_question render send failed', {
+            request_id: requestId,
+            chat_id: pending.chatId,
+            kind: cls.kind,
+            error: err instanceof Error ? err.message : String(err),
+          })
+          return
+      }
+    }
+  }
+
+  async function rerenderCurrent(requestId: string): Promise<void> {
+    const pending = relay.getPending(requestId)
+    if (!pending) return
+    if (!pending.chatId || pending.telegramMessageId === undefined) {
+      // No previous render — fall back to a fresh send.
+      await startQuestion(requestId)
+      return
+    }
+    const body = renderQuestionBody(pending, config.ask_user_question.max_preview_chars)
+    const keyboard = buildQuestionKeyboard(pending)
+    const chatId = pending.chatId
+    const messageId = pending.telegramMessageId
+    try {
+      await telegramApi.editMessageText(
+        chatId,
+        messageId,
+        body,
+        { parse_mode: 'HTML', reply_markup: keyboard },
+      )
+    } catch (err) {
+      // FIX-T2 F1: classify and react instead of warn-and-forget. The
+      // pre-fix path swallowed all errors at warn, so a deleted-message
+      // or kicked-bot scenario would silently wait until TTL.
+      const cls = classifyEditError(err)
+      switch (cls.kind) {
+        case 'benign':
+          // «message is not modified» — body identical to what's there
+          // already (e.g. double-tap on the same toggle). No-op.
+          log.debug('ask_user_question rerender no-op (not modified)', {
+            request_id: requestId,
+          })
+          return
+        case 'message_gone':
+          // Warchief deleted the keyboard message, or it aged out of the
+          // 48h edit window. Re-anchor ONCE: drop the stale message id and
+          // call startQuestion, which sends a fresh keyboard. A SECOND
+          // message_gone for the same request means re-anchor didn't help
+          // (chat permissions, bot kicked, …) — hard-expire so the hook
+          // wrapper gets a clean verdict.
+          if (recoveredOnce.has(requestId)) {
+            log.warn('ask_user_question rerender message_gone twice — expiring', {
+              request_id: requestId,
+              chat_id: chatId,
+              description: cls.description,
+            })
+            relay.expire(requestId, 'telegram anchor message gone twice; cannot recover')
+            recoveredOnce.delete(requestId)
+            return
+          }
+          recoveredOnce.add(requestId)
+          log.info('ask_user_question rerender message_gone — re-anchoring', {
+            request_id: requestId,
+            chat_id: chatId,
+            description: cls.description,
+          })
+          // Drop the stale id BEFORE calling startQuestion, otherwise the
+          // FIX-T3 F3 replay-protection branch would re-enter rerenderCurrent
+          // and recurse on the same dead message. The relay setter exposed
+          // by TASK-1 only accepts numbers; we work around by simulating an
+          // un-anchored state through the relay's per-question reset path —
+          // i.e. just call startQuestion, which on no-pending or missing-id
+          // already handles the fresh-send case. To force the missing-id
+          // path we mutate the local pending snapshot's view via the
+          // setTelegramMessageId contract: there's no clear() exposed, so
+          // we send a fresh message and overwrite. startQuestion's existing
+          // FIX-T3 F3 guard will see telegramMessageId still set and try to
+          // rerender — recursion risk. Avoid by sending directly here.
+          try {
+            const sent = await telegramApi.sendMessage(chatId, body, {
+              parse_mode: 'HTML',
+              reply_markup: keyboard,
+            })
+            relay.setTelegramMessageId(requestId, sent.message_id)
+            log.info('ask_user_question re-anchored after message_gone', {
+              request_id: requestId,
+              chat_id: chatId,
+              message_id: sent.message_id,
+            })
+          } catch (sendErr) {
+            const sendCls = classifyEditError(sendErr)
+            log.warn('ask_user_question re-anchor send failed', {
+              request_id: requestId,
+              chat_id: chatId,
+              kind: sendCls.kind,
+              error: sendErr instanceof Error ? sendErr.message : String(sendErr),
+            })
+            if (sendCls.kind === 'forbidden') {
+              relay.expire(requestId, `telegram forbidden ${sendCls.code}: ${sendCls.description}`)
+              recoveredOnce.delete(requestId)
+            }
+          }
+          return
+        case 'forbidden':
+          log.warn('ask_user_question rerender forbidden — expiring relay', {
+            request_id: requestId,
+            chat_id: chatId,
+            code: cls.code,
+          })
+          relay.expire(requestId, `telegram forbidden ${cls.code}: ${cls.description}`)
+          return
+        case 'parse':
+          log.error('ask_user_question rerender parse error — expiring', {
+            request_id: requestId,
+            chat_id: chatId,
+            description: cls.description,
+          })
+          relay.expire(requestId, `telegram parse error: ${cls.description}`)
+          return
+        case 'flood':
+          // Rate-limit wrapper exhausted retries. Drop this edit; the
+          // user can still tap the same button again to trigger a fresh
+          // edit attempt, or tap «Готово» (multi-select) to commit.
+          log.warn('ask_user_question rerender flood retry exhausted', {
+            request_id: requestId,
+            chat_id: chatId,
+            retry_after_s: cls.retryAfterSec,
+          })
+          return
+        case 'transient':
+          log.warn('ask_user_question rerender transient failure', {
+            request_id: requestId,
+            chat_id: chatId,
+            description: cls.description,
+          })
+          return
+      }
+    }
+  }
+
+  async function advanceAfterAnswer(requestId: string, prevMessageId: number | undefined, prevChatId: string | undefined): Promise<void> {
+    const stillPending = relay.getPending(requestId)
+    if (stillPending) {
+      // Clear the previous keyboard so the warchief can't double-answer
+      // the question we just consumed, then render the next.
+      if (prevChatId !== undefined && prevMessageId !== undefined) {
+        await clearKeyboard(requestId, prevChatId, prevMessageId, '<i>Ответ принят. Следующий вопрос…</i>')
+      }
+      // FIX-T2 F1: if clearKeyboard hit `forbidden` it already expired
+      // the relay; do NOT proceed to startQuestion on a settled request
+      // (would just no-op since getPending returns undefined, but the
+      // explicit check avoids a stray log line at debug).
+      if (relay.getPending(requestId) === undefined) return
+      await startQuestion(requestId)
+      return
+    }
+    // Resolved — drop the keyboard and confirm.
+    if (prevChatId !== undefined && prevMessageId !== undefined) {
+      // No requestId — the relay already settled, so even if clearKeyboard
+      // sees forbidden there's nothing to expire.
+      await clearKeyboard(undefined, prevChatId, prevMessageId, '<b>Ответ принят.</b>')
+    }
+  }
+
+  async function handleAskCallback(ctx: AskCallbackContext): Promise<void> {
+    const data = ctx.callbackQuery.data ?? ''
+    const parsed = parseAskCallback(data)
+    if (!parsed) {
+      // Unknown payload — silently ack so Telegram clears the spinner.
+      // Do NOT log at warn: this happens normally for non-`ask:`
+      // payloads if the dispatcher routed us a non-matching event.
+      await ctx.answerCallbackQuery().catch(() => {})
+      return
+    }
+
+    if (!isAuthorized(ctx.from.id)) {
+      log.warn('ask_user_question callback unauthorized', {
+        request_id: parsed.requestId,
+        user_id: ctx.from.id,
+        kind: parsed.kind,
+      })
+      await ctx.answerCallbackQuery({ text: 'Не авторизован' }).catch(() => {})
+      return
+    }
+
+    const pendingBefore = relay.getPending(parsed.requestId)
+    if (!pendingBefore) {
+      // Already resolved or never existed — Telegram replayed a stale tap.
+      await ctx.answerCallbackQuery({ text: 'Запрос уже закрыт' }).catch(() => {})
+      return
+    }
+
+    // Phase 5 FIX-T3 F4 (2026-05-27): stale callback verification BEFORE
+    // any relay mutation. Predicate order (matches the task spec):
+    //   1. questionIndex      — old keyboard for a question we've moved past
+    //   2. chatId             — callback fired in a different chat than the
+    //                           one we're waiting for (cross-chat replay)
+    //   3. callbackMessageId  — old keyboard from an earlier message that
+    //                           was re-anchored by rerenderCurrent/advance
+    // Each failure logs a `request_stale_callback` audit line and acks
+    // the spinner with a user-facing reason. The relay's own
+    // `ensureCurrent` (TASK-1) keeps a silent guard as defence in depth.
+    if (pendingBefore.currentIndex !== parsed.questionIndex) {
+      log.warn('ask_user_question request_stale_callback', {
+        reason: 'question_index_mismatch',
+        request_id: parsed.requestId,
+        user_id: ctx.from.id,
+        kind: parsed.kind,
+        callback_question_index: parsed.questionIndex,
+        current_index: pendingBefore.currentIndex,
+      })
+      await ctx.answerCallbackQuery({ text: 'Этот вопрос уже закрыт' }).catch(() => {})
+      return
+    }
+    if (String(pendingBefore.chatId) !== String(ctx.chatId)) {
+      log.warn('ask_user_question request_stale_callback', {
+        reason: 'chat_id_mismatch',
+        request_id: parsed.requestId,
+        user_id: ctx.from.id,
+        kind: parsed.kind,
+        callback_chat_id: ctx.chatId,
+        pending_chat_id: pendingBefore.chatId,
+      })
+      await ctx.answerCallbackQuery({ text: 'Не авторизован' }).catch(() => {})
+      return
+    }
+    if (
+      pendingBefore.telegramMessageId !== undefined &&
+      ctx.callbackMessageId !== undefined &&
+      ctx.callbackMessageId !== pendingBefore.telegramMessageId
+    ) {
+      log.warn('ask_user_question request_stale_callback', {
+        reason: 'message_id_mismatch',
+        request_id: parsed.requestId,
+        user_id: ctx.from.id,
+        kind: parsed.kind,
+        callback_message_id: ctx.callbackMessageId,
+        anchored_message_id: pendingBefore.telegramMessageId,
+      })
+      await ctx.answerCallbackQuery({ text: 'Этот вопрос уже закрыт' }).catch(() => {})
+      return
+    }
+
+    const prevMessageId = pendingBefore.telegramMessageId
+    const prevChatId = pendingBefore.chatId
+
+    try {
+      if (parsed.kind === 'choose') {
+        relay.answerChoice(parsed.requestId, parsed.questionIndex, parsed.optionIndex)
+        await ctx.answerCallbackQuery().catch(() => {})
+        await advanceAfterAnswer(parsed.requestId, prevMessageId, prevChatId)
+        return
+      }
+      if (parsed.kind === 'toggle') {
+        relay.toggle(parsed.requestId, parsed.questionIndex, parsed.optionIndex)
+        await ctx.answerCallbackQuery().catch(() => {})
+        await rerenderCurrent(parsed.requestId)
+        return
+      }
+      if (parsed.kind === 'done') {
+        relay.done(parsed.requestId, parsed.questionIndex)
+        await ctx.answerCallbackQuery().catch(() => {})
+        await advanceAfterAnswer(parsed.requestId, prevMessageId, prevChatId)
+        return
+      }
+      // kind === 'other'
+      pruneOther()
+      const targetChatId = prevChatId ?? ctx.chatId
+      await ctx.answerCallbackQuery().catch(() => {})
+      // FIX-T1 F4 (PRX-1 Phase 5, 2026-05-27): send with force_reply so
+      // Telegram clients auto-quote the prompt — the warchief's next
+      // message will carry `reply_to_message_id === sent.message_id`,
+      // which tryHandleOtherText then validates. The reply_markup shape
+      // is widened via cast: the structural `InlineKeyboardLike` only
+      // declares inline_keyboard, but Telegram's wire format accepts
+      // ForceReply on the same field. createTelegramApi forwards the
+      // markup verbatim and safe-telegram-api passes non-inline
+      // markups through unmodified (no string fields to redact).
+      const forceReply = {
+        force_reply: true,
+        selective: true,
+        input_field_placeholder: 'Введи ответ',
+      }
+      let promptMessageId: number | undefined
+      try {
+        const sent = await telegramApi.sendMessage(
+          targetChatId,
+          '<i>Введи ответ текстом одним сообщением.</i>',
+          {
+            parse_mode: 'HTML',
+            reply_markup: forceReply as unknown as InlineKeyboardLike,
+          },
+        )
+        promptMessageId = sent.message_id
+      } catch (err) {
+        log.warn('ask_user_question other prompt send failed', {
+          request_id: parsed.requestId,
+          chat_id: targetChatId,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+      // Seed the awaiting slot AFTER the send so promptMessageId is set
+      // on success. On send failure we DO NOT seed: without a prompt
+      // anchor any subsequent reply could not be safely validated, and
+      // a stray reply would otherwise be eaten if we left promptMessageId
+      // undefined (tryHandleOtherText's gate would treat undefined as
+      // «no check», which is exactly the hijack F4 closes).
+      if (promptMessageId !== undefined) {
+        awaitingOther.set(targetChatId, {
+          requestId: parsed.requestId,
+          questionIndex: parsed.questionIndex,
+          expiresAt: now() + otherTtlMs,
+          promptMessageId,
+        })
+      }
+    } catch (err) {
+      log.error('ask_user_question callback handler threw', {
+        request_id: parsed.requestId,
+        kind: parsed.kind,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      // Best-effort spinner ack so the warchief's UI doesn't hang.
+      await ctx.answerCallbackQuery().catch(() => {})
+    }
+  }
+
+  async function tryHandleOtherText(input: {
+    chatId: string
+    fromUserId: number
+    text: string
+    replyToMessageId?: number
+  }): Promise<boolean> {
+    pruneOther()
+    const entry = awaitingOther.get(input.chatId)
+    if (!entry) return false
+    // FIX-T1 F4 (PRX-1 Phase 5, 2026-05-27): explicit reply-to-prompt
+    // gate. Without this, any text in the chat (a permission verdict, a
+    // freeform question, a stray emoji) would be silently consumed into
+    // the Other slot until the relay timed out. Require the inbound
+    // message to actually reply to OUR «Введи ответ» prompt.
+    //
+    // Both branches return false (NOT true) so the caller falls through
+    // to the permission/OOB/channel-forward path — the slot stays open
+    // and the warchief can still answer by tapping the reply UI.
+    if (entry.promptMessageId === undefined) {
+      // Send failed earlier — no anchor to validate against. Refuse to
+      // consume on principle so a stray reply is never silently eaten.
+      log.debug('ask_user_question other text but no promptMessageId, ignored', {
+        request_id: entry.requestId,
+      })
+      return false
+    }
+    if (input.replyToMessageId !== entry.promptMessageId) {
+      log.debug('ask_user_question other text without matching reply_to, ignored', {
+        request_id: entry.requestId,
+        expected_reply_to: entry.promptMessageId,
+        got_reply_to: input.replyToMessageId ?? null,
+      })
+      return false
+    }
+    // Only the warchief (or an allowed approver) can complete the
+    // «Other» prompt. If a different sender types in the chat while we
+    // wait, ignore — their message flows through normal handlers.
+    if (!isAuthorized(input.fromUserId)) {
+      log.debug('ask_user_question other text from non-approver, ignored', {
+        request_id: entry.requestId,
+        user_id: input.fromUserId,
+      })
+      return false
+    }
+    // Consume — even on empty text (relay drops empty internally and
+    // logs at debug). We still clear the awaiting marker so the user
+    // is not silently swallowed forever.
+    const pendingBefore = relay.getPending(entry.requestId)
+    const prevMessageId = pendingBefore?.telegramMessageId
+    const prevChatId = pendingBefore?.chatId
+    awaitingOther.delete(input.chatId)
+    relay.answerOther(entry.requestId, entry.questionIndex, input.text)
+    await advanceAfterAnswer(entry.requestId, prevMessageId, prevChatId)
+    return true
+  }
+
+  function awaitingOtherCount(): number {
+    pruneOther()
+    return awaitingOther.size
+  }
+
+  return {
+    startQuestion,
+    handleAskCallback,
+    tryHandleOtherText,
+    awaitingOtherCount,
+  }
+}

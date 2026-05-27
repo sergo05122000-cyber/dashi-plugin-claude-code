@@ -87,6 +87,13 @@ export interface SendMessageOpts {
 
 export interface EditOpts {
   parse_mode?: 'MarkdownV2' | 'HTML'
+  // PRX-1 TASK-2 (2026-05-27): inline keyboard mutation on edit. Needed by
+  // the AskUserQuestion relay to re-render the multi-select question card
+  // when a toggle button is pressed (text changes — `[ ]` → `[x]` — AND
+  // the keyboard itself updates). Optional and additive: existing callers
+  // (commands/oob, channel/tools edit_message) pass no reply_markup and
+  // Telegram leaves the existing keyboard untouched.
+  reply_markup?: InlineKeyboardLike
 }
 
 export interface SendDocumentOpts {
@@ -145,6 +152,7 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
     async editMessageText(chatId, messageId, text, opts) {
       const other: Record<string, unknown> = {}
       if (opts.parse_mode !== undefined) other.parse_mode = opts.parse_mode
+      if (opts.reply_markup !== undefined) other.reply_markup = opts.reply_markup
       await bot.api.editMessageText(chatId, messageId, text, other)
     },
     async setMessageReaction(chatId, messageId, emoji) {

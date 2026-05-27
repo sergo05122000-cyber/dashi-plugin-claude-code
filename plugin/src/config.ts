@@ -230,6 +230,38 @@ export const AppConfigSchema = z.object({
   // MultichatRouter, and routes inbound traffic through them. Schema
   // declared above AppConfigSchema so the type can be re-exported.
   multichat: MultichatConfigSchema.default({}),
+  // AskUserQuestion relay (Phase ?, 2026-05-27, PRX-1 TASK-6). Bridges
+  // Claude Code's native AskUserQuestion tool requests into Telegram so
+  // the warchief can answer from his phone while a session runs headless.
+  //
+  // Default OFF: until a smoke run on staging proves the round-trip,
+  // AskUserQuestion still flows through the native Claude Code UI and
+  // the relay stays dormant. Flip `enabled=true` once TASK-1..TASK-5
+  // are wired and the audit JSONL is healthy.
+  //
+  // `allowed_user_ids` left undefined means «inherit from permission_relay
+  // at runtime» — TASK-1 / TASK-3 must resolve `?? permission_relay
+  // .allowed_user_ids` at the moment they need a recipient set. We
+  // deliberately do NOT copy the default here: duplicating the warchief
+  // id would create two sources of truth that can drift. The fallback
+  // is enforced in code (see resolveAskUserQuestionAllowedUserIds below)
+  // so a single change to permission_relay.allowed_user_ids propagates
+  // to AskUserQuestion automatically.
+  //
+  // `timeout_ms` caps how long the relay waits for a Telegram answer
+  // before emitting a `request_timeout` event and letting Claude fall
+  // back to its native flow. 5 min matches typical warchief response
+  // latency without leaving stale callbacks behind.
+  //
+  // `max_preview_chars` bounds the per-option preview rendered in the
+  // Telegram question card. Claude's option.preview can be long; this
+  // truncates per-option content before grammy formats the message.
+  ask_user_question: z.object({
+    enabled: z.boolean().default(false),
+    timeout_ms: z.number().int().positive().default(300_000),
+    allowed_user_ids: z.array(z.number().int().positive()).optional(),
+    max_preview_chars: z.number().int().positive().default(1000),
+  }).default({}),
 })
 export type AppConfig = z.infer<typeof AppConfigSchema>
 
@@ -283,6 +315,18 @@ export const RuntimeEnvSchema = z.object({
   TELEGRAM_MULTICHAT_POLICY_PATH: z.string().optional(),
   TELEGRAM_MULTICHAT_STATE_DIR: z.string().optional(),
   TELEGRAM_MULTICHAT_WORKSPACE_DIR: z.string().optional(),
+  // AskUserQuestion relay (PRX-1 TASK-6, 2026-05-27). ENABLED follows the
+  // same truthy convention as the multichat/memory flags so operators
+  // memorise one mental model. ALLOWED_USER_IDS is CSV (parsed below with
+  // a stricter parser than z.coerce — negative / non-integer / empty
+  // entries must throw clearly, not silently coerce to NaN).
+  TELEGRAM_ASK_USER_QUESTION_ENABLED: z
+    .string()
+    .transform((v) => /^(1|true|yes|on)$/i.test(v))
+    .optional(),
+  TELEGRAM_ASK_USER_QUESTION_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
+  TELEGRAM_ASK_USER_QUESTION_ALLOWED_USER_IDS: z.string().optional(), // CSV
+  TELEGRAM_ASK_USER_QUESTION_MAX_PREVIEW_CHARS: z.coerce.number().int().positive().optional(),
 })
 export type RuntimeEnv = z.infer<typeof RuntimeEnvSchema>
 
@@ -412,6 +456,25 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   if (parsedEnv.TELEGRAM_MULTICHAT_WORKSPACE_DIR !== undefined) multichat.workspace_dir = parsedEnv.TELEGRAM_MULTICHAT_WORKSPACE_DIR
   if (Object.keys(multichat).length > 0) merged.multichat = multichat
 
+  // AskUserQuestion env overrides (PRX-1 TASK-6, 2026-05-27). Same layering
+  // pattern as the multichat block above.
+  const askUserQuestion = (merged.ask_user_question && typeof merged.ask_user_question === 'object'
+    ? merged.ask_user_question
+    : {}) as Record<string, unknown>
+  if (parsedEnv.TELEGRAM_ASK_USER_QUESTION_ENABLED !== undefined) {
+    askUserQuestion.enabled = parsedEnv.TELEGRAM_ASK_USER_QUESTION_ENABLED
+  }
+  if (parsedEnv.TELEGRAM_ASK_USER_QUESTION_TIMEOUT_MS !== undefined) {
+    askUserQuestion.timeout_ms = parsedEnv.TELEGRAM_ASK_USER_QUESTION_TIMEOUT_MS
+  }
+  if (parsedEnv.TELEGRAM_ASK_USER_QUESTION_ALLOWED_USER_IDS !== undefined) {
+    askUserQuestion.allowed_user_ids = parseCsvUserIds(parsedEnv.TELEGRAM_ASK_USER_QUESTION_ALLOWED_USER_IDS)
+  }
+  if (parsedEnv.TELEGRAM_ASK_USER_QUESTION_MAX_PREVIEW_CHARS !== undefined) {
+    askUserQuestion.max_preview_chars = parsedEnv.TELEGRAM_ASK_USER_QUESTION_MAX_PREVIEW_CHARS
+  }
+  if (Object.keys(askUserQuestion).length > 0) merged.ask_user_question = askUserQuestion
+
   try {
     return AppConfigSchema.parse(merged)
   } catch (err) {
@@ -437,7 +500,19 @@ export type StatePaths = {
   sessionIds: string
   deadLetterUpdates: string
   deadLetterWebhook: string
-  logs: { server: string; telegram: string; permissions: string; webhook: string }
+  logs: {
+    server: string
+    telegram: string
+    permissions: string
+    webhook: string
+    /**
+     * AskUserQuestion relay audit JSONL (PRX-1 TASK-6, 2026-05-27).
+     * Event types written by TASK-1: `request_created`, `request_answered`,
+     * `request_timeout`, `request_unauthorized`, `request_duplicate`.
+     * Path is exposed here; TASK-1 is the only writer.
+     */
+    ask_user_question: string
+  }
 }
 
 export function getStatePaths(_config: AppConfig, env: RuntimeEnv): StatePaths {
@@ -465,6 +540,49 @@ export function getStatePaths(_config: AppConfig, env: RuntimeEnv): StatePaths {
       // Renamed so log shippers configured for *.jsonl pick it up correctly.
       permissions: join(root, 'logs', 'permissions.jsonl'),
       webhook: join(root, 'logs', 'webhook.log'),
+      ask_user_question: join(root, 'logs', 'ask-user-question.jsonl'),
     },
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// resolveAskUserQuestionAllowedUserIds — single source of truth for the
+// AskUserQuestion recipient set. When the operator omits
+// `ask_user_question.allowed_user_ids` in config.json / env, the relay
+// inherits `permission_relay.allowed_user_ids`. Callers (TASK-1 state
+// machine, TASK-3 HTTP routes) MUST go through this helper rather than
+// reading the raw field, so a single change to permission_relay
+// propagates automatically and the two lists can never drift.
+//
+// The optional `log` argument lets boot code emit a single line noting
+// whether the fallback fired — useful in tests (spy on the logger) and
+// in prod (operator sees the resolved set in server.log on startup).
+// ─────────────────────────────────────────────────────────────────────
+
+export interface AllowedUserIdsLogger {
+  info: (msg: string, fields?: Record<string, unknown>) => void
+}
+
+export function resolveAskUserQuestionAllowedUserIds(
+  config: AppConfig,
+  log?: AllowedUserIdsLogger,
+): readonly number[] {
+  const explicit = config.ask_user_question.allowed_user_ids
+  if (explicit !== undefined) {
+    if (log) {
+      log.info('ask_user_question: using explicit allowed_user_ids', {
+        count: explicit.length,
+        fallback: false,
+      })
+    }
+    return explicit
+  }
+  const inherited = config.permission_relay.allowed_user_ids
+  if (log) {
+    log.info('ask_user_question: allowed_user_ids unset, inheriting from permission_relay', {
+      count: inherited.length,
+      fallback: true,
+    })
+  }
+  return inherited
 }
