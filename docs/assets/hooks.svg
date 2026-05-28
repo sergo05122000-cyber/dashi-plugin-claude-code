@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 360" width="100%" height="auto">
+  <defs>
+    <linearGradient id="bg-grad-hk" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0a0e14"/>
+      <stop offset="100%" stop-color="#0f141b"/>
+    </linearGradient>
+    <marker id="arrow-blue-hk" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#58a6ff"/>
+    </marker>
+    <marker id="arrow-terra-hk" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#d97757"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1000" height="360" fill="url(#bg-grad-hk)"/>
+
+  <!-- NODE 1: Claude Code event -->
+  <rect x="20" y="116" width="170" height="80" rx="12"
+        fill="#11161d" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="105" y="144" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="11" font-weight="600" fill="#e6edf3">Claude Code event</text>
+  <text x="105" y="162" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="9" fill="#8b949e">Pre · PostToolUse</text>
+  <text x="105" y="178" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="9" fill="#8b949e">Stop</text>
+
+  <!-- Arrow 1->2 blue -->
+  <line x1="190" y1="156" x2="228" y2="156"
+        stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrow-blue-hk)"/>
+
+  <!-- NODE 2: post-hook.ts -->
+  <rect x="232" y="116" width="170" height="80" rx="12"
+        fill="#11161d" stroke="#222a33" stroke-width="1.4"/>
+  <text x="317" y="144" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="11" font-weight="600" fill="#e6edf3">post-hook.ts</text>
+  <text x="317" y="162" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="9" fill="#8b949e">stdout empty</text>
+  <text x="317" y="178" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="9" fill="#8b949e">exit 0</text>
+
+  <!-- Arrow 2->3 blue labeled "Bearer POST" -->
+  <line x1="402" y1="156" x2="440" y2="156"
+        stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrow-blue-hk)"/>
+  <text x="421" y="148" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="9" fill="#58a6ff">Bearer POST</text>
+
+  <!-- NODE 3: webhook server -->
+  <rect x="444" y="100" width="174" height="112" rx="12"
+        fill="#11161d" stroke="#222a33" stroke-width="1.4"/>
+  <text x="531" y="128" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="11" font-weight="600" fill="#e6edf3">webhook server</text>
+  <text x="531" y="146" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="9" fill="#8b949e">timing-safe</text>
+  <text x="531" y="162" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="9" fill="#8b949e">256 KB limit</text>
+  <text x="531" y="178" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="9" fill="#8b949e">Zod validation</text>
+
+  <!-- Arrow 3->4 blue -->
+  <line x1="618" y1="156" x2="656" y2="156"
+        stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrow-blue-hk)"/>
+
+  <!-- NODE 4: claude-events.ts -->
+  <rect x="660" y="116" width="160" height="80" rx="12"
+        fill="#11161d" stroke="#d97757" stroke-width="1.5"/>
+  <text x="740" y="144" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="11" font-weight="600" fill="#e6edf3">claude-events.ts</text>
+  <text x="740" y="162" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="9" fill="#8b949e">event bus</text>
+  <text x="740" y="178" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="9" fill="#8b949e">typed dispatch</text>
+
+  <!-- Fan-out: 4 terracotta arrows to right-side nodes -->
+  <!-- StatusManager -->
+  <line x1="820" y1="136" x2="862" y2="70"
+        stroke="#d97757" stroke-width="1.4" marker-end="url(#arrow-terra-hk)"/>
+  <!-- ProgressReporter -->
+  <line x1="820" y1="148" x2="862" y2="148"
+        stroke="#d97757" stroke-width="1.4" marker-end="url(#arrow-terra-hk)"/>
+  <!-- TaskMirror -->
+  <line x1="820" y1="164" x2="862" y2="224"
+        stroke="#d97757" stroke-width="1.4" marker-end="url(#arrow-terra-hk)"/>
+  <!-- MemoryWriter -->
+  <line x1="820" y1="174" x2="862" y2="300"
+        stroke="#d97757" stroke-width="1.4" marker-end="url(#arrow-terra-hk)"/>
+
+  <!-- RIGHT FAN-OUT NODES -->
+  <!-- StatusManager -->
+  <rect x="866" y="44" width="116" height="36" rx="8"
+        fill="#0d1219" stroke="#222a33" stroke-width="1.2"/>
+  <text x="924" y="67" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="11" fill="#e6edf3">StatusManager</text>
+
+  <!-- ProgressReporter -->
+  <rect x="866" y="130" width="116" height="36" rx="8"
+        fill="#0d1219" stroke="#222a33" stroke-width="1.2"/>
+  <text x="924" y="153" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="11" fill="#e6edf3">ProgressReporter</text>
+
+  <!-- TaskMirror -->
+  <rect x="866" y="206" width="116" height="36" rx="8"
+        fill="#0d1219" stroke="#222a33" stroke-width="1.2"/>
+  <text x="924" y="229" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="11" fill="#e6edf3">TaskMirror</text>
+
+  <!-- MemoryWriter -->
+  <rect x="866" y="282" width="116" height="36" rx="8"
+        fill="#0d1219" stroke="#222a33" stroke-width="1.2"/>
+  <text x="924" y="305" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="11" fill="#e6edf3">MemoryWriter</text>
+</svg>

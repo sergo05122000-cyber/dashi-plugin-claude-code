@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 320" width="100%" height="auto">
+  <defs>
+    <linearGradient id="bg-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0a0e14"/>
+      <stop offset="100%" stop-color="#0f141b"/>
+    </linearGradient>
+    <marker id="arrow-blue" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#58a6ff"/>
+    </marker>
+    <marker id="arrow-terra" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#d97757"/>
+    </marker>
+  </defs>
+
+  <!-- Page background -->
+  <rect width="1000" height="320" fill="url(#bg-grad)"/>
+
+  <!-- ===================== EDGES (drawn before nodes so nodes sit on top) ===================== -->
+
+  <!-- Arrow 1: Telegram -> Plugin (top lane, blue, label "message") -->
+  <line x1="222" y1="130" x2="352" y2="130"
+        stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrow-blue)"/>
+  <text x="287" y="122" text-anchor="middle" font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="10" fill="#58a6ff">message</text>
+
+  <!-- Arrow 2: Plugin -> Claude (top lane, blue, label "push channel message") -->
+  <line x1="648" y1="130" x2="772" y2="130"
+        stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arrow-blue)"/>
+  <text x="710" y="122" text-anchor="middle" font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="10" fill="#58a6ff">push channel message</text>
+
+  <!-- Arrow 3: Claude -> Plugin (bottom lane, terracotta, label "final answer") -->
+  <line x1="772" y1="192" x2="648" y2="192"
+        stroke="#d97757" stroke-width="1.6" marker-end="url(#arrow-terra)"/>
+  <text x="710" y="208" text-anchor="middle" font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="10" fill="#d97757">final answer</text>
+
+  <!-- Arrow 4: Plugin -> Telegram (bottom lane, terracotta, label "reply · media · reactions") -->
+  <line x1="352" y1="192" x2="222" y2="192"
+        stroke="#d97757" stroke-width="1.6" marker-end="url(#arrow-terra)"/>
+  <text x="287" y="208" text-anchor="middle" font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="10" fill="#d97757">reply · media · reactions</text>
+
+  <!-- Arrow 5: Claude self-loop -> Plugin (dotted terracotta arc, "progress hooks") -->
+  <!-- Arc from Claude top, curving up and left toward plugin right -->
+  <path d="M 870,64 C 870,30 640,30 640,64"
+        fill="none" stroke="#d97757" stroke-width="1.4"
+        stroke-dasharray="4 3" opacity="0.55"
+        marker-end="url(#arrow-terra)"/>
+  <text x="755" y="24" text-anchor="middle" font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="10" fill="#8b949e">progress hooks</text>
+
+  <!-- ===================== LEFT NODE: Telegram ===================== -->
+  <rect x="28" y="76" width="194" height="168" rx="14"
+        fill="#11161d" stroke="#58a6ff" stroke-width="1.4"/>
+  <text x="125" y="148" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="22" font-weight="600" fill="#e6edf3">Telegram</text>
+  <text x="125" y="174" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="10" fill="#8b949e">getUpdates · long poll</text>
+
+  <!-- ===================== CENTER NODE: Plugin ===================== -->
+  <rect x="356" y="56" width="288" height="208" rx="14"
+        fill="#0d1219" stroke="#222a33" stroke-width="1.2"/>
+
+  <!-- Plugin header -->
+  <text x="500" y="82" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="10" letter-spacing="1" fill="#8b949e">PLUGIN · BUN + TS</text>
+
+  <!-- Row 1: TelegramPoller -->
+  <rect x="374" y="90" width="252" height="44" rx="8"
+        fill="#11161d" stroke="#222a33" stroke-width="1"/>
+  <text x="500" y="117" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="12" fill="#e6edf3">TelegramPoller · allowlist gate</text>
+
+  <!-- Row 2: safe-telegram-api -->
+  <rect x="374" y="142" width="252" height="44" rx="8"
+        fill="#11161d" stroke="#222a33" stroke-width="1"/>
+  <text x="500" y="169" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="12" fill="#e6edf3">safe-telegram-api</text>
+
+  <!-- Row 3: redact etc. (muted) -->
+  <rect x="374" y="194" width="252" height="40" rx="8"
+        fill="#11161d" stroke="#222a33" stroke-width="1"/>
+  <text x="500" y="218" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="11" fill="#8b949e">redact · HTML · chunk · rate-limit</text>
+
+  <!-- ===================== RIGHT NODE: Claude Code session ===================== -->
+  <rect x="776" y="76" width="196" height="168" rx="14"
+        fill="#11161d" stroke="#d97757" stroke-width="1.4"/>
+  <text x="874" y="136" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="20" font-weight="600" fill="#e6edf3">Claude Code</text>
+  <text x="874" y="158" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="16" font-weight="400" fill="#e6edf3">session</text>
+  <text x="874" y="182" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="10" fill="#8b949e">live session</text>
+  <text x="874" y="198" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="10" fill="#8b949e">thinking · tools · MCP</text>
+</svg>

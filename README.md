@@ -12,15 +12,7 @@
 
 It replaces the deprecated `claude -p` gateway pattern (a Python daemon that spawned a fresh headless session for every message). Cutover deadline — **2026-06-15** (Anthropic is splitting billing; details in section [13](#13-why-migrate--the-2026-06-15-deadline)).
 
-```
-[ Telegram ]
-     │
-     ▼  getUpdates (long polling)
-[ plugin (Bun + TypeScript) ]──── push channel message ───▶ [ Claude Code session ]
-     ▲                                                              │
-     │  reply / status / reactions / media                          │  thinking + tools + final answer
-     └──────────────────────────────────────────────────────────────┘
-```
+![Architecture — Telegram ↔ plugin ↔ Claude Code session](docs/assets/architecture-hero.svg)
 
 One plugin process = one Telegram bot = one agent. By default it serves **a single DM chat** (legacy single-session mode). With `multichat.enabled` turned on, the same bot fans incoming messages out across several per-chat tmux sessions of one identity — see section [3](#3-multichat--how-it-works-and-why).
 
@@ -107,6 +99,8 @@ The parser (`src/config.ts`) validates every value as a positive integer and fai
 
 ## 3. Multichat — how it works and why
 
+![Multichat — one bot fans out across several per-chat tmux sessions](docs/assets/multichat.svg)
+
 ### Why
 
 Sometimes you need to run several chats in parallel under the same identity: the operator's personal DM + a work group + a sandbox. One bot, one personality, different "rooms" with different rights and different privacy levels.
@@ -169,6 +163,8 @@ chats:
 ## 4. Plugin hooks
 
 Progress in Telegram (`ProgressReporter`, `TaskMirror`, `StatusManager`) is fed by Claude Code hooks. Without installing the hooks these surfaces stay silent — you only get the final reply.
+
+![Hooks — Claude Code event flows through post-hook and the webhook server to the progress surfaces](docs/assets/hooks.svg)
 
 ### Installation
 
@@ -373,6 +369,8 @@ The `reply` default is `format='html'` (PR #22): markdown is auto-converted, aut
 ## 10. Security — so data never leaks
 
 Defence is layered — several independent barriers:
+
+![Security — layered defence-in-depth from inbound message to processed safely](docs/assets/security.svg)
 
 **Allowlist gate (the first barrier).** Every incoming message is checked *before* processing (`src/telegram/gate.ts`): in a DM — sender_id ∈ `allowed_user_ids` (+ a defensive chat_id check); in groups (multichat) — chat ∈ `policy.allowlist.chats` AND sender ∈ `policy.allowlist.users`. Not allowed — dropped without processing.
 

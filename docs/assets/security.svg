@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 520" width="100%" height="auto">
+  <defs>
+    <linearGradient id="bg-grad-sc" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0a0e14"/>
+      <stop offset="100%" stop-color="#0f141b"/>
+    </linearGradient>
+    <marker id="arrow-blue-sc" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#58a6ff"/>
+    </marker>
+    <marker id="arrow-terra-sc" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#d97757"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1000" height="520" fill="url(#bg-grad-sc)"/>
+
+  <!-- TOP CAPSULE: inbound message (cool-blue) -->
+  <rect x="340" y="22" width="320" height="46" rx="23"
+        fill="#11161d" stroke="#58a6ff" stroke-width="1.6"/>
+  <text x="500" y="51" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="14" font-weight="600" fill="#e6edf3">inbound message</text>
+
+  <!-- Arrow top capsule -> layer 1 -->
+  <line x1="500" y1="68" x2="500" y2="88"
+        stroke="#d97757" stroke-width="1.5" marker-end="url(#arrow-terra-sc)"/>
+
+  <!-- LAYER 1: allowlist gate  y=92 -->
+  <rect x="200" y="92" width="600" height="52" rx="10"
+        fill="#11161d" stroke="#222a33" stroke-width="1.5"/>
+  <text x="254" y="124" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="22" font-weight="700" fill="#d97757">1</text>
+  <line x1="278" y1="102" x2="278" y2="134"
+        stroke="#222a33" stroke-width="1"/>
+  <text x="510" y="124" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="13" fill="#e6edf3">allowlist gate</text>
+  <text x="830" y="124" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="10" fill="#8b949e">user_id check</text>
+
+  <!-- Arrow 1->2 -->
+  <line x1="500" y1="144" x2="500" y2="162"
+        stroke="#d97757" stroke-width="1.5" marker-end="url(#arrow-terra-sc)"/>
+
+  <!-- LAYER 2: anti-spoof addressing  y=166 -->
+  <rect x="200" y="166" width="600" height="52" rx="10"
+        fill="#11161d" stroke="#222a33" stroke-width="1.5"/>
+  <text x="254" y="198" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="22" font-weight="700" fill="#d97757">2</text>
+  <line x1="278" y1="176" x2="278" y2="208"
+        stroke="#222a33" stroke-width="1"/>
+  <text x="510" y="198" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="13" fill="#e6edf3">anti-spoof addressing</text>
+  <text x="830" y="198" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="10" fill="#8b949e">chat_id verify</text>
+
+  <!-- Arrow 2->3 -->
+  <line x1="500" y1="218" x2="500" y2="236"
+        stroke="#d97757" stroke-width="1.5" marker-end="url(#arrow-terra-sc)"/>
+
+  <!-- LAYER 3: secret redaction  y=240 -->
+  <rect x="200" y="240" width="600" height="52" rx="10"
+        fill="#11161d" stroke="#222a33" stroke-width="1.5"/>
+  <text x="254" y="272" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="22" font-weight="700" fill="#d97757">3</text>
+  <line x1="278" y1="250" x2="278" y2="282"
+        stroke="#222a33" stroke-width="1"/>
+  <text x="510" y="272" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="13" fill="#e6edf3">secret redaction</text>
+  <text x="830" y="272" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="10" fill="#8b949e">regex scrub</text>
+
+  <!-- Arrow 3->4 -->
+  <line x1="500" y1="292" x2="500" y2="310"
+        stroke="#d97757" stroke-width="1.5" marker-end="url(#arrow-terra-sc)"/>
+
+  <!-- LAYER 4: path-traversal guard  y=314 -->
+  <rect x="200" y="314" width="600" height="52" rx="10"
+        fill="#11161d" stroke="#222a33" stroke-width="1.5"/>
+  <text x="254" y="346" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="22" font-weight="700" fill="#d97757">4</text>
+  <line x1="278" y1="324" x2="278" y2="356"
+        stroke="#222a33" stroke-width="1"/>
+  <text x="510" y="346" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="13" fill="#e6edf3">path-traversal guard</text>
+  <text x="830" y="346" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="10" fill="#8b949e">../ block</text>
+
+  <!-- Arrow 4->5 -->
+  <line x1="500" y1="366" x2="500" y2="384"
+        stroke="#d97757" stroke-width="1.5" marker-end="url(#arrow-terra-sc)"/>
+
+  <!-- LAYER 5: tmux env isolation  y=388 -->
+  <rect x="200" y="388" width="600" height="52" rx="10"
+        fill="#11161d" stroke="#222a33" stroke-width="1.5"/>
+  <text x="254" y="420" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="22" font-weight="700" fill="#d97757">5</text>
+  <line x1="278" y1="398" x2="278" y2="430"
+        stroke="#222a33" stroke-width="1"/>
+  <text x="510" y="420" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="13" fill="#e6edf3">tmux env isolation</text>
+  <text x="830" y="420" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="10" fill="#8b949e">per-chat pane</text>
+
+  <!-- Arrow layer 5 -> bottom capsule -->
+  <line x1="500" y1="440" x2="500" y2="460"
+        stroke="#d97757" stroke-width="1.5" marker-end="url(#arrow-terra-sc)"/>
+
+  <!-- BOTTOM CAPSULE: processed safely (terracotta) -->
+  <rect x="340" y="464" width="320" height="46" rx="23"
+        fill="#11161d" stroke="#d97757" stroke-width="1.6"/>
+  <text x="500" y="493" text-anchor="middle"
+        font-family="ui-monospace,'JetBrains Mono','SF Mono',monospace"
+        font-size="14" font-weight="600" fill="#e6edf3">processed safely</text>
+</svg>
