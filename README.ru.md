@@ -6,15 +6,7 @@
 
 Это замена устаревшему `claude -p` gateway-паттерну (Python-демон, который спавнил новую headless-сессию на каждое сообщение). Cutover deadline — **2026-06-15** (Anthropic разделяет billing, подробности в разделе [13](#13-зачем-переезд--дедлайн-2026-06-15)).
 
-```
-[ Telegram ]
-     │
-     ▼  getUpdates (long polling)
-[ plugin (Bun + TypeScript) ]──── push channel message ───▶ [ Claude Code session ]
-     ▲                                                              │
-     │  reply / status / reactions / media                          │  thinking + tools + final answer
-     └──────────────────────────────────────────────────────────────┘
-```
+![Архитектура — Telegram ↔ плагин ↔ сессия Claude Code](docs/assets/architecture-hero.svg)
 
 Один процесс плагина = один Telegram-бот = один агент. По умолчанию обслуживается **один DM-чат** (legacy single-session режим). При включённом `multichat.enabled` тот же бот раскладывает входящие по нескольким per-chat tmux-сессиям одной identity — см. раздел [3](#3-multichat--как-работает-и-зачем).
 
@@ -101,6 +93,8 @@ TELEGRAM_ALLOWED_USER_IDS=164795011,123456789
 
 ## 3. Multichat — как работает и зачем
 
+![Multichat — один бот раскладывает входящие по нескольким per-chat tmux-сессиям](docs/assets/multichat.svg)
+
 ### Зачем
 
 Иногда нужно вести параллельно несколько чатов одной и той же identity: личный DM вождя + рабочая группа + sandbox. Один бот, одна личность, разные «комнаты» с разными правами и разной приватностью.
@@ -163,6 +157,8 @@ chats:
 ## 4. Hooks плагина
 
 Прогресс в Telegram (`ProgressReporter`, `TaskMirror`, `StatusManager`) питается от Claude Code hooks. Без установки хуков эти поверхности молчат — приходит только финальный ответ.
+
+![Hooks — событие Claude Code проходит через post-hook и webhook-сервер к поверхностям прогресса](docs/assets/hooks.svg)
 
 ### Установка
 
@@ -367,6 +363,8 @@ Runtime-управление: `/mirror on|off|status` без рестарта п
 ## 10. Безопасность — чтобы данные не утекали
 
 Защита эшелонирована — несколько независимых барьеров:
+
+![Безопасность — эшелонированная защита от входящего сообщения до безопасной обработки](docs/assets/security.svg)
 
 **Allowlist-gate (первый барьер).** Любое входящее проверяется ДО обработки (`src/telegram/gate.ts`): в DM — sender_id ∈ `allowed_user_ids` (+ defensive chat_id); в группах (multichat) — chat ∈ `policy.allowlist.chats` И sender ∈ `policy.allowlist.users`. Не прошёл — drop без обработки.
 
