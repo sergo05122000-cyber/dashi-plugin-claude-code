@@ -3,4 +3,8 @@ bun.lockb
 bun.lock
 *.log
 .env
-state/
+# Ignore runtime state directories (e.g. plugin/state/ created when a dev runs
+# the plugin in-place), but NOT the source directory plugin/src/state/.
+# Issue #7: the bare `state/` pattern recursively excluded the source tree's
+# state module, breaking `bun install` from a clean clone.
+/state/
