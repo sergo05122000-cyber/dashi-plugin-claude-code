@@ -74,13 +74,13 @@
 
 ```bash
 # в channel.env (CSV, без пробелов после запятых, только положительные целые)
-TELEGRAM_ALLOWED_USER_IDS=164795011,123456789
+TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
 ```
 
 Эквивалент в `config.json`:
 
 ```json
-{ "allowed_user_ids": [164795011, 123456789] }
+{ "allowed_user_ids": [123456789, 987654321] }
 ```
 
 Парсер (`src/config.ts`) валидирует каждое значение как положительное целое и падает с понятной ошибкой на мусоре. Env перекрывает `config.json`. В DM Telegram ставит `chat.id == user.id`, поэтому gate проверяет и sender_id, и chat_id (defence-in-depth, `src/telegram/gate.ts`).
@@ -121,11 +121,11 @@ TELEGRAM_ALLOWED_USER_IDS=164795011,123456789
 ```yaml
 version: 1
 allowlist:
-  chats: ["164795011", "-1003784643974"]   # chat_id строкой; отрицательные group id ОБЯЗАНЫ быть в кавычках
-  users: ["164795011"]                       # кто вообще может писать
-mention_allowlist: ["164795011"]             # кто может звать бота через @mention в группах
+  chats: ["123456789", "-1001234567890"]   # chat_id строкой; отрицательные group id ОБЯЗАНЫ быть в кавычках
+  users: ["123456789"]                       # кто вообще может писать
+mention_allowlist: ["123456789"]             # кто может звать бота через @mention в группах
 chats:
-  "164795011":
+  "123456789":
     mode: private                            # private | public — выбирает доступные поверхности
     streaming: progress                      # progress | off
     tmux_mirror: true                        # TmuxMirror только в этом чате
@@ -136,7 +136,7 @@ chats:
     system_reminder: "Это личный DM вождя. Полный доступ."
     idle_ttl_ms: 1800000                     # 30 мин до выгрузки tmux-сессии (default)
     max_queue_depth: 1                        # сколько inbound можно поставить в очередь (default 1)
-  "-1003784643974":
+  "-1001234567890":
     mode: public
     streaming: off
     tmux_mirror: false

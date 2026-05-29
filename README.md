@@ -80,13 +80,13 @@ Access is the single gate, and it is **mandatory**. Allowed users are set via th
 
 ```bash
 # in channel.env (CSV, no spaces after commas, positive integers only)
-TELEGRAM_ALLOWED_USER_IDS=164795011,123456789
+TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
 ```
 
 The `config.json` equivalent:
 
 ```json
-{ "allowed_user_ids": [164795011, 123456789] }
+{ "allowed_user_ids": [123456789, 987654321] }
 ```
 
 The parser (`src/config.ts`) validates every value as a positive integer and fails with a clear error on garbage. Env overrides `config.json`. In a DM, Telegram sets `chat.id == user.id`, so the gate checks both sender_id and chat_id (defence-in-depth, `src/telegram/gate.ts`).
@@ -127,11 +127,11 @@ Chats are described in `policy.yaml` (strict Zod schema, `src/chats/policy-loade
 ```yaml
 version: 1
 allowlist:
-  chats: ["164795011", "-1003784643974"]   # chat_id as a string; negative group ids MUST be quoted
-  users: ["164795011"]                       # who is allowed to write at all
-mention_allowlist: ["164795011"]             # who may summon the bot via @mention in groups
+  chats: ["123456789", "-1001234567890"]   # chat_id as a string; negative group ids MUST be quoted
+  users: ["123456789"]                       # who is allowed to write at all
+mention_allowlist: ["123456789"]             # who may summon the bot via @mention in groups
 chats:
-  "164795011":
+  "123456789":
     mode: private                            # private | public — selects the available surfaces
     streaming: progress                      # progress | off
     tmux_mirror: true                        # TmuxMirror only in this chat
@@ -142,7 +142,7 @@ chats:
     system_reminder: "This is the operator's personal DM. Full access."
     idle_ttl_ms: 1800000                     # 30 min before the tmux session is unloaded (default)
     max_queue_depth: 1                        # how many inbound messages may be queued (default 1)
-  "-1003784643974":
+  "-1001234567890":
     mode: public
     streaming: off
     tmux_mirror: false
