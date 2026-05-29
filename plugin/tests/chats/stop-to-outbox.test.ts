@@ -10,8 +10,9 @@
 // `{MULTICHAT_STATE_DIR}/chats/{CHAT_ID}/outbox/`.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { spawnSync } from 'child_process'
+import { spawn, spawnSync } from 'child_process'
 import {
+  appendFileSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -84,6 +85,31 @@ function run(
     stdout: r.stdout ?? '',
     stderr: r.stderr ?? '',
   }
+}
+
+// Async variant: spawns the hook without blocking, so the test can mutate
+// the transcript WHILE the hook is mid-run (used to reproduce the
+// transcript-flush race where the reply text lands after the hook starts).
+function runAsync(
+  env: Record<string, string>,
+  stdinPayload: Record<string, unknown>,
+): Promise<RunResult> {
+  return new Promise((resolve) => {
+    const p = spawn('python3', [HOOK], {
+      env: { ...process.env, ...env },
+    })
+    let stdout = ''
+    let stderr = ''
+    p.stdout.on('data', (d) => {
+      stdout += d
+    })
+    p.stderr.on('data', (d) => {
+      stderr += d
+    })
+    p.on('close', (code) => resolve({ code: code ?? -1, stdout, stderr }))
+    p.stdin.write(JSON.stringify(stdinPayload))
+    p.stdin.end()
+  })
 }
 
 function outboxDir(): string {
@@ -550,5 +576,107 @@ describe('stop-to-outbox.py — dedupe on repeated Stop', () => {
     expect(files.length).toBe(2)
     const texts = files.map((f) => readOutboxPayload(f).text).sort()
     expect(texts).toEqual(['first answer', 'second answer'])
+  })
+})
+
+describe('stop-to-outbox.py — transcript-flush race (extended-thinking)', () => {
+  // 2026-05-29 production bug (M5b) on group -1003784643974, session affccb42:
+  // a reply with extended-thinking emits TWO transcript lines — [thinking]
+  // first, [text] a beat later. The Stop hook fired/tail-read in the window
+  // AFTER the thinking line was on disk but BEFORE the text line flushed, saw
+  // a thinking-only assistant message, walked past it to the user prompt, and
+  // returned None -> the reply was never written to outbox. The first
+  // (mention) reply survived only because it had no thinking block. The fix is
+  // a bounded retry of the tail-read when extraction comes back empty: the
+  // text line lands within fractions of a second.
+
+  test('recovers a reply whose text lands AFTER the hook first reads', async () => {
+    const transcript = join(stateDir, 'transcript.jsonl')
+    // Initial snapshot the hook sees first: user prompt + a thinking-only
+    // assistant message. No text block yet — exactly the racy window.
+    writeFileSync(
+      transcript,
+      userLine('какая сессия у тебя работает сейчас?') +
+        '\n' +
+        JSON.stringify({
+          uuid: 'th1',
+          message: { role: 'assistant', content: [{ type: 'thinking', thinking: '...' }] },
+        }) +
+        '\n',
+      'utf8',
+    )
+    // The text line arrives shortly after the hook has started its first read.
+    const timer = setTimeout(() => {
+      appendFileSync(
+        transcript,
+        JSON.stringify({
+          uuid: 'tx1',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Сейчас работает публичная сессия.' }],
+          },
+        }) + '\n',
+      )
+    }, 120)
+    const r = await runAsync(
+      {
+        CHAT_ID,
+        MULTICHAT_STATE_DIR: stateDir,
+        STOP_OUTBOX_RETRY_ATTEMPTS: '30',
+        STOP_OUTBOX_RETRY_DELAY_MS: '50',
+      },
+      { transcript_path: transcript, session_id: 's1' },
+    )
+    clearTimeout(timer)
+    expect(r.code).toBe(0)
+    const files = listOutboxJson()
+    expect(files.length).toBe(1)
+    expect(readOutboxPayload(files[0]!).text).toBe('Сейчас работает публичная сессия.')
+  })
+
+  test('_env_int clamps an oversized retry budget (no infinite hang)', () => {
+    // Guard (review NIT-1): an operator setting a huge STOP_OUTBOX_RETRY_*
+    // value must not be able to hang the synchronous Stop hook. _env_int
+    // clamps DOWN to maximum; below-minimum/garbage fall back to default.
+    const probe = [
+      'import importlib.util',
+      `spec = importlib.util.spec_from_file_location('h', ${JSON.stringify(HOOK)})`,
+      'm = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)',
+      'import os',
+      "os.environ['BIG'] = '999999999999'",
+      "os.environ['NEG'] = '-3'",
+      "os.environ['JUNK'] = 'abc'",
+      "print(m._env_int('BIG', 4, minimum=1, maximum=50))",
+      "print(m._env_int('NEG', 4, minimum=1, maximum=50))",
+      "print(m._env_int('JUNK', 4, minimum=1, maximum=50))",
+      "print(m._env_int('UNSET', 4, minimum=1, maximum=50))",
+    ].join('\n')
+    const r = spawnSync('python3', ['-c', probe], { encoding: 'utf8' })
+    expect(r.status).toBe(0)
+    // clamped-to-max, default(neg), default(junk), default(unset)
+    expect(r.stdout.trim().split('\n')).toEqual(['50', '4', '4', '4'])
+  })
+
+  test('a genuinely text-less turn still gives up (retry is bounded, no hang)', () => {
+    // Guard: retry must NOT turn a real pure-thinking/tool turn into a hang or
+    // a spurious send. With no text ever appearing, the hook exhausts its
+    // (small) retry budget and delivers nothing.
+    const transcript = writeTranscript([
+      userLine('запусти ls'),
+      JSON.stringify({
+        message: { role: 'assistant', content: [{ type: 'thinking', thinking: '...' }] },
+      }),
+    ])
+    const r = run(
+      {
+        CHAT_ID,
+        MULTICHAT_STATE_DIR: stateDir,
+        STOP_OUTBOX_RETRY_ATTEMPTS: '3',
+        STOP_OUTBOX_RETRY_DELAY_MS: '10',
+      },
+      { transcript_path: transcript, session_id: 's1' },
+    )
+    expect(r.code).toBe(0)
+    expect(listOutboxJson().length).toBe(0)
   })
 })

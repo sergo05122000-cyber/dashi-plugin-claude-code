@@ -208,6 +208,40 @@ def _is_user_prompt(content: Any) -> bool:
     return False
 
 
+def _env_int(
+    name: str, default: int, *, minimum: int = 0, maximum: int | None = None
+) -> int:
+    """Read a bounded int from the environment, fail-safe to ``default``.
+
+    Used for the retry knobs. Any missing/blank/malformed value, or one below
+    ``minimum``, yields ``default`` — the hook must never crash on operator
+    typos. A value above ``maximum`` is clamped DOWN to ``maximum`` (not the
+    default) so an oversized retry budget can never hang the synchronous Stop
+    hook forever.
+
+    Args:
+        name: Environment variable name.
+        default: Value when unset/blank/invalid/below ``minimum``.
+        minimum: Lowest accepted value; below it we fall back to ``default``.
+        maximum: Optional upper clamp; values above it are reduced to it.
+
+    Returns:
+        The parsed, bounded int, or ``default``.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except (ValueError, TypeError):
+        return default
+    if val < minimum:
+        return default
+    if maximum is not None and val > maximum:
+        return maximum
+    return val
+
+
 def build_filename() -> str:
     """Build an outbox filename matching the router's ``buildFilename`` scheme.
 
@@ -324,7 +358,28 @@ def main() -> int:
     # observe (opt-in via STOP_OUTBOX_DEBUG; no-op in production).
     _debug_log(hook_state_dir, "fired", session_id=session_id)
 
-    extracted = read_last_assistant_text(Path(transcript_path_raw))
+    # Bounded retry on empty extraction. 2026-05-29 (M5b): a reply produced
+    # with extended-thinking emits TWO transcript lines — [thinking] first,
+    # [text] a beat later. A Stop hook that tail-reads in the window between
+    # them sees a thinking-only assistant message, walks past it to the user
+    # prompt, and gets None — silently dropping a reply the turn DID produce.
+    # The text line lands within fractions of a second, so re-read a few times
+    # before concluding the turn had no text. A genuinely text-less turn (pure
+    # tool / pure thinking) simply exhausts the budget and delivers nothing —
+    # this never invents a reply, it only waits for one already on its way.
+    # Cost: a genuinely text-less turn-end pays the full (attempts-1)*delay
+    # (~360ms with defaults) before exiting 0 — acceptable since the hot path
+    # always ends on a reply. Knobs are upper-clamped so an oversized value
+    # cannot hang the synchronous hook.
+    attempts = _env_int("STOP_OUTBOX_RETRY_ATTEMPTS", 4, minimum=1, maximum=50)
+    delay_s = _env_int("STOP_OUTBOX_RETRY_DELAY_MS", 120, minimum=0, maximum=2000) / 1000.0
+    extracted = None
+    for attempt in range(attempts):
+        extracted = read_last_assistant_text(Path(transcript_path_raw))
+        if extracted is not None:
+            break
+        if attempt < attempts - 1:
+            time.sleep(delay_s)
     if extracted is None:
         _debug_log(hook_state_dir, "no_text", session_id=session_id, reason="tool_only_turn")
         return 0
