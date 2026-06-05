@@ -601,6 +601,8 @@ export interface FleetAgent {
   webhookEnabled: boolean | null
   /** Webhook ports referenced by hook commands in the agent's workspace settings. */
   hookPorts: string[]
+  /** Path of the workspace settings.json actually found; null = could not locate/read. */
+  settingsPath: string | null
 }
 
 /** Parse a systemd unit: EnvironmentFile + tmux socket per Exec line. Pure. */
@@ -611,7 +613,13 @@ export function parseUnitFile(text: string): { envPath: string | null; sockets: 
     const env = line.match(/^\s*EnvironmentFile=-?(\S+)/)
     if (env?.[1]) envPath = env[1]
     if (/^\s*Exec(Start|StartPost|Stop|StopPost)=.*tmux/.test(line)) {
-      const sock = line.match(/tmux\s+(?:[^-]|-(?!L))*?-L\s+(\S+)/) ?? line.match(/-L\s+(\S+)/)
+      // Only inspect tmux's OWN argv: everything before the first quote is
+      // tmux args, the quoted tail is the nested payload (`'claude ... -L x'`
+      // must not read as a tmux socket).
+      const cmdPart = line.slice(line.indexOf('tmux'))
+      const quoteIdx = cmdPart.search(/['"]/)
+      const argsPart = quoteIdx === -1 ? cmdPart : cmdPart.slice(0, quoteIdx)
+      const sock = argsPart.match(/\s-L\s+(\S+)/)
       sockets.add(sock?.[1] ?? '')
     }
   }
@@ -631,7 +639,8 @@ export function envValue(envText: string, key: string): string | null {
 export function hookPortsInSettings(settingsRaw: string | null): string[] {
   if (!settingsRaw) return []
   const ports = new Set<string>()
-  for (const m of settingsRaw.matchAll(/127\.0\.0\.1:(\d+)\/hooks\/agent/g)) {
+  // Any localhost spelling counts — 127.0.0.1, localhost, 0.0.0.0, [::1].
+  for (const m of settingsRaw.matchAll(/(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\]):(\d+)\/hooks\/agent/g)) {
     const p = m[1]
     if (p !== undefined) ports.add(p)
   }
@@ -657,6 +666,25 @@ export function checkFleet(agents: FleetAgent[], sharedSettingsRaw: string | nul
       status: 'warn',
       detail: `cannot read channel.env for: ${unreadable.join(', ')} — port/token checks are partial`,
       fix: 'run the doctor as a user that can read the env files',
+    })
+  }
+
+  // A readable env that lacks PORT or TOKEN makes the uniqueness checks below
+  // silently skip that agent — surface it instead of reporting a hollow PASS.
+  const missingKeys = agents
+    .filter((a) => a.envReadable)
+    .map((a) => {
+      const miss = [a.port == null ? 'TELEGRAM_WEBHOOK_PORT' : null, a.tokenDigest == null ? 'TELEGRAM_BOT_TOKEN' : null].filter(Boolean)
+      return miss.length > 0 ? `${a.name} (${miss.join(', ')})` : null
+    })
+    .filter((x): x is string => x != null)
+  if (missingKeys.length > 0) {
+    out.push({
+      id: 'fleet-env-keys',
+      title: 'Fleet env files carry PORT and TOKEN',
+      status: 'warn',
+      detail: `missing keys: ${missingKeys.join('; ')} — these agents are excluded from the uniqueness checks`,
+      fix: 'set TELEGRAM_WEBHOOK_PORT and TELEGRAM_BOT_TOKEN in each channel.env',
     })
   }
 
@@ -726,14 +754,24 @@ export function checkFleet(agents: FleetAgent[], sharedSettingsRaw: string | nul
       : { id: 'fleet-webhook-enabled', title: 'webhook.enabled=true in every state config', status: 'warn', detail: webhookOff.join('; '), fix: 'env only sets host/port — write {"webhook":{"enabled":true,...}} to <state-dir>/config.json (invariant e)' },
   )
 
+  // ANY foreign port is a failure even when the own port is also present —
+  // a stale last-install-wins hook next to a correct one still double-routes.
   const foreign = agents
-    .filter((a) => a.port != null && a.hookPorts.length > 0 && !a.hookPorts.includes(a.port))
-    .map((a) => `${a.name} hooks point at port(s) ${a.hookPorts.join(',')} but its webhook is ${a.port}`)
-  out.push(
-    foreign.length === 0
-      ? { id: 'fleet-hook-ports', title: 'Each agent\'s hooks point at its own port', status: 'pass', detail: 'no foreign-port hooks' }
-      : { id: 'fleet-hook-ports', title: 'Each agent\'s hooks point at its own port', status: 'fail', detail: foreign.join('; '), fix: 're-run install-hooks.sh with --settings <that agent\'s settings.json> and the agent\'s own --webhook-url' },
-  )
+    .filter((a) => a.port != null)
+    .map((a) => ({ a, alien: a.hookPorts.filter((p) => p !== a.port) }))
+    .filter(({ alien }) => alien.length > 0)
+    .map(({ a, alien }) => `${a.name} hooks point at foreign port(s) ${alien.join(',')} (own webhook: ${a.port})`)
+  // Hooks we could not inspect are an unverified state, not a pass.
+  const unverified = agents
+    .filter((a) => a.envReadable && a.settingsPath == null)
+    .map((a) => a.name)
+  if (foreign.length > 0) {
+    out.push({ id: 'fleet-hook-ports', title: 'Each agent\'s hooks point at its own port', status: 'fail', detail: foreign.join('; '), fix: 're-run install-hooks.sh with --settings <that agent\'s settings.json> and the agent\'s own --webhook-url, and remove stale hook blocks' })
+  } else if (unverified.length > 0) {
+    out.push({ id: 'fleet-hook-ports', title: 'Each agent\'s hooks point at its own port', status: 'warn', detail: `workspace settings not found for: ${unverified.join(', ')} — hook routing unverified`, fix: 'expected at <TELEGRAM_WORKSPACE_ROOT>/settings.json or <root>/.claude/settings.json' })
+  } else {
+    out.push({ id: 'fleet-hook-ports', title: 'Each agent\'s hooks point at its own port', status: 'pass', detail: 'no foreign-port hooks' })
+  }
 
   return out
 }
@@ -770,11 +808,13 @@ export function scanFleet(unitDir: string): FleetAgent[] {
     // IS the .claude dir (settings.json directly inside), or the root contains
     // a .claude/ subdir.
     let hookPorts: string[] = []
+    let settingsPath: string | null = null
     if (workspaceRoot) {
       for (const cand of [join(workspaceRoot, 'settings.json'), join(workspaceRoot, '.claude', 'settings.json')]) {
         const raw = readFileSafe(cand)
         if (raw != null) {
           hookPorts = hookPortsInSettings(raw)
+          settingsPath = cand
           break
         }
       }
@@ -791,6 +831,7 @@ export function scanFleet(unitDir: string): FleetAgent[] {
       workspaceRoot,
       webhookEnabled,
       hookPorts,
+      settingsPath,
     })
   }
   return agents

@@ -370,6 +370,7 @@ describe('fleet (multi-agent) checks', () => {
     workspaceRoot: '/srv/agents/a',
     webhookEnabled: true,
     hookPorts: ['8089'],
+    settingsPath: '/srv/agents/a/settings.json',
     ...over,
   })
   const byId = (checks: Check[]): Record<string, Check> => Object.fromEntries(checks.map((c) => [c.id, c]))
@@ -472,7 +473,7 @@ describe('fleet (multi-agent) checks', () => {
   test('unreadable env degrades to warn, not crash', () => {
     const checks = byId(checkFleet([
       agent({}),
-      agent({ name: 'locked', envReadable: false, port: null, tokenDigest: null, stateDir: null, workspaceRoot: null, webhookEnabled: null, hookPorts: [], sockets: ['s2'] }),
+      agent({ name: 'locked', envReadable: false, port: null, tokenDigest: null, stateDir: null, workspaceRoot: null, webhookEnabled: null, hookPorts: [], settingsPath: null, sockets: ['s2'] }),
     ], null))
     expect(checks['fleet-env-readable']?.status).toBe('warn')
     expect(checks['fleet-env-readable']?.detail).toContain('locked')
@@ -494,5 +495,60 @@ describe('fleet discovery filter', () => {
   test('units without tmux Exec lines are not channels', () => {
     const helper = parseUnitFile('ExecStart=/usr/bin/python3 /srv/listener.py\nEnvironmentFile=/etc/x.env')
     expect(helper.sockets).toEqual([])
+  })
+})
+
+describe('fleet checks — review fixes (Codex HOLD round)', () => {
+  const agent = (over: Partial<FleetAgent>): FleetAgent => ({
+    name: 'a',
+    unitPath: '/etc/systemd/system/channel-a.service',
+    sockets: ['channel-a'],
+    envPath: '/etc/dashi-plugin/a/channel.env',
+    envReadable: true,
+    port: '8089',
+    tokenDigest: 'digest-a',
+    stateDir: '/var/lib/dashi-channel/a',
+    workspaceRoot: '/srv/agents/a',
+    webhookEnabled: true,
+    hookPorts: ['8089'],
+    settingsPath: '/srv/agents/a/settings.json',
+    ...over,
+  })
+  const byId = (checks: Check[]): Record<string, Check> => Object.fromEntries(checks.map((c) => [c.id, c]))
+
+  test('readable env missing PORT/TOKEN surfaces as warn, not hollow pass', () => {
+    const checks = byId(checkFleet([agent({ name: 'bare', port: null, tokenDigest: null })], null))
+    expect(checks['fleet-env-keys']?.status).toBe('warn')
+    expect(checks['fleet-env-keys']?.detail).toContain('bare')
+    expect(checks['fleet-env-keys']?.detail).toContain('TELEGRAM_WEBHOOK_PORT')
+  })
+
+  test('foreign port NEXT TO the own port still fails (stale last-install hook)', () => {
+    const checks = byId(checkFleet([agent({ name: 'arthas', port: '8103', hookPorts: ['8103', '8093'] })], null))
+    expect(checks['fleet-hook-ports']?.status).toBe('fail')
+    expect(checks['fleet-hook-ports']?.detail).toContain('8093')
+    expect(checks['fleet-hook-ports']?.detail).not.toContain('8103,')
+  })
+
+  test('workspace settings not found = warn (unverified), not pass', () => {
+    const checks = byId(checkFleet([agent({ settingsPath: null, hookPorts: [] })], null))
+    expect(checks['fleet-hook-ports']?.status).toBe('warn')
+    expect(checks['fleet-hook-ports']?.detail).toContain('unverified')
+  })
+
+  test('hookPortsInSettings catches localhost spellings', () => {
+    expect(hookPortsInSettings('x http://localhost:8089/hooks/agent y')).toEqual(['8089'])
+    expect(hookPortsInSettings('x http://0.0.0.0:8090/hooks/agent y')).toEqual(['8090'])
+    expect(hookPortsInSettings('x http://[::1]:8091/hooks/agent y')).toEqual(['8091'])
+  })
+
+  test('-L inside the quoted nested command is NOT a tmux socket', () => {
+    const unit = "ExecStart=/usr/bin/tmux new-session -d -s s 'claude -L sneaky --flag'"
+    expect(parseUnitFile(unit).sockets).toEqual([''])
+  })
+
+  test('-L in tmux argv before the quoted payload IS the socket', () => {
+    const unit = "ExecStart=/usr/bin/tmux -L real new-session -d -s s 'claude -L sneaky'"
+    expect(parseUnitFile(unit).sockets).toEqual(['real'])
   })
 })
