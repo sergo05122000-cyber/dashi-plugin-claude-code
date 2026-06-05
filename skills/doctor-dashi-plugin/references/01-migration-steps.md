@@ -16,7 +16,7 @@ playbook around them. Commands are verbatim; substitute `<agent>`,
 |---|---|---|
 | OS | — | linux→systemd, macos→launchd |
 | Claude Code ≥ 2.1 | `claude --version` | `2.1.x`+ (persistent welcome-accepts need `2.1.140+`) |
-| Bun ≥ 1.3.14 | `bun --version` | `>= 1.3.14` |
+| Bun ≥ 1.3.9 | `bun --version` | `>= 1.3.9` (lowest verified in production) |
 | tmux | `which tmux` | found; **record the exact path** (it goes in the unit/plist) |
 | Max login | `claude` then OAuth | login saved under the service user |
 | Old gateway inventoried | see below | token, allowed ids, workspace, unit name recorded |

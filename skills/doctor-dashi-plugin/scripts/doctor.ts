@@ -34,7 +34,11 @@ export type OS = 'linux' | 'macos' | 'other'
 
 /** Required floors. Below these, migration is unsupported. */
 export const MIN_CLAUDE = [2, 1, 0] as const
-export const MIN_BUN = [1, 3, 14] as const
+// 1.3.9 is the lowest Bun verified in production (Thrall VPS fleet: live
+// channel + 1266 plugin tests green). The previous 1.3.14 floor was the
+// authoring machine's version, not a real requirement, and failed working
+// hosts for no reason.
+export const MIN_BUN = [1, 3, 9] as const
 
 /** The five hook events install-hooks.sh must register. */
 export const REQUIRED_HOOK_EVENTS = [
@@ -71,7 +75,14 @@ const SECRET_WORDS = 'TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY|BEARER'
 const SECRET_QUOTED = new RegExp(`("?[A-Za-z0-9_]*(?:${SECRET_WORDS})[A-Za-z0-9_]*"?\\s*[=:]\\s*)(["'])[\\s\\S]*?\\2`, 'gi')
 const SECRET_BARE = new RegExp(`([A-Za-z0-9_]*(?:${SECRET_WORDS})[A-Za-z0-9_]*\\s*[=:]\\s*)([^\\s"',}]+)`, 'gi')
 
-export function redact(input: string): string {
+/**
+ * Secret-class masking only — the rules that detect ACTUAL credentials.
+ * Used both by `redact` (display) and by the settings leak CHECK, which
+ * must not fire on privacy-only maskings like IP addresses: install-hooks
+ * legitimately writes `http://127.0.0.1:<port>/hooks/agent` into every
+ * hook command, and flagging that as a leak failed every correct setup.
+ */
+export function redactSecretsStrict(input: string): string {
   return input
     // Known secret assignments — mask the value regardless of its shape, so an
     // unusual or quoted token still does not leak. Quoted form first.
@@ -81,6 +92,13 @@ export function redact(input: string): string {
     .replace(/\bgsk_[A-Za-z0-9]{20,}\b/g, '<groq-key>')
     .replace(/\bsk-[A-Za-z0-9-]{20,}\b/g, '<api-key>')
     .replace(/[Bb]earer\s+[A-Za-z0-9._-]{10,}/g, 'Bearer <redacted>')
+}
+
+export function redact(input: string): string {
+  return redactSecretsStrict(input)
+    // Privacy-only masking (NOT a secret): server IPs in output shown to
+    // public groups. Kept out of redactSecretsStrict so the leak check
+    // doesn't false-positive on the loopback webhook URL.
     .replace(/\b(\d{1,3}\.){3}\d{1,3}\b/g, '<ip>')
 }
 
@@ -240,10 +258,12 @@ function hasWorkingHook(entries: SettingsHookEntry[], marker: string): boolean {
 export function checkSettingsHooks(settings: unknown): Check[] {
   const out: Check[] = []
   const raw = JSON.stringify(settings ?? {})
-  // Shape-based leak detection: if redaction changes the serialized settings,
-  // something secret-shaped is present (a token value, a bearer literal, a known
-  // secret-key assignment) regardless of the key name.
-  const leaked = /TELEGRAM_WEBHOOK_TOKEN/.test(raw) || redact(raw) !== raw
+  // Shape-based leak detection: if SECRET-class redaction changes the
+  // serialized settings, something secret-shaped is present (a token value, a
+  // bearer literal, a known secret-key assignment) regardless of the key name.
+  // Strict variant on purpose: full redact() also masks IPs, and the loopback
+  // webhook URL that install-hooks writes would false-positive every setup.
+  const leaked = /TELEGRAM_WEBHOOK_TOKEN/.test(raw) || redactSecretsStrict(raw) !== raw
   out.push(
     leaked
       ? {
@@ -672,8 +692,8 @@ function gatherChecks(opts: Options): Check[] {
   const bun = probe(process.execPath.endsWith('bun') ? process.execPath : 'bun', ['--version'])
   checks.push(
     bun.stdout
-      ? checkVersion('bun-version', 'Bun >= 1.3.14', bun.stdout, MIN_BUN)
-      : { id: 'bun-version', title: 'Bun >= 1.3.14', status: 'fail', detail: 'bun not found', fix: 'install bun' },
+      ? checkVersion('bun-version', 'Bun >= 1.3.9', bun.stdout, MIN_BUN)
+      : { id: 'bun-version', title: 'Bun >= 1.3.9', status: 'fail', detail: 'bun not found', fix: 'install bun' },
   )
   const tmux = probe('tmux', ['-V'])
   checks.push(

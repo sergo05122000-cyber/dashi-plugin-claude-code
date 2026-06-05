@@ -85,8 +85,8 @@ describe('semver', () => {
     expect(checkVersion('c', 'claude', '2.1.0', MIN_CLAUDE).status).toBe('pass')
     expect(checkVersion('c', 'claude', '2.5.3', MIN_CLAUDE).status).toBe('pass')
     expect(checkVersion('c', 'claude', '2.0.9', MIN_CLAUDE).status).toBe('fail')
-    expect(checkVersion('b', 'bun', '1.3.13', MIN_BUN).status).toBe('fail')
-    expect(checkVersion('b', 'bun', '1.3.14', MIN_BUN).status).toBe('pass')
+    expect(checkVersion('b', 'bun', '1.3.8', MIN_BUN).status).toBe('fail')
+    expect(checkVersion('b', 'bun', '1.3.9', MIN_BUN).status).toBe('pass')
   })
   test('checkVersion fails on unparseable output without leaking it raw', () => {
     const c = checkVersion('c', 'claude', 'command not found: claude', MIN_CLAUDE)
@@ -160,6 +160,50 @@ describe('checkSettingsHooks', () => {
 
   test('secret-shaped value under a DIFFERENT key → FAIL (shape detection)', () => {
     const leaked = { hooks: good.hooks, custom: { MY_API_KEY: 'gsk_abcdefghijklmnopqrstuvwxyz0123' } }
+    expect(checkSettingsHooks(leaked).find((c) => c.id === 'settings-no-token')?.status).toBe('fail')
+  })
+
+  test('canonical install-hooks command with loopback webhook URL → PASS (no IP false positive)', () => {
+    // install-hooks.sh writes exactly this shape into every correct setup;
+    // the leak check must not flag the 127.0.0.1 webhook URL as a secret.
+    const canonical = {
+      hooks: {
+        ...good.hooks,
+        Stop: [
+          {
+            marker: 'dashi-channel-hook',
+            hooks: [
+              {
+                type: 'command',
+                command:
+                  "TELEGRAM_HOOK_CHAT_ID='164795011' TELEGRAM_HOOK_AGENT_ID='arthas' TELEGRAM_WEBHOOK_URL='http://127.0.0.1:8103/hooks/agent' bun '/srv/agent/.claude/jarvis-channel/plugin/scripts/post-hook.ts'",
+              },
+            ],
+          },
+          hookEntry('dashi-channel-fallback-reply'),
+        ],
+      },
+    }
+    expect(checkSettingsHooks(canonical).find((c) => c.id === 'settings-no-token')?.status).toBe('pass')
+  })
+
+  test('bot token in a hook command → still FAIL with strict secret rules', () => {
+    const leaked = {
+      hooks: {
+        ...good.hooks,
+        Stop: [
+          {
+            marker: 'dashi-channel-hook',
+            hooks: [
+              {
+                type: 'command',
+                command: "TELEGRAM_BOT_TOKEN='8338508613:AAH1234567890abcdefghijklmnopqrstuvw' bun 'scripts/post-hook.ts'",
+              },
+            ],
+          },
+        ],
+      },
+    }
     expect(checkSettingsHooks(leaked).find((c) => c.id === 'settings-no-token')?.status).toBe('fail')
   })
 

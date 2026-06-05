@@ -47,7 +47,7 @@ Every flag is optional — pass what you have. `--json` gives machine-readable
 output for an agent to parse. Exit code: `0` = no FAIL, `1` = at least one FAIL,
 `2` = usage error.
 
-The doctor checks, in order: toolchain floors (Claude Code ≥ 2.1, Bun ≥ 1.3.14,
+The doctor checks, in order: toolchain floors (Claude Code ≥ 2.1, Bun ≥ 1.3.9,
 tmux), **workspace placement** (the #1 first-run failure — identity drift),
 settings.json hooks + token leak, **MCP comms consistency** (the latent
 silent-channel landmine), the Telegram allowlist, and live-session signals
