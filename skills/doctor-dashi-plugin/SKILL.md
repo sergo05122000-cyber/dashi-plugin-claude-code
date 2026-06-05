@@ -47,6 +47,17 @@ Every flag is optional — pass what you have. `--json` gives machine-readable
 output for an agent to parse. Exit code: `0` = no FAIL, `1` = at least one FAIL,
 `2` = usage error.
 
+**Multi-agent fleet mode** (README section 14): add `--fleet` to discover every
+`channel-*.service` unit on the host (helper units without a tmux Exec line are
+skipped) and verify the five isolation invariants ACROSS agents — unique
+webhook ports, unique bot tokens (sha256 digests, never printed), a dedicated
+tmux socket per unit (duplicates incl. two-on-default fail; a single default
+socket is a warn), the shared `~/.claude/settings.json` free of channel hooks,
+`webhook.enabled=true` in every agent's state config, and each agent's hooks
+pointing at its OWN webhook port (the last-install-wins disaster). Use
+`--fleet-dir <dir>` for a non-standard unit directory or in tests. Run it
+before and after adding agent #2..N.
+
 The doctor checks, in order: toolchain floors (Claude Code ≥ 2.1, Bun ≥ 1.3.9,
 tmux), **workspace placement** (the #1 first-run failure — identity drift),
 settings.json hooks + token leak, **MCP comms consistency** (the latent

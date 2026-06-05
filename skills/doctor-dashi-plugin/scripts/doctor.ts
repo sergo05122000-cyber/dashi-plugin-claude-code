@@ -15,7 +15,8 @@
  * Exit: 0 = no FAIL, 1 = at least one FAIL, 2 = usage error.
  */
 import { spawnSync } from 'child_process'
-import { existsSync, readFileSync } from 'fs'
+import { createHash } from 'crypto'
+import { existsSync, readFileSync, readdirSync } from 'fs'
 import { dirname, join } from 'path'
 import { homedir, platform } from 'os'
 
@@ -575,6 +576,267 @@ function parseJsonSafe(text: string | null): unknown {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Fleet (multi-agent) checks — README section 14. N agents on one host under
+// one subscription is only safe when the five isolation invariants hold:
+// per-workspace hooks, distinct webhook ports, distinct bot tokens, dedicated
+// tmux sockets, webhook.enabled per state config. `--fleet` discovers every
+// channel-*.service unit and verifies the invariants ACROSS agents — the
+// single-agent checks above cannot see cross-agent collisions.
+// ---------------------------------------------------------------------------
+
+export interface FleetAgent {
+  name: string
+  unitPath: string
+  /** Distinct tmux socket names used by the unit's Exec lines ('' = default socket). */
+  sockets: string[]
+  envPath: string | null
+  envReadable: boolean
+  port: string | null
+  /** sha256 hex digest of the bot token — never the token itself. */
+  tokenDigest: string | null
+  stateDir: string | null
+  workspaceRoot: string | null
+  /** true/false from <state-dir>/config.json; null = config missing/unreadable. */
+  webhookEnabled: boolean | null
+  /** Webhook ports referenced by hook commands in the agent's workspace settings. */
+  hookPorts: string[]
+  /** Path of the workspace settings.json actually found; null = could not locate/read. */
+  settingsPath: string | null
+}
+
+/** Parse a systemd unit: EnvironmentFile + tmux socket per Exec line. Pure. */
+export function parseUnitFile(text: string): { envPath: string | null; sockets: string[] } {
+  let envPath: string | null = null
+  const sockets = new Set<string>()
+  for (const line of text.split('\n')) {
+    const env = line.match(/^\s*EnvironmentFile=-?(\S+)/)
+    if (env?.[1]) envPath = env[1]
+    if (/^\s*Exec(Start|StartPost|Stop|StopPost)=.*tmux/.test(line)) {
+      // Only inspect tmux's OWN argv: everything before the first quote is
+      // tmux args, the quoted tail is the nested payload (`'claude ... -L x'`
+      // must not read as a tmux socket).
+      const cmdPart = line.slice(line.indexOf('tmux'))
+      const quoteIdx = cmdPart.search(/['"]/)
+      const argsPart = quoteIdx === -1 ? cmdPart : cmdPart.slice(0, quoteIdx)
+      const sock = argsPart.match(/\s-L\s+(\S+)/)
+      sockets.add(sock?.[1] ?? '')
+    }
+  }
+  return { envPath, sockets: [...sockets] }
+}
+
+/** First value of KEY=... in env-file text. Pure. */
+export function envValue(envText: string, key: string): string | null {
+  for (const line of envText.split('\n')) {
+    const m = line.match(new RegExp(`^\\s*${key}=(.*)$`))
+    if (m) return (m[1] ?? '').trim() || null
+  }
+  return null
+}
+
+/** Webhook ports referenced by hook commands in a serialized settings.json. Pure. */
+export function hookPortsInSettings(settingsRaw: string | null): string[] {
+  if (!settingsRaw) return []
+  const ports = new Set<string>()
+  // Any localhost spelling counts — 127.0.0.1, localhost, 0.0.0.0, [::1].
+  for (const m of settingsRaw.matchAll(/(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\]):(\d+)\/hooks\/agent/g)) {
+    const p = m[1]
+    if (p !== undefined) ports.add(p)
+  }
+  return [...ports]
+}
+
+/** Cross-agent invariant checks. Pure — agents prepared by scanFleet. */
+export function checkFleet(agents: FleetAgent[], sharedSettingsRaw: string | null): Check[] {
+  const out: Check[] = []
+  const names = agents.map((a) => a.name).join(', ')
+  out.push(
+    agents.length > 0
+      ? { id: 'fleet-size', title: 'Fleet discovery', status: 'pass', detail: `${agents.length} channel unit(s): ${names}` }
+      : { id: 'fleet-size', title: 'Fleet discovery', status: 'fail', detail: 'no channel-*.service units found', fix: 'pass --fleet-dir <dir with channel-*.service files>' },
+  )
+  if (agents.length === 0) return out
+
+  const unreadable = agents.filter((a) => !a.envReadable).map((a) => a.name)
+  if (unreadable.length > 0) {
+    out.push({
+      id: 'fleet-env-readable',
+      title: 'Fleet env files readable',
+      status: 'warn',
+      detail: `cannot read channel.env for: ${unreadable.join(', ')} — port/token checks are partial`,
+      fix: 'run the doctor as a user that can read the env files',
+    })
+  }
+
+  // A readable env that lacks PORT or TOKEN makes the uniqueness checks below
+  // silently skip that agent — surface it instead of reporting a hollow PASS.
+  const missingKeys = agents
+    .filter((a) => a.envReadable)
+    .map((a) => {
+      const miss = [a.port == null ? 'TELEGRAM_WEBHOOK_PORT' : null, a.tokenDigest == null ? 'TELEGRAM_BOT_TOKEN' : null].filter(Boolean)
+      return miss.length > 0 ? `${a.name} (${miss.join(', ')})` : null
+    })
+    .filter((x): x is string => x != null)
+  if (missingKeys.length > 0) {
+    out.push({
+      id: 'fleet-env-keys',
+      title: 'Fleet env files carry PORT and TOKEN',
+      status: 'warn',
+      detail: `missing keys: ${missingKeys.join('; ')} — these agents are excluded from the uniqueness checks`,
+      fix: 'set TELEGRAM_WEBHOOK_PORT and TELEGRAM_BOT_TOKEN in each channel.env',
+    })
+  }
+
+  const dupBy = (label: string, key: (a: FleetAgent) => string | null): string[] => {
+    const seen = new Map<string, string[]>()
+    for (const a of agents) {
+      const v = key(a)
+      if (v == null) continue
+      seen.set(v, [...(seen.get(v) ?? []), a.name])
+    }
+    return [...seen.values()].filter((group) => group.length > 1).map((group) => `${group.join(' & ')} share a ${label}`)
+  }
+
+  const portDupes = dupBy('webhook port', (a) => a.port)
+  out.push(
+    portDupes.length === 0
+      ? { id: 'fleet-ports-unique', title: 'Webhook ports unique across agents', status: 'pass', detail: agents.map((a) => `${a.name}:${a.port ?? '?'}`).join(', ') }
+      : { id: 'fleet-ports-unique', title: 'Webhook ports unique across agents', status: 'fail', detail: portDupes.join('; '), fix: 'give every agent its own TELEGRAM_WEBHOOK_PORT (invariant b)' },
+  )
+
+  const tokenDupes = dupBy('bot token', (a) => a.tokenDigest)
+  out.push(
+    tokenDupes.length === 0
+      ? { id: 'fleet-tokens-unique', title: 'Bot tokens unique across agents', status: 'pass', detail: 'all token digests differ' }
+      : { id: 'fleet-tokens-unique', title: 'Bot tokens unique across agents', status: 'fail', detail: tokenDupes.join('; '), fix: 'one token = one getUpdates consumer; a shared token means 409 Conflict (invariant c)' },
+  )
+
+  // Sockets: a unit whose Exec lines disagree is broken on its own; across
+  // units, any duplicate socket (including two on the default '') races at boot.
+  const inconsistent = agents.filter((a) => a.sockets.length > 1).map((a) => a.name)
+  const socketOf = (a: FleetAgent): string | null => (a.sockets.length === 1 ? (a.sockets[0] ?? null) : null)
+  const socketDupes = dupBy('tmux socket', (a) => socketOf(a) === '' ? '<default>' : socketOf(a))
+  const onDefault = agents.filter((a) => socketOf(a) === '').map((a) => a.name)
+  if (inconsistent.length > 0) {
+    out.push({ id: 'fleet-sockets', title: 'Dedicated tmux socket per unit', status: 'fail', detail: `Exec lines disagree on -L inside: ${inconsistent.join(', ')}`, fix: 'use the same tmux -L <socket> in ExecStart, ExecStartPost AND ExecStop' })
+  } else if (socketDupes.length > 0) {
+    out.push({ id: 'fleet-sockets', title: 'Dedicated tmux socket per unit', status: 'fail', detail: socketDupes.join('; '), fix: 'two Type=forking units on one socket race at boot — give each unit tmux -L channel-<agent> (invariant d)' })
+  } else if (onDefault.length === 1 && agents.length > 1) {
+    out.push({ id: 'fleet-sockets', title: 'Dedicated tmux socket per unit', status: 'warn', detail: `${onDefault[0]} runs on the default socket (no -L)`, fix: 'works while unique, but a future unit without -L will race it — prefer a dedicated socket' })
+  } else {
+    out.push({ id: 'fleet-sockets', title: 'Dedicated tmux socket per unit', status: 'pass', detail: agents.map((a) => `${a.name}:${socketOf(a) === '' ? '<default>' : socketOf(a)}`).join(', ') })
+  }
+
+  const sharedDirty = sharedSettingsRaw != null && /dashi-channel-hook|post-hook\.ts|read-receipt-hook\.ts|fallback-reply-hook\.ts/.test(sharedSettingsRaw)
+  out.push(
+    sharedDirty
+      ? { id: 'fleet-shared-settings', title: 'Shared ~/.claude/settings.json free of channel hooks', status: 'fail', detail: 'channel hooks found in the user-level settings — they fire in EVERY agent session and route through one agent\'s bot/port', fix: 'move channel hooks into each agent\'s <workspace>/.claude/settings.json (invariant a)' }
+      : { id: 'fleet-shared-settings', title: 'Shared ~/.claude/settings.json free of channel hooks', status: 'pass', detail: 'no channel hook markers in the shared file' },
+  )
+
+  for (const [id, label, key, fix] of [
+    ['fleet-state-dirs-unique', 'State dirs unique across agents', (a: FleetAgent) => a.stateDir, 'give every agent its own TELEGRAM_STATE_DIR'],
+    ['fleet-workspaces-unique', 'Workspace roots unique across agents', (a: FleetAgent) => a.workspaceRoot, 'give every agent its own TELEGRAM_WORKSPACE_ROOT (identity isolation)'],
+  ] as const) {
+    const dupes = dupBy(label.toLowerCase(), key)
+    out.push(
+      dupes.length === 0
+        ? { id, title: label, status: 'pass', detail: 'no collisions' }
+        : { id, title: label, status: 'fail', detail: dupes.join('; '), fix },
+    )
+  }
+
+  const webhookOff = agents.filter((a) => a.webhookEnabled !== true).map((a) => `${a.name} (${a.webhookEnabled === false ? 'enabled=false' : 'state config missing'})`)
+  out.push(
+    webhookOff.length === 0
+      ? { id: 'fleet-webhook-enabled', title: 'webhook.enabled=true in every state config', status: 'pass', detail: 'all agents have a live webhook endpoint' }
+      : { id: 'fleet-webhook-enabled', title: 'webhook.enabled=true in every state config', status: 'warn', detail: webhookOff.join('; '), fix: 'env only sets host/port — write {"webhook":{"enabled":true,...}} to <state-dir>/config.json (invariant e)' },
+  )
+
+  // ANY foreign port is a failure even when the own port is also present —
+  // a stale last-install-wins hook next to a correct one still double-routes.
+  const foreign = agents
+    .filter((a) => a.port != null)
+    .map((a) => ({ a, alien: a.hookPorts.filter((p) => p !== a.port) }))
+    .filter(({ alien }) => alien.length > 0)
+    .map(({ a, alien }) => `${a.name} hooks point at foreign port(s) ${alien.join(',')} (own webhook: ${a.port})`)
+  // Hooks we could not inspect are an unverified state, not a pass.
+  const unverified = agents
+    .filter((a) => a.envReadable && a.settingsPath == null)
+    .map((a) => a.name)
+  if (foreign.length > 0) {
+    out.push({ id: 'fleet-hook-ports', title: 'Each agent\'s hooks point at its own port', status: 'fail', detail: foreign.join('; '), fix: 're-run install-hooks.sh with --settings <that agent\'s settings.json> and the agent\'s own --webhook-url, and remove stale hook blocks' })
+  } else if (unverified.length > 0) {
+    out.push({ id: 'fleet-hook-ports', title: 'Each agent\'s hooks point at its own port', status: 'warn', detail: `workspace settings not found for: ${unverified.join(', ')} — hook routing unverified`, fix: 'expected at <TELEGRAM_WORKSPACE_ROOT>/settings.json or <root>/.claude/settings.json' })
+  } else {
+    out.push({ id: 'fleet-hook-ports', title: 'Each agent\'s hooks point at its own port', status: 'pass', detail: 'no foreign-port hooks' })
+  }
+
+  return out
+}
+
+/** Discover channel-*.service units and build FleetAgents. IO wrapper around the pure parsers. */
+export function scanFleet(unitDir: string): FleetAgent[] {
+  let entries: string[] = []
+  try {
+    entries = readdirSync(unitDir).filter((f) => /^channel-.+\.service$/.test(f))
+  } catch {
+    return []
+  }
+  const agents: FleetAgent[] = []
+  for (const f of entries.sort()) {
+    const unitPath = join(unitDir, f)
+    const text = readFileSafe(unitPath)
+    if (text == null) continue
+    const name = f.replace(/^channel-/, '').replace(/\.service$/, '')
+    const { envPath, sockets } = parseUnitFile(text)
+    // Not every channel-*.service is a channel: helper units (webhook
+    // listeners, sync timers) share the prefix but never run tmux. A channel
+    // unit always supervises a tmux session — skip anything that doesn't.
+    if (sockets.length === 0) continue
+    const envText = envPath ? readFileSafe(envPath) : null
+    const token = envText ? envValue(envText, 'TELEGRAM_BOT_TOKEN') : null
+    const stateDir = envText ? envValue(envText, 'TELEGRAM_STATE_DIR') : null
+    const workspaceRoot = envText ? envValue(envText, 'TELEGRAM_WORKSPACE_ROOT') : null
+    let webhookEnabled: boolean | null = null
+    if (stateDir) {
+      const stateConfig = parseJsonSafe(readFileSafe(join(stateDir, 'config.json'))) as { webhook?: { enabled?: boolean } } | null
+      webhookEnabled = stateConfig?.webhook?.enabled === true ? true : stateConfig ? false : null
+    }
+    // Workspace settings: both layouts exist in the wild — the workspace root
+    // IS the .claude dir (settings.json directly inside), or the root contains
+    // a .claude/ subdir.
+    let hookPorts: string[] = []
+    let settingsPath: string | null = null
+    if (workspaceRoot) {
+      for (const cand of [join(workspaceRoot, 'settings.json'), join(workspaceRoot, '.claude', 'settings.json')]) {
+        const raw = readFileSafe(cand)
+        if (raw != null) {
+          hookPorts = hookPortsInSettings(raw)
+          settingsPath = cand
+          break
+        }
+      }
+    }
+    agents.push({
+      name,
+      unitPath,
+      sockets,
+      envPath,
+      envReadable: envText != null,
+      port: envText ? envValue(envText, 'TELEGRAM_WEBHOOK_PORT') : null,
+      tokenDigest: token ? createHash('sha256').update(token).digest('hex') : null,
+      stateDir,
+      workspaceRoot,
+      webhookEnabled,
+      hookPorts,
+      settingsPath,
+    })
+  }
+  return agents
+}
+
 interface Options {
   json: boolean
   os: OS
@@ -587,6 +849,8 @@ interface Options {
   chatId?: string
   tmuxSession?: string
   queueJsonPath?: string
+  fleet?: boolean
+  fleetDir?: string
 }
 
 function parseArgs(argv: string[]): Options | { error: string } {
@@ -641,6 +905,12 @@ function parseArgs(argv: string[]): Options | { error: string } {
       case '--queue-json':
         opts.queueJsonPath = next()
         break
+      case '--fleet':
+        opts.fleet = true
+        break
+      case '--fleet-dir':
+        opts.fleetDir = next()
+        break
       case '--help':
       case '-h':
         return { error: 'help' }
@@ -667,6 +937,10 @@ Options:
   --chat <id>              a Telegram chat id to verify (group id is -100...)
   --session <name>         tmux channel session (e.g. channel-myagent)
   --queue-json <path>      a saved getUpdates JSON response to classify (409 / drain)
+  --fleet                  multi-agent mode: discover channel-*.service units and
+                           verify the five isolation invariants ACROSS agents
+                           (README section 14)
+  --fleet-dir <path>       where to look for unit files (default: /etc/systemd/system)
   --json                   machine-readable output
   -h, --help               this help
 
@@ -772,6 +1046,15 @@ function gatherChecks(opts: Options): Check[] {
     } else {
       checks.push(classifyQueue(parsed))
     }
+  }
+
+  // Fleet (multi-agent) invariants — cross-agent collisions invisible to the
+  // single-agent checks above. The shared-settings probe always reads the
+  // USER-level file (the one that fires in every session), regardless of
+  // where --settings points.
+  if (opts.fleet) {
+    const agents = scanFleet(opts.fleetDir ?? '/etc/systemd/system')
+    checks.push(...checkFleet(agents, readFileSafe(join(homedir(), '.claude', 'settings.json'))))
   }
 
   // live session state (crash loop / auth / welcome hang / listening)
