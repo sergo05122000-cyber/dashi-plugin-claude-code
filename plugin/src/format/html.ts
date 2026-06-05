@@ -195,12 +195,84 @@ function stashTables(input: string, store: Placeholder[]): string {
   })
 }
 
+interface SafeTagToken {
+  /** Offset of `<` in the input. */
+  start: number
+  /** Offset just past `>`. */
+  end: number
+  /** The full raw tag text, e.g. `</pre>`. */
+  raw: string
+  /** Lowercased tag name. */
+  name: string
+  /** True for `</foo>`. */
+  closing: boolean
+}
+
 function stashSafeTags(input: string, store: Placeholder[]): string {
-  return input.replace(SAFE_TAG_RE, match => {
-    const key = sentinel('TG', store.length)
-    store.push({ key, html: match })
-    return key
+  // Tokenize safe-tag candidates with positions, then keep only tags that
+  // form properly-nested OPEN/CLOSE pairs (void <br> always kept, closing
+  // </br> never). Everything else falls through to the escape pass.
+  //
+  // Why balance-aware: a lone `<pre>` mentioned in prose («два сообщения
+  // с <pre>») used to survive verbatim, reach Telegram as an unclosed tag,
+  // and trip the pre-send validator's whole-message plain-text downgrade —
+  // the warchief saw literal &lt;b&gt; soup instead of formatting
+  // (2026-06-05). Escaping the unpaired tag keeps the rest of the message
+  // valid HTML so formatting ships.
+  const tokens: SafeTagToken[] = []
+  for (const m of input.matchAll(SAFE_TAG_RE)) {
+    const raw = m[0]
+    const name = (/^<\/?\s*([a-zA-Z][a-zA-Z0-9-]*)/.exec(raw)?.[1] ?? '').toLowerCase()
+    tokens.push({
+      start: m.index,
+      end: m.index + raw.length,
+      raw,
+      name,
+      closing: raw.startsWith('</'),
+    })
+  }
+
+  const keep = new Set<number>()
+  const stack: number[] = []
+  tokens.forEach((t, idx) => {
+    if (t.name === 'br') {
+      // Void element: bare/self-closing form is valid on its own; the
+      // closing form `</br>` is invalid HTML — leave it for escaping.
+      if (!t.closing) keep.add(idx)
+      return
+    }
+    if (!t.closing) {
+      stack.push(idx)
+      return
+    }
+    const top = stack[stack.length - 1]
+    if (top !== undefined && tokens[top]!.name === t.name) {
+      // Properly-nested pair — keep both ends. Strict top-of-stack match
+      // guarantees every kept pair contains only kept (balanced) tags, so
+      // the preserved subset always passes Telegram's nesting rules.
+      stack.pop()
+      keep.add(top)
+      keep.add(idx)
+      return
+    }
+    // Mismatched closing tag (`</b>` with no open `<b>` on top) — escape.
   })
+  // Anything left on the stack is an unclosed opener — not kept.
+
+  if (keep.size === 0) return input
+
+  let out = ''
+  let cursor = 0
+  tokens.forEach((t, idx) => {
+    if (!keep.has(idx)) return
+    out += input.slice(cursor, t.start)
+    const key = sentinel('TG', store.length)
+    store.push({ key, html: t.raw })
+    out += key
+    cursor = t.end
+  })
+  out += input.slice(cursor)
+  return out
 }
 
 function stashMdLinks(input: string, store: Placeholder[]): string {
@@ -233,7 +305,9 @@ function restoreAll(input: string, stores: Placeholder[][]): string {
  * apply markdown transforms on the escaped text, then restore sentinels.
  * This guarantees that:
  *   - HTML never appears inside a code block (we stashed code first)
- *   - User-typed `<script>` etc gets escaped, agent-written `<b>` survives
+ *   - User-typed `<script>` etc gets escaped; agent-written `<b>…</b>`
+ *     survives only as balanced pairs — an unpaired safe tag (a lone
+ *     `<pre>` mentioned in prose) is escaped like ordinary text
  *   - snake_case identifiers don't get accidentally italicized
  */
 export function markdownToTelegramHtml(text: string): string {

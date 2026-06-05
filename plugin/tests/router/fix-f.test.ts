@@ -55,6 +55,7 @@ import {
   OutboxMessageSchema,
   type OutboxMessage,
 } from '../../src/router/inbox-bridge.js'
+import { validateTelegramHtml } from '../../src/safety/html-validator.js'
 
 // ──────────────────────────────────────────────────────────────────────
 // Shared helpers (mirrored from multichat-router.gate.test.ts so the
@@ -283,6 +284,16 @@ describe('OutboxMessageSchema (FIX-F)', () => {
     expect(parsed.format).toBe('html')
   })
 
+  test('format=auto parses (2026-06-05 Stop-hook contract)', () => {
+    const parsed = OutboxMessageSchema.parse({
+      text: '**bold**',
+      chat_id: '164795011',
+      timestamp: '2026-06-05T00:00:00Z',
+      format: 'auto',
+    })
+    expect(parsed.format).toBe('auto')
+  })
+
   test('format=rich (invalid enum) → ZodError', () => {
     const result = OutboxMessageSchema.safeParse({
       text: 'x',
@@ -425,6 +436,91 @@ describe('deliverClaim format → parse_mode mapping (FIX-F)', () => {
     expect(fx.telegram.calls[0]?.opts.parse_mode).toBe('HTML')
   }, 5_000)
 
+  test('format=auto → markdown converted to HTML, parse_mode=HTML', async () => {
+    // 2026-06-05: the Python Stop hook cannot run the TS converter, so
+    // it writes format='auto' and the router converts at send time.
+    // Pre-fix the hook hardcoded 'text' and group chats saw literal
+    // `**bold**`.
+    const router = makeRouter(fx, policyForOwner())
+    await seedOutboxFile(fx.stateDir, ownerChat, `${Date.now()}-auto.json`, {
+      text: '**жирный** и одиночный <pre> в прозе',
+      chat_id: ownerChat,
+      timestamp: '2026-06-05T00:00:00Z',
+      format: 'auto',
+    })
+
+    await router.start()
+    await new Promise((r) => setTimeout(r, 600))
+    await router.stop()
+
+    expect(fx.telegram.calls.length).toBe(1)
+    const call = fx.telegram.calls[0]!
+    expect(call.opts.parse_mode).toBe('HTML')
+    // ** converted, lone <pre> escaped (balance-aware stash) — the body
+    // must survive Telegram's HTML parser without the plain-text downgrade.
+    expect(call.text).toContain('<b>жирный</b>')
+    expect(call.text).toContain('&lt;pre&gt;')
+    expect(call.text).not.toContain('**')
+  }, 5_000)
+
+  test('format=auto long payload → chunked into multiple sends', async () => {
+    const router = makeRouter(fx, policyForOwner())
+    const para = `${'строка анализа воркшопа '.repeat(40)}\n\n`
+    await seedOutboxFile(fx.stateDir, ownerChat, `${Date.now()}-long.json`, {
+      // ~9.6k chars → must split into 3 chunks at the 4000 boundary.
+      text: para.repeat(10),
+      chat_id: ownerChat,
+      reply_to: '77',
+      timestamp: '2026-06-05T00:00:00Z',
+      format: 'auto',
+    })
+
+    await router.start()
+    await new Promise((r) => setTimeout(r, 600))
+    await router.stop()
+
+    expect(fx.telegram.calls.length).toBeGreaterThan(1)
+    for (const call of fx.telegram.calls) {
+      expect((call.text as string).length).toBeLessThanOrEqual(4000)
+      expect(call.opts.parse_mode).toBe('HTML')
+    }
+    // reply_to threads only the first chunk — no quote-spam.
+    expect(fx.telegram.calls[0]?.opts.reply_to_message_id).toBe(77)
+    for (const call of fx.telegram.calls.slice(1)) {
+      expect('reply_to_message_id' in call.opts).toBe(false)
+    }
+  }, 5_000)
+
+  test('format=auto long MARKDOWN payload → every chunk is valid Telegram HTML', async () => {
+    // Codex review 2026-06-05 LOW #1: the risky path is long markdown
+    // whose conversion produces real HTML tags near chunk boundaries.
+    // Every sent chunk must survive validateTelegramHtml (no downgrade)
+    // — splitMessage's tag-balancing has to keep <b>/<code>/<pre> pairs
+    // intact per chunk.
+    const router = makeRouter(fx, policyForOwner())
+    const para =
+      '**Сервис ReplyGuy** ищет посты по теме и пишет `комментарии` от агента.\n' +
+      '```python\nfor post in feed:\n    comment(post)\n```\n' +
+      'Подробнее: [док](https://example.com/doc) и одиночный <pre> в прозе.\n\n'
+    await seedOutboxFile(fx.stateDir, ownerChat, `${Date.now()}-mdlong.json`, {
+      text: para.repeat(30), // ~6.5k chars source → multiple chunks
+      chat_id: ownerChat,
+      timestamp: '2026-06-05T00:00:00Z',
+      format: 'auto',
+    })
+
+    await router.start()
+    await new Promise((r) => setTimeout(r, 600))
+    await router.stop()
+
+    expect(fx.telegram.calls.length).toBeGreaterThan(1)
+    for (const call of fx.telegram.calls) {
+      expect(call.opts.parse_mode).toBe('HTML')
+      const verdict = validateTelegramHtml(call.text)
+      expect(verdict.downgraded).toBe(false)
+    }
+  }, 5_000)
+
   test('invalid format → file dead-lettered, sendMessage never called', async () => {
     const router = makeRouter(fx, policyForOwner())
     const filename = `${Date.now()}-eeee.json`
@@ -468,6 +564,79 @@ describe('deliverClaim format → parse_mode mapping (FIX-F)', () => {
     expect((sidecarMeta.reason as string).startsWith('parse_failed:')).toBe(
       true,
     )
+  }, 5_000)
+})
+
+// ──────────────────────────────────────────────────────────────────────
+// Partial delivery (Codex review 2026-06-05 MED #1): a failure AFTER the
+// first chunk shipped must NOT dead-letter the claim — an operator retry
+// would duplicate the already-visible head of the answer. The claim is
+// confirmed (consumed) and `router.outbox.partial_delivery` is logged.
+// A failure on chunk 0 keeps the old dead-letter semantics.
+// ──────────────────────────────────────────────────────────────────────
+
+describe('deliverClaim partial delivery (format=auto)', () => {
+  let fx: Fixture
+  const ownerChat = '164795011'
+
+  beforeEach(() => {
+    fx = setupFixture()
+  })
+  afterEach(() => {
+    cleanupFixture(fx)
+  })
+
+  test('second chunk fails → claim consumed, partial_delivery logged, no dead-letter', async () => {
+    // Failing spy: first sendMessage succeeds, the rest throw.
+    let calls = 0
+    const api: MultichatTelegramApi = {
+      sendMessage: async () => {
+        calls++
+        if (calls > 1) throw new Error('network blip')
+        return { message_id: 1 } as unknown as Awaited<
+          ReturnType<MultichatTelegramApi['sendMessage']>
+        >
+      },
+      sendChatAction: async () => {},
+    }
+    const policy = makePolicy({
+      chats: { [ownerChat]: makeChatPolicy() },
+      allowlist_users: [ownerChat],
+    })
+    const router = new MultichatRouter({
+      policy,
+      pool: fx.pool as unknown as TmuxSessionPool,
+      stateDir: fx.stateDir,
+      workspaceDir: fx.workspaceDir,
+      telegramApi: api,
+      logger: fx.loggerState.logger,
+    })
+    await seedOutboxFile(fx.stateDir, ownerChat, `${Date.now()}-part.json`, {
+      text: `${'абзац текста про воркшоп '.repeat(40)}\n\n`.repeat(10),
+      chat_id: ownerChat,
+      timestamp: '2026-06-05T00:00:00Z',
+      format: 'auto',
+    })
+
+    await router.start()
+    await new Promise((r) => setTimeout(r, 600))
+    await router.stop()
+
+    expect(calls).toBeGreaterThan(1)
+    // Logged as partial delivery…
+    expect(
+      fx.loggerState.logs.some((l) => l.msg === 'router.outbox.partial_delivery'),
+    ).toBe(true)
+    // …and NOT dead-lettered (no retry-able copy left behind).
+    const deadLetterDir = join(
+      fx.stateDir,
+      'chats',
+      ownerChat,
+      'outbox',
+      'dead-letter',
+    )
+    const entries = existsSync(deadLetterDir) ? readdirSync(deadLetterDir) : []
+    expect(entries.length).toBe(0)
   }, 5_000)
 })
 

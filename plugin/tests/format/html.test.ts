@@ -6,6 +6,7 @@ import {
   isTelegramHtmlParseError,
   markdownToTelegramHtml,
 } from '../../src/format/html.js'
+import { validateTelegramHtml } from '../../src/safety/html-validator.js'
 
 describe('escapeHtml / escapeHtmlAttr', () => {
   test('escapes ampersand angle brackets in plain text', () => {
@@ -111,6 +112,55 @@ describe('markdownToTelegramHtml', () => {
 
   test('handles empty string', () => {
     expect(markdownToTelegramHtml('')).toBe('')
+  })
+
+  // Balance-aware safe-tag stashing (2026-06-05): a lone safe tag in prose
+  // must be escaped, not preserved — preserved-verbatim it reaches Telegram
+  // as an unclosed tag and trips the validator's whole-message plain-text
+  // downgrade, mangling every other tag into literal &lt;b&gt; text.
+  describe('unbalanced safe tags', () => {
+    test('lone <pre> in prose is escaped while markdown bold still converts', () => {
+      const md = '**Жирный заголовок** и вопрос: ты видишь ДВА окна (два сообщения с <pre>) в личке?'
+      const html = markdownToTelegramHtml(md)
+      expect(html).toContain('<b>Жирный заголовок</b>')
+      expect(html).toContain('&lt;pre&gt;')
+      expect(html).not.toContain('(два сообщения с <pre>)')
+      // The whole point: the rendered body must survive pre-send validation.
+      expect(validateTelegramHtml(html).downgraded).toBe(false)
+    })
+
+    test('balanced agent-written pair still survives verbatim', () => {
+      const html = markdownToTelegramHtml('see <pre>raw block</pre> and <b>bold</b>')
+      expect(html).toContain('<pre>raw block</pre>')
+      expect(html).toContain('<b>bold</b>')
+      expect(validateTelegramHtml(html).downgraded).toBe(false)
+    })
+
+    test('mismatched closing tag is escaped, surrounding pair kept', () => {
+      const html = markdownToTelegramHtml('<i>a</b>b</i> tail')
+      expect(html).toContain('<i>a&lt;/b&gt;b</i>')
+      expect(validateTelegramHtml(html).downgraded).toBe(false)
+    })
+
+    test('improperly nested tags are all escaped rather than shipped broken', () => {
+      const html = markdownToTelegramHtml('<b>a<pre>b</b> c')
+      expect(html).toContain('&lt;b&gt;a&lt;pre&gt;b&lt;/b&gt; c')
+      expect(html).not.toContain('<b>')
+      expect(validateTelegramHtml(html).downgraded).toBe(false)
+    })
+
+    test('void <br> is kept without a closing pair, </br> is escaped', () => {
+      const html = markdownToTelegramHtml('line<br>break</br>')
+      expect(html).toContain('line<br>break')
+      expect(html).toContain('&lt;/br&gt;')
+      expect(validateTelegramHtml(html).downgraded).toBe(false)
+    })
+
+    test('nested same-name pairs survive', () => {
+      const html = markdownToTelegramHtml('<b>out <b>in</b> out</b>')
+      expect(html).toContain('<b>out <b>in</b> out</b>')
+      expect(validateTelegramHtml(html).downgraded).toBe(false)
+    })
   })
 })
 

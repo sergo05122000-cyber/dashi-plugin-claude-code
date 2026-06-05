@@ -29,6 +29,8 @@ import { readdir, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import type { TelegramApi } from '../channel/tools.js'
+import { splitMessage } from '../format/chunk.js'
+import { markdownToTelegramHtml } from '../format/html.js'
 import type { Logger } from '../log.js'
 import {
   assertValidChatId,
@@ -785,22 +787,71 @@ export class MultichatRouter {
     // were delivered as literal text — regressing PR #22 which made
     // 'html' the default for the channel reply tool.
     //
-    // We deliberately do NOT call markdownToTelegramHtml here: the
-    // outbox writer (the tmux-side reply tool) owns text shape — the
-    // router is a thin transport. A writer that wants markdown→HTML
-    // conversion must do it before the outbox file lands; this mirrors
-    // how the in-process channel reply tool calls markdownToTelegramHtml
-    // before pushing to sendMessage.
-    if (message.format === 'html') {
+    // For 'html' / 'markdown' / 'text' we deliberately do NOT call
+    // markdownToTelegramHtml here: the outbox writer (the tmux-side
+    // reply tool) owns text shape — the router is a thin transport. A
+    // writer that wants markdown→HTML conversion must do it before the
+    // outbox file lands; this mirrors how the in-process channel reply
+    // tool calls markdownToTelegramHtml before pushing to sendMessage.
+    //
+    // 'auto' (2026-06-05) is the explicit opt-in for writers that
+    // cannot convert on their side — the Python Stop hook. The router
+    // converts markdown→HTML with the SAME converter the reply tool
+    // uses (one implementation, no Python re-impl drift) and chunks at
+    // the same 4000-char boundary so a long group answer doesn't trip
+    // Telegram's 4096 cap. safe-telegram-api still validates/redacts
+    // each chunk on the way out.
+    let text = message.text
+    if (message.format === 'auto') {
+      text = markdownToTelegramHtml(text)
+      opts.parse_mode = 'HTML'
+    } else if (message.format === 'html') {
       opts.parse_mode = 'HTML'
     } else if (message.format === 'markdown') {
       opts.parse_mode = 'MarkdownV2'
     }
     // format === 'text' → omit parse_mode entirely.
+    //
+    // Partial-delivery policy for multi-chunk sends (Codex review
+    // 2026-06-05, MED #1): if chunk 0 fails, nothing reached the user —
+    // dead-letter the claim like any single-message failure (operator
+    // retry is safe). If a LATER chunk fails, the head of the answer is
+    // already user-visible — retrying the whole payload would duplicate
+    // it, so we log `partial_delivery` and CONFIRM the claim instead
+    // (same «never duplicate the user-visible message» stance as the
+    // confirm-failure path below).
+    let sentChunks = 0
     try {
-      await this.telegramApi.sendMessage(chatId, message.text, opts)
+      const chunks = message.format === 'auto' ? splitMessage(text) : [text]
+      for (let i = 0; i < chunks.length; i++) {
+        // reply_to threads only the first chunk — mirrors the reply
+        // tool's chunking contract (no quote-spam on long answers).
+        const chunkOpts = i === 0 ? opts : { ...opts }
+        if (i > 0) delete chunkOpts.reply_to_message_id
+        await this.telegramApi.sendMessage(chatId, chunks[i] as string, chunkOpts)
+        sentChunks++
+      }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err)
+      if (sentChunks > 0) {
+        this.logger.error('router.outbox.partial_delivery', {
+          chat_id: chatId,
+          original: claim.originalName,
+          sent_chunks: sentChunks,
+          error: reason,
+        })
+        await confirmOutboxClaim(claim).catch((confirmErr: unknown) => {
+          this.logger.warn('router.outbox.confirm_failed', {
+            chat_id: chatId,
+            original: claim.originalName,
+            error:
+              confirmErr instanceof Error
+                ? confirmErr.message
+                : String(confirmErr),
+          })
+        })
+        return
+      }
       this.logger.warn('router.outbox.send_failed', {
         chat_id: chatId,
         error: reason,

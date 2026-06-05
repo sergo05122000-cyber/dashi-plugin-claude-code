@@ -421,7 +421,11 @@ def main() -> int:
         "text": assistant_text,
         "chat_id": chat_id,  # strictly from env, never from transcript
         "timestamp": now_iso,
-        "format": "text",
+        # 'auto' (2026-06-05): the router converts markdown -> Telegram HTML
+        # with the shared TS converter and chunks at 4000 chars. The previous
+        # hardcoded 'text' shipped agent markdown as literal **bold** into
+        # group chats (no parse_mode at all).
+        "format": "auto",
     }
 
     final_path = outbox_dir / build_filename()

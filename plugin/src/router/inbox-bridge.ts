@@ -100,8 +100,17 @@ export type InboundMessage = {
 // because the only known in-tree writer path is the channel reply
 // tool itself (PR #22), which uses 'html' by default and converts
 // markdown→HTML before shipping.
+//
+// 'auto' (2026-06-05): the router runs `markdownToTelegramHtml` over
+// the payload at send time, then ships with parse_mode='HTML'. This
+// is the contract for writers that CANNOT convert on their side —
+// concretely the Python Stop hook (stop-to-outbox.py), which used to
+// hardcode `format: 'text'` and shipped agent markdown as literal
+// `**bold**` into group chats. One TS converter serves both the
+// in-process reply tool and the tmux outbox path; the router stays a
+// thin transport for every other format value (opt-in only).
 export const OutboxMessageFormatSchema = z
-  .enum(['html', 'markdown', 'text'])
+  .enum(['auto', 'html', 'markdown', 'text'])
   .default('html')
 export type OutboxMessageFormat = z.infer<typeof OutboxMessageFormatSchema>
 

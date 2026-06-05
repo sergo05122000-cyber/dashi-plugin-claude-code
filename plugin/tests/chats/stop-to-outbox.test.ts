@@ -148,7 +148,9 @@ describe('stop-to-outbox.py — extraction', () => {
     const payload = readOutboxPayload(files[0]!)
     expect(payload.text).toBe('final answer')
     expect(payload.chat_id).toBe(CHAT_ID)
-    expect(payload.format).toBe('text')
+    // 'auto' (2026-06-05): router converts markdown→HTML at send time —
+    // the Python hook cannot run the TS converter itself.
+    expect(payload.format).toBe('auto')
     expect(typeof payload.timestamp).toBe('string')
     expect((payload.timestamp as string).length).toBeGreaterThan(0)
   })
