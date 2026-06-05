@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 import {
   checkAllowlist,
+  checkFleet,
+  envValue,
+  hookPortsInSettings,
+  parseUnitFile,
+  type FleetAgent,
   checkCommsConsistency,
   checkSettingsHooks,
   checkVersion,
@@ -349,5 +354,145 @@ describe('report aggregation', () => {
   test('redact masks secret-key assignments regardless of value shape', () => {
     expect(redact('TELEGRAM_WEBHOOK_TOKEN=super-secret-xyz')).not.toContain('super-secret-xyz')
     expect(redact('"MY_SECRET":"whatever-123"')).not.toContain('whatever-123')
+  })
+})
+
+describe('fleet (multi-agent) checks', () => {
+  const agent = (over: Partial<FleetAgent>): FleetAgent => ({
+    name: 'a',
+    unitPath: '/etc/systemd/system/channel-a.service',
+    sockets: ['channel-a'],
+    envPath: '/etc/dashi-plugin/a/channel.env',
+    envReadable: true,
+    port: '8089',
+    tokenDigest: 'digest-a',
+    stateDir: '/var/lib/dashi-channel/a',
+    workspaceRoot: '/srv/agents/a',
+    webhookEnabled: true,
+    hookPorts: ['8089'],
+    ...over,
+  })
+  const byId = (checks: Check[]): Record<string, Check> => Object.fromEntries(checks.map((c) => [c.id, c]))
+
+  test('parseUnitFile extracts EnvironmentFile and per-Exec-line sockets', () => {
+    const unit = [
+      '[Service]',
+      'EnvironmentFile=/etc/dashi-plugin/arthas/channel.env',
+      "ExecStart=/usr/bin/tmux -L channel-arthas new-session -d -s channel-arthas 'claude ...'",
+      'ExecStartPost=/usr/local/bin/confirm.sh',
+      'ExecStop=/usr/bin/tmux -L channel-arthas kill-session -t channel-arthas',
+    ].join('\n')
+    const parsed = parseUnitFile(unit)
+    expect(parsed.envPath).toBe('/etc/dashi-plugin/arthas/channel.env')
+    expect(parsed.sockets).toEqual(['channel-arthas'])
+  })
+
+  test('parseUnitFile: default socket registers as empty string; mixed sockets both appear', () => {
+    const unit = [
+      'ExecStart=/usr/bin/tmux new-session -d -s channel-thrall claude',
+      'ExecStop=/usr/bin/tmux -L other kill-session -t channel-thrall',
+    ].join('\n')
+    const parsed = parseUnitFile(unit)
+    expect(parsed.sockets.sort()).toEqual(['', 'other'])
+  })
+
+  test('envValue picks the first assignment and trims', () => {
+    expect(envValue('A=1\nTELEGRAM_WEBHOOK_PORT=8103\n', 'TELEGRAM_WEBHOOK_PORT')).toBe('8103')
+    expect(envValue('TELEGRAM_WEBHOOK_PORT=\n', 'TELEGRAM_WEBHOOK_PORT')).toBeNull()
+  })
+
+  test('hookPortsInSettings finds webhook ports in hook commands', () => {
+    const raw = JSON.stringify({ hooks: { Stop: [{ hooks: [{ command: "X bun 'http://127.0.0.1:8103/hooks/agent'".replace('X', "TELEGRAM_WEBHOOK_URL='http://127.0.0.1:8103/hooks/agent'") }] }] } })
+    expect(hookPortsInSettings(raw)).toEqual(['8103'])
+    expect(hookPortsInSettings(null)).toEqual([])
+  })
+
+  test('healthy two-agent fleet passes everything', () => {
+    const checks = byId(checkFleet([
+      agent({ name: 'thrall', sockets: [''], port: '8093', tokenDigest: 'd1', stateDir: '/s/1', workspaceRoot: '/w/1', hookPorts: ['8093'] }),
+      agent({ name: 'arthas', sockets: ['channel-arthas'], port: '8103', tokenDigest: 'd2', stateDir: '/s/2', workspaceRoot: '/w/2', hookPorts: ['8103'] }),
+    ], '{"hooks":{}}'))
+    expect(checks['fleet-size']?.status).toBe('pass')
+    expect(checks['fleet-ports-unique']?.status).toBe('pass')
+    expect(checks['fleet-tokens-unique']?.status).toBe('pass')
+    // exactly one agent on the default socket = warn (recommendation), not fail
+    expect(checks['fleet-sockets']?.status).toBe('warn')
+    expect(checks['fleet-shared-settings']?.status).toBe('pass')
+    expect(checks['fleet-webhook-enabled']?.status).toBe('pass')
+    expect(checks['fleet-hook-ports']?.status).toBe('pass')
+  })
+
+  test('duplicate port / token / socket fail with agent names', () => {
+    const checks = byId(checkFleet([
+      agent({ name: 'a', port: '8089', tokenDigest: 'same', sockets: ['s1'] }),
+      agent({ name: 'b', port: '8089', tokenDigest: 'same', sockets: ['s1'], stateDir: '/s/b', workspaceRoot: '/w/b' }),
+    ], null))
+    expect(checks['fleet-ports-unique']?.status).toBe('fail')
+    expect(checks['fleet-ports-unique']?.detail).toContain('a & b')
+    expect(checks['fleet-tokens-unique']?.status).toBe('fail')
+    expect(checks['fleet-sockets']?.status).toBe('fail')
+  })
+
+  test('two agents both on the default socket = fail, not warn', () => {
+    const checks = byId(checkFleet([
+      agent({ name: 'a', sockets: [''] }),
+      agent({ name: 'b', sockets: [''], port: '8090', tokenDigest: 'd2', stateDir: '/s/b', workspaceRoot: '/w/b' }),
+    ], null))
+    expect(checks['fleet-sockets']?.status).toBe('fail')
+  })
+
+  test('inconsistent -L inside one unit = fail', () => {
+    const checks = byId(checkFleet([agent({ sockets: ['x', 'y'] })], null))
+    expect(checks['fleet-sockets']?.status).toBe('fail')
+    expect(checks['fleet-sockets']?.detail).toContain('disagree')
+  })
+
+  test('channel hooks in the shared settings = fail', () => {
+    const shared = JSON.stringify({ hooks: { Stop: [{ marker: 'dashi-channel-hook', hooks: [{ command: 'bun post-hook.ts' }] }] } })
+    const checks = byId(checkFleet([agent({})], shared))
+    expect(checks['fleet-shared-settings']?.status).toBe('fail')
+  })
+
+  test('webhook disabled or state config missing = warn with reason', () => {
+    const checks = byId(checkFleet([
+      agent({ name: 'off', webhookEnabled: false }),
+      agent({ name: 'missing', webhookEnabled: null, port: '8090', tokenDigest: 'd2', stateDir: '/s/2', workspaceRoot: '/w/2' }),
+    ], null))
+    expect(checks['fleet-webhook-enabled']?.status).toBe('warn')
+    expect(checks['fleet-webhook-enabled']?.detail).toContain('off (enabled=false)')
+    expect(checks['fleet-webhook-enabled']?.detail).toContain('missing (state config missing)')
+  })
+
+  test('hooks pointing at a foreign port = fail (the last-install-wins disaster)', () => {
+    const checks = byId(checkFleet([agent({ name: 'arthas', port: '8103', hookPorts: ['8093'] })], null))
+    expect(checks['fleet-hook-ports']?.status).toBe('fail')
+    expect(checks['fleet-hook-ports']?.detail).toContain('8093')
+  })
+
+  test('unreadable env degrades to warn, not crash', () => {
+    const checks = byId(checkFleet([
+      agent({}),
+      agent({ name: 'locked', envReadable: false, port: null, tokenDigest: null, stateDir: null, workspaceRoot: null, webhookEnabled: null, hookPorts: [], sockets: ['s2'] }),
+    ], null))
+    expect(checks['fleet-env-readable']?.status).toBe('warn')
+    expect(checks['fleet-env-readable']?.detail).toContain('locked')
+  })
+
+  test('empty fleet fails discovery', () => {
+    const checks = byId(checkFleet([], null))
+    expect(checks['fleet-size']?.status).toBe('fail')
+  })
+
+  test('token digests never expose the token in any rendered output', () => {
+    const checks = checkFleet([agent({ tokenDigest: 'a'.repeat(64) })], null)
+    const text = renderReport(checks)
+    expect(text).not.toContain('a'.repeat(64))
+  })
+})
+
+describe('fleet discovery filter', () => {
+  test('units without tmux Exec lines are not channels', () => {
+    const helper = parseUnitFile('ExecStart=/usr/bin/python3 /srv/listener.py\nEnvironmentFile=/etc/x.env')
+    expect(helper.sockets).toEqual([])
   })
 })
