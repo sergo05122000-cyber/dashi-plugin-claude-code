@@ -619,11 +619,11 @@ describe('checkProgressSurfaces — exactly one activity surface', () => {
   })
   test('tmux mirror alone passes', () => {
     const c = checkProgressSurfaces({ tmux_mirror: { enabled: true, pane_target: 'channel-x:0.0' } })
-    expect(c.status).toBe('ok')
+    expect(c.status).toBe('pass')
   })
   test('empty config passes (defaults are all-off since 2026-06-09)', () => {
     const c = checkProgressSurfaces({})
-    expect(c.status).toBe('ok')
+    expect(c.status).toBe('pass')
   })
   test('unreadable config is a warn, not a crash', () => {
     const c = checkProgressSurfaces('not an object')
