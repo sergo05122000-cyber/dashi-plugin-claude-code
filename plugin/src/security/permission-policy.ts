@@ -33,6 +33,7 @@
 // owns stdin/stdout, the loopback POST, and the bounded-deadline wait.
 
 import { resolve } from 'path'
+import { z } from 'zod'
 
 export type PermissionTier = 'allow' | 'deny' | 'confirm'
 
@@ -62,6 +63,39 @@ export interface PolicyScope {
   readonly allow?: PolicyRules
 }
 
+// Strict runtime schema for an operator-supplied policy (Codex high,
+// 2026-06-09). The hook validates parsed YAML against this before trusting
+// it; on any failure it discards the file and falls back to confirm-everything
+// so a typo'd/hostile policy can never silently widen the allow surface.
+// `.strict()` rejects unknown keys (e.g. a misspelled `allows:` that would
+// otherwise be ignored and leave the intended rule un-applied).
+const PolicyRulesSchema = z
+  .object({
+    tools: z.array(z.string()).optional(),
+    read_paths: z.array(z.string()).optional(),
+    write_paths: z.array(z.string()).optional(),
+    bash_patterns: z.array(z.string()).optional(),
+  })
+  .strict()
+
+const PolicyScopeSchema = z
+  .object({
+    deny: PolicyRulesSchema.optional(),
+    confirm: PolicyRulesSchema.optional(),
+    allow: PolicyRulesSchema.optional(),
+  })
+  .strict()
+
+export const PermissionPolicySchema = z
+  .object({
+    default_tier: z.enum(['allow', 'confirm']).optional(),
+    deny: PolicyRulesSchema.optional(),
+    confirm: PolicyRulesSchema.optional(),
+    allow: PolicyRulesSchema.optional(),
+    scopes: z.record(z.string(), PolicyScopeSchema).optional(),
+  })
+  .strict()
+
 export interface PermissionPolicy {
   /**
    * Tier for a tool call that matches no deny/confirm/allow rule.
@@ -82,6 +116,11 @@ export interface PermissionPolicy {
 
 // Tools that cannot mutate state or exfiltrate data. Under default_tier
 // "confirm" these still auto-allow so read-only work never blocks.
+//
+// WebSearch / WebFetch are deliberately NOT here (Codex high, 2026-06-09):
+// a search query or fetched URL is an outbound channel that can exfiltrate
+// context, so they must not be classified as inherently safe. They fall to
+// default_tier (confirm under Variant 2) and can be operator-allowlisted.
 const READ_ONLY_TOOLS = new Set<string>([
   'Read',
   'Glob',
@@ -89,7 +128,6 @@ const READ_ONLY_TOOLS = new Set<string>([
   'LS',
   'NotebookRead',
   'TodoWrite',
-  'WebSearch',
 ])
 
 // Tools that take a filesystem path we must policy-check.
@@ -119,25 +157,10 @@ const BUILTIN_DENY_PATHS: readonly string[] = [
   '/proc/*/cmdline',
 ]
 
-// Catastrophic / unrecoverable shell — denied even under confirm-everything.
-// These match via substring (lowercased) OR glob when meta present.
-const BUILTIN_DENY_BASH: readonly string[] = [
-  'rm -rf /',
-  'rm -rf /*',
-  'rm -rf ~',
-  'rm -fr /',
-  ':(){ :|:& };:', // fork bomb
-  'mkfs',
-  'dd if=*of=/dev/sd*',
-  '> /dev/sda',
-  'chmod -R 777 /',
-  'chown -R * /',
-]
-
 // Risky-but-legitimate shell that must reach the owner as a confirm when the
-// operator policy hasn't already classified it. Interpreter/exfil evasion
-// vectors live here so a clever command can't silently auto-allow under
-// default_tier "allow".
+// operator policy hasn't already classified it. Substring match (lowercased).
+// Interpreter/exfil evasion (curl|sh with any spacing) is handled separately
+// by `bashConfirmEvasion` so a clever command can't silently auto-allow.
 const BUILTIN_CONFIRM_BASH: readonly string[] = [
   'sudo ',
   'rm -rf ',
@@ -145,14 +168,8 @@ const BUILTIN_CONFIRM_BASH: readonly string[] = [
   'git push',
   'git reset --hard',
   'git clean -',
-  'curl * | sh',
-  'curl * | bash',
-  'wget * | sh',
-  'wget * | bash',
-  'base64 -d* | sh',
-  'base64 -d* | bash',
-  'chmod -R',
-  'chown -R',
+  'chmod -r',
+  'chown -r',
   'systemctl',
   'kill ',
   'pkill',
@@ -162,6 +179,177 @@ const BUILTIN_CONFIRM_BASH: readonly string[] = [
   'apt install',
   'apt-get install',
 ]
+
+// ── Catastrophic Bash detection (Codex Critical #4, 2026-06-09) ─────────
+//
+// Substring matching let `rm -r -f /`, `rm -rf -- /`, `dd … of=/dev/nvme0n1`
+// and `wipefs -a /dev/sda` slip past the old literal list. We tokenize each
+// top-level shell segment instead. This is a best-effort backstop, NOT the
+// sole secret/destructive boundary (that is `env -i` isolation + this gate's
+// fail-closed posture): a sufficiently obfuscated command (eval of a base64
+// blob, variable-built paths) can still evade — those route through the
+// built-in confirm tier or operator policy instead.
+
+// Block-device families a destructive write must never target unconfirmed.
+const BLOCK_DEVICE_RE = /\/dev\/(sd|nvme|vd|hd|disk|mmcblk|xvd|loop|dm-)/i
+
+// Root / home targets that turn a recursive delete into a catastrophe.
+const ROOT_TARGET_RE = /^(\/\*?|~\/?|\$\{?home\}?\/?|\/root\/?\*?|\/home\/?\*?|\.\/?\*)$/i
+
+// Fork bomb, tolerant of internal spacing: `:(){ :|:& };:` and variants.
+const FORK_BOMB_RE = /:\s*\(\s*\)\s*\{[^}]*\|[^}]*&[^}]*\}\s*;\s*:/
+
+// Secret/credential references inside a Bash command (Codex Critical #2).
+// Mirrors BUILTIN_DENY_PATHS for the Read/Write path tools: `cat .env`,
+// `grep … ~/.aws/credentials`, `tar cz ~/.ssh`, `cat /proc/$$/environ` must
+// hard-deny just like a Read of the same file. A leading boundary char keeps
+// `environment`/`monkey.json`-style false positives out.
+const SECRET_BASH_RES: readonly RegExp[] = [
+  /(^|[\s'"=:(/<>|&;])\.env($|[\s'".)/<>|&;]|\.[a-z0-9_-]+)/i,
+  /\.pem\b/i,
+  /\.key\b/i,
+  /(^|[\s'"=:(/<>|&;])\.?secrets?\//i,
+  /\bid_rsa\b/i,
+  /\bid_dsa\b/i,
+  /\bid_ecdsa\b/i,
+  /\bid_ed25519\b/i,
+  /(^|[\s'"=:(/<>|&;])\.ssh($|[\s/'".)<>|&;])/i,
+  /(^|[\s'"=:(/<>|&;])\.aws($|[\s/'".)<>|&;])/i,
+  /\.config\/gcloud\b/i,
+  /\.claude\/\.credentials/i,
+  /\.codex\/auth/i,
+  /\.credentials\b/i,
+  /\/proc\/[0-9$]+\/(environ|cmdline)/i,
+]
+
+/** Split a command on top-level shell operators. Best-effort, not quote-aware:
+ *  over-segmentation can only MISS a cross-segment catastrophe (acceptable for
+ *  a backstop — catastrophic ops live in a single segment). */
+function segmentBash(command: string): string[] {
+  return command
+    .split(/&&|\|\||;|\n|\||&/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+}
+
+/** True if any flag token carries `letter` (combined like -rf, or long form). */
+function hasFlag(args: readonly string[], letter: string, longNames: readonly string[]): boolean {
+  const l = letter.toLowerCase()
+  for (const t of args) {
+    if (!t.startsWith('-')) continue
+    if (t.startsWith('--')) {
+      if (longNames.includes(t.slice(2).toLowerCase())) return true
+      continue
+    }
+    if (t.slice(1).toLowerCase().includes(l)) return true
+  }
+  return false
+}
+
+/** Non-flag operands of a segment, honoring `--` end-of-options. */
+function operands(args: readonly string[]): string[] {
+  const out: string[] = []
+  let endOpts = false
+  for (const a of args) {
+    if (a === '--') { endOpts = true; continue }
+    if (!endOpts && a.startsWith('-')) continue
+    out.push(a)
+  }
+  return out
+}
+
+// Command prefixes that wrap the real command (`sudo rm -rf /`, `env … dd …`).
+// We strip them — plus their flags and VAR=val env assignments — so the
+// catastrophe check sees the actual command, not the wrapper.
+const COMMAND_WRAPPERS = new Set([
+  'sudo', 'doas', 'env', 'nice', 'nohup', 'command', 'builtin', 'exec', 'setsid', 'stdbuf', 'ionice',
+])
+
+function stripWrappers(tokens: readonly string[]): string[] {
+  let rest = tokens.slice()
+  // Bound the loop so a pathological all-wrapper line can't spin.
+  for (let i = 0; i < 8 && rest.length > 0; i += 1) {
+    const head = (rest[0]!.split('/').pop() ?? rest[0]!).toLowerCase()
+    if (!COMMAND_WRAPPERS.has(head)) break
+    rest = rest.slice(1)
+    // Drop wrapper flags and env assignments (VAR=val) that precede the command.
+    while (rest.length > 0 && (rest[0]!.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(rest[0]!))) {
+      rest = rest.slice(1)
+    }
+  }
+  return rest
+}
+
+function catastrophicSegment(seg: string): string | null {
+  const rawTokens = seg.split(/\s+/).filter(Boolean)
+  const tokens = stripWrappers(rawTokens)
+  if (tokens.length === 0) return null
+  const cmd = (tokens[0]!.split('/').pop() ?? tokens[0]!).toLowerCase()
+  const args = tokens.slice(1)
+
+  if (cmd === 'rm') {
+    const recursive = hasFlag(args, 'r', ['recursive'])
+    const force = hasFlag(args, 'f', ['force'])
+    const noPreserve = args.some((a) => a.toLowerCase() === '--no-preserve-root')
+    const hitsRoot = operands(args).some((t) => ROOT_TARGET_RE.test(t))
+    if ((recursive && force && hitsRoot) || (noPreserve && (recursive || force))) {
+      return `rm recursive-force on root target`
+    }
+  }
+
+  if (cmd === 'dd' && args.some((a) => /^of=/i.test(a) && BLOCK_DEVICE_RE.test(a))) {
+    return `dd to block device`
+  }
+
+  if (cmd.startsWith('mkfs')) return `mkfs filesystem create`
+  if (cmd === 'wipefs') return `wipefs signature wipe`
+  if (cmd === 'blkdiscard') return `blkdiscard`
+  if (cmd === 'shred' && operands(args).some((p) => BLOCK_DEVICE_RE.test(p))) return `shred block device`
+
+  if (cmd === 'chmod' || cmd === 'chown') {
+    const recursive = hasFlag(args, 'r', ['recursive'])
+    // chmod/chown: first operand is mode/owner, the rest are paths.
+    const paths = operands(args).slice(1)
+    if (recursive && paths.some((p) => ROOT_TARGET_RE.test(p))) {
+      return `${cmd} -R on root target`
+    }
+  }
+
+  // Truncating-redirect onto a raw block device: `> /dev/sda`.
+  if (/>\s*/.test(seg) && BLOCK_DEVICE_RE.test(seg) && /(^|[\s>])\/dev\//.test(seg)) {
+    if (/>\s*\/dev\//.test(seg) && BLOCK_DEVICE_RE.test(seg)) return `redirect onto block device`
+  }
+
+  return null
+}
+
+/** Built-in catastrophic hard-deny over the whole command. Returns the matched
+ *  rule label, or null. Fail-closed callers treat any non-null as deny. */
+function builtinBashHardDeny(command: string): string | null {
+  if (FORK_BOMB_RE.test(command)) return 'fork-bomb'
+  for (const seg of segmentBash(command)) {
+    const hit = catastrophicSegment(seg)
+    if (hit) return hit
+  }
+  return null
+}
+
+/** Built-in secret-path hard-deny over a Bash command. */
+function bashReferencesSecret(command: string): boolean {
+  return SECRET_BASH_RES.some((re) => re.test(command))
+}
+
+/** Interpreter/exfil pipe evasion that must reach the owner as a confirm,
+ *  tolerant of any spacing around the pipe (`curl x|sh`, `wget … | bash`,
+ *  `base64 -d | sh`, `… | sudo …`). */
+function bashConfirmEvasion(commandLower: string): boolean {
+  const pipeInterp = /\|\s*(sudo\s+)?(sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php)\b/.test(commandLower)
+  const downloader = /\b(curl|wget|fetch)\b/.test(commandLower)
+  const b64 = /\bbase64\s+(-d|--decode)\b/.test(commandLower)
+  if ((downloader || b64) && pipeInterp) return true
+  if (/\|\s*sudo\b/.test(commandLower)) return true
+  return false
+}
 
 /**
  * Minimal glob matcher supporting `*`, `?`, and `**`.
@@ -317,10 +505,21 @@ function extractPath(toolInput: Record<string, unknown>): string | undefined {
   return typeof fp === 'string' && fp.length > 0 ? fp : undefined
 }
 
-function extractCommand(toolName: string, toolInput: Record<string, unknown>): string | undefined {
-  if (toolName !== 'Bash') return undefined
+type CommandExtract =
+  | { readonly kind: 'not_bash' }
+  | { readonly kind: 'malformed' }
+  | { readonly kind: 'ok'; readonly command: string }
+
+// A Bash call MUST carry a non-empty string command. Anything else
+// (missing field, wrong type, empty string) is malformed and — under
+// bypassPermissions where there is no native prompt — must fail CLOSED to
+// deny, never silently fall through to default_tier allow (Codex high:
+// the old code returned '' here and an empty command auto-allowed).
+function extractCommand(toolName: string, toolInput: Record<string, unknown>): CommandExtract {
+  if (toolName !== 'Bash') return { kind: 'not_bash' }
   const cmd = toolInput.command
-  return typeof cmd === 'string' ? cmd : ''
+  if (typeof cmd !== 'string' || cmd.trim().length === 0) return { kind: 'malformed' }
+  return { kind: 'ok', command: cmd }
 }
 
 const MAX_COMMAND_LEN = 100_000
@@ -336,12 +535,15 @@ export interface ClassifyInput {
 /**
  * Classify one tool call. Pure, fail-closed.
  *
- * Order:
- *   1. Validate shape — malformed → deny.
- *   2. Built-in hard-deny (paths + bash) — operator cannot relax.
+ * Order (Codex Critical #3 fix — built-in confirm now beats operator allow,
+ * matching the deny > confirm > allow precedence the operator policy itself
+ * obeys; an operator allow can no longer wave through sudo / git push / pipe-
+ * to-interpreter):
+ *   1. Validate shape — malformed tool name or malformed Bash → deny.
+ *   2. Built-in hard-deny (secret paths, secret-bash, catastrophic bash) —
+ *      operator cannot relax.
  *   3. Operator deny (global ∪ scope).
- *   4. Built-in confirm bash (interpreter/exfil/destructive) unless operator
- *      already allowed it.
+ *   4. Built-in confirm bash (interpreter/exfil/destructive) — UNCONDITIONAL.
  *   5. Operator confirm.
  *   6. Operator allow.
  *   7. default_tier (read-only tools always allow).
@@ -359,23 +561,35 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
 
   const rawPath = extractPath(ti)
   const pathCands = rawPath !== undefined ? pathCandidates(rawPath) : undefined
-  const rawCommand = extractCommand(toolName, ti)
+
+  // Bash command extraction is fail-closed: a Bash call with a missing/empty
+  // command is malformed and denies (never falls through to default allow).
+  const cmdEx = extractCommand(toolName, ti)
+  if (cmdEx.kind === 'malformed') {
+    return { tier: 'deny', reason: 'malformed Bash call: missing or empty command', matchedRule: 'builtin:malformed_bash' }
+  }
+  const rawCommand = cmdEx.kind === 'ok' ? cmdEx.command : undefined
   if (rawCommand !== undefined && rawCommand.length > MAX_COMMAND_LEN) {
     return { tier: 'deny', reason: 'bash command exceeds size cap', matchedRule: 'builtin:command-too-long' }
   }
   const commandLower = rawCommand !== undefined ? rawCommand.toLowerCase() : undefined
 
-  // 2. Built-in hard-deny — paths (read & write tools) + catastrophic bash.
+  // 2. Built-in hard-deny — secret paths (read & write tools).
   if (pathCands && (READ_PATH_TOOLS.has(toolName) || WRITE_PATH_TOOLS.has(toolName))) {
     const hit = matchPathRules(BUILTIN_DENY_PATHS, pathCands)
     if (hit) {
       return { tier: 'deny', reason: `secret/credential path blocked: ${hit}`, matchedRule: `builtin:deny_path:${hit}` }
     }
   }
-  if (commandLower !== undefined) {
-    const hit = matchBashRules(BUILTIN_DENY_BASH, commandLower)
-    if (hit) {
-      return { tier: 'deny', reason: `catastrophic command blocked: ${hit}`, matchedRule: `builtin:deny_bash:${hit}` }
+  // 2b. Built-in hard-deny — Bash. Catastrophic commands AND secret-path
+  // references (cat .env, grep ~/.aws/credentials, …) both hard-deny.
+  if (rawCommand !== undefined) {
+    const catastrophic = builtinBashHardDeny(rawCommand)
+    if (catastrophic) {
+      return { tier: 'deny', reason: `catastrophic command blocked: ${catastrophic}`, matchedRule: `builtin:deny_bash:${catastrophic}` }
+    }
+    if (bashReferencesSecret(rawCommand)) {
+      return { tier: 'deny', reason: 'secret/credential reference in Bash command blocked', matchedRule: 'builtin:deny_bash_secret' }
     }
   }
 
@@ -390,15 +604,15 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     return { tier: 'deny', reason: `policy deny (${denyHit})`, matchedRule: `deny:${denyHit}` }
   }
 
-  // An explicit operator allow can short-circuit built-in confirm bash
-  // (e.g. operator allow-lists `git push` to a known repo). Compute it now.
-  const allowHit = rulesMatch(allowRules, toolName, pathCands, commandLower)
-
-  // 4. Built-in confirm bash — unless the operator explicitly allowed it.
-  if (commandLower !== undefined && !allowHit) {
+  // 4. Built-in confirm bash — UNCONDITIONAL (no operator-allow short-circuit).
+  // Substring list + spacing-tolerant interpreter/exfil evasion detection.
+  if (commandLower !== undefined) {
     const hit = matchBashRules(BUILTIN_CONFIRM_BASH, commandLower)
     if (hit) {
       return { tier: 'confirm', reason: `risky command needs confirmation: ${hit}`, matchedRule: `builtin:confirm_bash:${hit}` }
+    }
+    if (bashConfirmEvasion(commandLower)) {
+      return { tier: 'confirm', reason: 'pipe-to-interpreter download needs confirmation', matchedRule: 'builtin:confirm_bash:pipe-interpreter' }
     }
   }
 
@@ -409,6 +623,7 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
   }
 
   // 6. Operator allow.
+  const allowHit = rulesMatch(allowRules, toolName, pathCands, commandLower)
   if (allowHit) {
     return { tier: 'allow', reason: `policy allow (${allowHit})`, matchedRule: `allow:${allowHit}` }
   }

@@ -106,6 +106,60 @@ describe('loadPolicy', () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+  test('schema-invalid policy (unknown key) → confirm fallback (Codex high)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pgh-'))
+    try {
+      const p = join(dir, 'permission-policy.yaml')
+      // `allows:` is a typo of `allow:` — strict schema rejects, so the whole
+      // file is discarded rather than silently applying a partial policy.
+      writeFileSync(p, 'default_tier: allow\nallows:\n  bash_patterns:\n    - rm\n')
+      const { policy, warning } = loadPolicy(p)
+      expect(policy.default_tier).toBe('confirm')
+      expect(warning).toContain('schema invalid')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+  test('schema-invalid policy (wrong type) → confirm fallback', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pgh-'))
+    try {
+      const p = join(dir, 'permission-policy.yaml')
+      writeFileSync(p, 'default_tier: maybe\n')
+      const { policy, warning } = loadPolicy(p)
+      expect(policy.default_tier).toBe('confirm')
+      expect(warning).toContain('schema invalid')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('decideLocal fail-closed (Codex Critical #1 / high)', () => {
+  test('malformed Bash (no command) → deny, never allow', () => {
+    const d = decideLocal({
+      envelope: { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: {} },
+      policy: ALLOW_POLICY,
+      scope: 'main',
+    })
+    expect(d.action).toBe('emit')
+    expect(JSON.parse(d.stdout!).hookSpecificOutput.permissionDecision).toBe('deny')
+  })
+  test('catastrophic Bash → deny even under default allow', () => {
+    const d = decideLocal({
+      envelope: { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'sudo rm -rf --no-preserve-root /' } },
+      policy: ALLOW_POLICY,
+      scope: 'main',
+    })
+    expect(JSON.parse(d.stdout!).hookSpecificOutput.permissionDecision).toBe('deny')
+  })
+  test('secret read via Bash → deny', () => {
+    const d = decideLocal({
+      envelope: { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'cat .env' } },
+      policy: ALLOW_POLICY,
+      scope: 'main',
+    })
+    expect(JSON.parse(d.stdout!).hookSpecificOutput.permissionDecision).toBe('deny')
+  })
 })
 
 describe('resolvePolicyPath', () => {

@@ -36,6 +36,7 @@ import { load as parseYaml, JSON_SCHEMA } from 'js-yaml'
 
 import {
   classifyToolCall,
+  PermissionPolicySchema,
   type PermissionPolicy,
   type PermissionVerdict,
 } from '../src/security/permission-policy.js'
@@ -96,7 +97,18 @@ export function loadPolicy(path: string): { policy: PermissionPolicy; warning?: 
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return { policy: FALLBACK_POLICY, warning: 'policy not an object; fallback' }
   }
-  return { policy: parsed as PermissionPolicy }
+  // Strict schema validation (Codex high): an unknown/misspelled key or a
+  // wrong-typed rule list discards the whole file rather than silently
+  // applying a partial policy that could widen the allow surface.
+  const result = PermissionPolicySchema.safeParse(parsed)
+  if (!result.success) {
+    const summary = result.error.issues
+      .map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`)
+      .join('; ')
+      .slice(0, 200)
+    return { policy: FALLBACK_POLICY, warning: `policy schema invalid (${summary}); confirm-everything fallback` }
+  }
+  return { policy: result.data as PermissionPolicy }
 }
 
 // ── confirm-tier request building ───────────────────────────────────────
@@ -297,18 +309,32 @@ async function runConfirm(req: ConfirmRequest): Promise<ConfirmDecision> {
   return mapConfirmResponse(payload)
 }
 
+// Fail-closed exit (Codex Critical #1, 2026-06-09): under bypassPermissions
+// there is no native prompt, so emitting NOTHING means the tool RUNS. Every
+// path where we cannot positively classify a PreToolUse call must emit an
+// explicit deny instead of returning silently. The hook is registered for
+// PreToolUse only, so an unreadable/unparseable envelope is a PreToolUse we
+// failed to inspect — deny it.
+function failClosed(reason: string): void {
+  warn(reason)
+  emit(renderDeny(reason))
+}
+
 async function main(): Promise<void> {
   const raw = await readStdin()
-  if (raw.trim().length === 0) return
+  if (raw.trim().length === 0) {
+    failClosed('empty stdin (no tool envelope); fail-closed')
+    return
+  }
   let envelope: unknown
   try {
     envelope = JSON.parse(raw)
   } catch {
-    warn('stdin not valid JSON')
+    failClosed('stdin not valid JSON; fail-closed')
     return
   }
   if (envelope === null || typeof envelope !== 'object' || Array.isArray(envelope)) {
-    warn('stdin payload not an object')
+    failClosed('stdin payload not an object; fail-closed')
     return
   }
   const env = process.env
@@ -357,5 +383,7 @@ const isMainModule = (() => {
 })()
 
 if (isMainModule) {
-  await main().catch((err) => warn(err instanceof Error ? err.message : 'unknown error'))
+  // Top-level fail-closed: any unexpected throw emits a deny rather than
+  // exiting silently (which under bypassPermissions would run the tool).
+  await main().catch((err) => failClosed(err instanceof Error ? err.message : 'unknown error; fail-closed'))
 }
