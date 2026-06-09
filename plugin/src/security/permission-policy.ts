@@ -194,7 +194,8 @@ const BUILTIN_CONFIRM_BASH: readonly string[] = [
 const BLOCK_DEVICE_RE = /\/dev\/(sd|nvme|vd|hd|disk|mmcblk|xvd|loop|dm-)/i
 
 // Root / home targets that turn a recursive delete into a catastrophe.
-const ROOT_TARGET_RE = /^(\/\*?|~\/?|\$\{?home\}?\/?|\/root\/?\*?|\/home\/?\*?|\.\/?\*)$/i
+// `\/+\*?` catches `/`, `//`, `///*` etc. (Codex high: `rm -rf //` evaded).
+const ROOT_TARGET_RE = /^(\/+\*?|~\/?|\$\{?home\}?\/?|\/root\/?\*?|\/home\/?\*?|\.\/?\*)$/i
 
 // Fork bomb, tolerant of internal spacing: `:(){ :|:& };:` and variants.
 const FORK_BOMB_RE = /:\s*\(\s*\)\s*\{[^}]*\|[^}]*&[^}]*\}\s*;\s*:/
@@ -219,7 +220,8 @@ const SECRET_BASH_RES: readonly RegExp[] = [
   /\.claude\/\.credentials/i,
   /\.codex\/auth/i,
   /\.credentials\b/i,
-  /\/proc\/[0-9$]+\/(environ|cmdline)/i,
+  // /proc env/cmdline exfil — numeric pid, $$/$PPID, self, thread-self.
+  /\/proc\/(self|thread-self|[0-9]+|\$[a-z]*)\/(environ|cmdline)/i,
 ]
 
 /** Split a command on top-level shell operators. Best-effort, not quote-aware:
@@ -306,6 +308,19 @@ function catastrophicSegment(seg: string): string | null {
   if (cmd === 'blkdiscard') return `blkdiscard`
   if (cmd === 'shred' && operands(args).some((p) => BLOCK_DEVICE_RE.test(p))) return `shred block device`
 
+  // Writing a file onto a raw block device clobbers the disk (Codex high:
+  // `cp image.iso /dev/sda`, `truncate -s0 /dev/sda`, `tee /dev/sda`).
+  if ((cmd === 'cp' || cmd === 'mv' || cmd === 'tee' || cmd === 'truncate') && operands(args).some((p) => BLOCK_DEVICE_RE.test(p))) {
+    return `${cmd} onto block device`
+  }
+
+  // `find <root> -delete` / `find <root> -exec rm …` recursively wipes a tree.
+  if (cmd === 'find') {
+    const hasDestructive = args.some((a) => a === '-delete' || a === '-exec' || a === '-execdir')
+    const rootScope = operands(args).some((p) => ROOT_TARGET_RE.test(p))
+    if (hasDestructive && rootScope) return `find destructive on root scope`
+  }
+
   if (cmd === 'chmod' || cmd === 'chown') {
     const recursive = hasFlag(args, 'r', ['recursive'])
     // chmod/chown: first operand is mode/owner, the rest are paths.
@@ -339,14 +354,25 @@ function bashReferencesSecret(command: string): boolean {
   return SECRET_BASH_RES.some((re) => re.test(command))
 }
 
-/** Interpreter/exfil pipe evasion that must reach the owner as a confirm,
- *  tolerant of any spacing around the pipe (`curl x|sh`, `wget … | bash`,
- *  `base64 -d | sh`, `… | sudo …`). */
+/** Interpreter/exfil pipe evasion that must reach the owner as a confirm.
+ *  Tolerant of spacing, absolute interpreter paths (`| /bin/bash`), wrapper
+ *  prefixes (`| env bash`, `| sudo bash`), process/command substitution
+ *  (`bash <(curl …)`, `sh -c "$(curl …)"`) and base64-decode-to-interpreter
+ *  (Codex high — the old detector missed all of these). */
+const INTERPRETER_RE = /\b(sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php)\b/
+const DOWNLOADER_RE = /\b(curl|wget|fetch)\b/
+
 function bashConfirmEvasion(commandLower: string): boolean {
-  const pipeInterp = /\|\s*(sudo\s+)?(sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php)\b/.test(commandLower)
-  const downloader = /\b(curl|wget|fetch)\b/.test(commandLower)
-  const b64 = /\bbase64\s+(-d|--decode)\b/.test(commandLower)
-  if ((downloader || b64) && pipeInterp) return true
+  // Pipe to an interpreter, allowing sudo/env wrappers and absolute paths.
+  if (/\|\s*(sudo\s+|env\s+)*(\/\S+\/)?(sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php)\b/.test(commandLower)) {
+    return true
+  }
+  // Downloader + interpreter present anywhere in the command — covers pipes,
+  // process substitution `<(curl …)`, and command substitution `$(curl …)`.
+  if (DOWNLOADER_RE.test(commandLower) && INTERPRETER_RE.test(commandLower)) return true
+  // base64 decode feeding an interpreter.
+  if (/\bbase64\s+(-d|--decode)\b/.test(commandLower) && INTERPRETER_RE.test(commandLower)) return true
+  // Pipe to sudo (privilege escalation of piped data).
   if (/\|\s*sudo\b/.test(commandLower)) return true
   return false
 }
@@ -561,6 +587,13 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
 
   const rawPath = extractPath(ti)
   const pathCands = rawPath !== undefined ? pathCandidates(rawPath) : undefined
+
+  // A write tool with no usable file_path is malformed — we cannot policy-check
+  // the target, so under bypassPermissions it must fail closed to deny rather
+  // than fall through to default_tier allow (Codex high, mirrors malformed Bash).
+  if (WRITE_PATH_TOOLS.has(toolName) && rawPath === undefined) {
+    return { tier: 'deny', reason: `malformed ${toolName} call: missing file_path`, matchedRule: 'builtin:malformed_path' }
+  }
 
   // Bash command extraction is fail-closed: a Bash call with a missing/empty
   // command is malformed and denies (never falls through to default allow).

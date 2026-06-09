@@ -160,6 +160,23 @@ describe('decideLocal fail-closed (Codex Critical #1 / high)', () => {
     })
     expect(JSON.parse(d.stdout!).hookSpecificOutput.permissionDecision).toBe('deny')
   })
+  test('envelope with NO hook_event_name → deny (was passthrough fail-open)', () => {
+    const d = decideLocal({
+      envelope: { tool_name: 'Bash', tool_input: { command: 'rm x' } },
+      policy: ALLOW_POLICY,
+      scope: 'main',
+    })
+    expect(d.action).toBe('emit')
+    expect(JSON.parse(d.stdout!).hookSpecificOutput.permissionDecision).toBe('deny')
+  })
+  test('a genuine non-PreToolUse event still passes through (empty stdout)', () => {
+    const d = decideLocal({
+      envelope: { hook_event_name: 'PostToolUse', tool_name: 'Bash' },
+      policy: ALLOW_POLICY,
+      scope: 'main',
+    })
+    expect(d).toEqual({ action: 'emit', stdout: '' })
+  })
 })
 
 describe('resolvePolicyPath', () => {

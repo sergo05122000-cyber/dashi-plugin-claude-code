@@ -33,8 +33,11 @@ export function parsePgateCallback(data: string): PgateCallbackPayload | null {
 }
 
 // Structural subset of grammY's callback_query Context the handler needs.
+// messageId is the id of the message the tapped keyboard is attached to
+// (ctx.callbackQuery.message.message_id) — used to bind a tap to the exact
+// pending request so a stale keyboard can't resolve a later, id-reusing one.
 export interface PgateCallbackContext {
-  callbackQuery: { data: string }
+  callbackQuery: { data: string; messageId?: number }
   from: { id: number }
   answerCallbackQuery(arg?: { text?: string }): Promise<void>
 }
@@ -44,6 +47,9 @@ export interface PermissionGateUi {
   sendPrompt(requestId: string): Promise<void>
   /** Dispatch a `pgate:*` callback. Returns true if it consumed the event. */
   handlePgateCallback(ctx: PgateCallbackContext): Promise<boolean>
+  /** Strip the keyboard + mark a card as expired (used on relay timeout so a
+   *  stale Allow button can't resolve a future request that reuses the id). */
+  clearKeyboard(chatId: string, messageId: number, note: string): Promise<void>
 }
 
 export interface PermissionGateUiDeps {
@@ -131,6 +137,24 @@ export function createPermissionGateUi(deps: PermissionGateUiDeps): PermissionGa
     }
 
     const pendingBefore = relay.getPending(parsed.requestId)
+
+    // Message-id binding (Codex high): only resolve when the tapped keyboard
+    // belongs to THIS pending request's message. A short id can be reused once
+    // its 60s tombstone expires; without this, a stale Allow button left on an
+    // old (e.g. timed-out) card could resolve a later request that reused the
+    // id. When the context carries no message id we fall through (older grammy
+    // paths) — the auth + idempotency guards still apply.
+    if (
+      pendingBefore
+      && ctx.callbackQuery.messageId !== undefined
+      && pendingBefore.telegramMessageId !== undefined
+      && ctx.callbackQuery.messageId !== pendingBefore.telegramMessageId
+    ) {
+      log.warn('permission_gate tap message-id mismatch (stale keyboard)', { request_id: parsed.requestId })
+      await ctx.answerCallbackQuery({ text: 'Запрос уже закрыт' }).catch(() => {})
+      return true
+    }
+
     const status = relay.answer(parsed.requestId, parsed.behavior)
 
     if (status === 'idempotent') {
@@ -161,5 +185,16 @@ export function createPermissionGateUi(deps: PermissionGateUiDeps): PermissionGa
     return true
   }
 
-  return { sendPrompt, handlePgateCallback }
+  async function clearKeyboard(chatId: string, messageId: number, note: string): Promise<void> {
+    await telegramApi
+      .editMessageText(chatId, messageId, `🔐 <b>Запрос подтверждения</b>\n\n<b>${escapeHtml(note)}</b>`, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [] },
+      })
+      .catch((err) => {
+        log.warn('permission_gate clearKeyboard failed', { error: err instanceof Error ? err.message : String(err) })
+      })
+  }
+
+  return { sendPrompt, handlePgateCallback, clearKeyboard }
 }

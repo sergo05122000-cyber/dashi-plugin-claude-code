@@ -227,7 +227,10 @@ export interface WebhookDeps {
   // either is undefined (or the feature is disabled in config) the route
   // answers 503 / pass_through and the hook fails closed to deny.
   permissionRelay?: PermissionGateRelay
-  permissionUi?: { sendPrompt(requestId: string): Promise<void> }
+  permissionUi?: {
+    sendPrompt(requestId: string): Promise<void>
+    clearKeyboard?(chatId: string, messageId: number, note: string): Promise<void>
+  }
 }
 
 export interface WebhookServerHandle {
@@ -1012,6 +1015,7 @@ async function handlePermissionRequest(
 
   // Fresh request → send the keyboard. Replay / sync-resolution → skip
   // (requestId undefined means the relay already has a verdict).
+  let sentMessageId: number | undefined
   if (requestId !== undefined) {
     writePermissionAuditEvent(statePaths, log, {
       event: 'request_created',
@@ -1024,6 +1028,10 @@ async function handlePermissionRequest(
     })
     try {
       await permissionUi.sendPrompt(requestId)
+      // Capture the keyboard's message id while the request is still pending so
+      // we can strip it on timeout (Codex high: a left-over Allow button could
+      // resolve a future id-reusing request).
+      sentMessageId = permissionRelay.getPending(requestId)?.telegramMessageId
     } catch (err) {
       // If we can't deliver the keyboard the warchief can never tap → there is
       // no point waiting out the timeout. Fail closed immediately.
@@ -1051,6 +1059,10 @@ async function handlePermissionRequest(
       reply(res, 200, { status: 'allow' })
       return
     case 'timeout':
+      // Strip the stale keyboard so a late tap can't resolve a future request.
+      if (sentMessageId !== undefined && permissionUi.clearKeyboard) {
+        await permissionUi.clearKeyboard(chatId, sentMessageId, 'Истёк (нет ответа)').catch(() => {})
+      }
       reply(res, 200, { status: 'timeout', reason: verdict.reason ?? `no tap in ${effectiveTimeoutMs}ms` })
       return
     case 'deny':

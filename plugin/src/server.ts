@@ -661,8 +661,12 @@ bot.on('callback_query:data', async ctx => {
   // its prefix never collides with `ask:` or the headless `perm:*` flow.
   if (data.startsWith('pgate:')) {
     try {
+      const pgateMessageId = ctx.callbackQuery.message?.message_id
       await permissionGateUi.handlePgateCallback({
-        callbackQuery: { data },
+        callbackQuery: {
+          data,
+          ...(pgateMessageId !== undefined ? { messageId: pgateMessageId } : {}),
+        },
         from: { id: ctx.from.id },
         answerCallbackQuery: async arg => {
           if (arg) await ctx.answerCallbackQuery(arg)

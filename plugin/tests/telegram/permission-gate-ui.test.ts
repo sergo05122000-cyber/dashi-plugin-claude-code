@@ -118,6 +118,32 @@ describe('permission-gate UI', () => {
     expect(toast).toBe('Разрешено')
   })
 
+  test('tap from a stale keyboard (message-id mismatch) does NOT resolve the relay', async () => {
+    const { api } = makeTelegramApi()
+    const { relay, answered } = makeFakeRelay({ telegramMessageId: 5 })
+    const ui = createPermissionGateUi({ config, log, telegramApi: api, relay })
+    let toast: string | undefined
+    await ui.handlePgateCallback({
+      callbackQuery: { data: 'pgate:allow:abcde', messageId: 999 }, // != 5
+      from: { id: 164795011 },
+      answerCallbackQuery: async (arg) => { toast = arg?.text },
+    })
+    expect(answered).toHaveLength(0)
+    expect(toast).toBe('Запрос уже закрыт')
+  })
+
+  test('tap with the matching message-id resolves normally', async () => {
+    const { api } = makeTelegramApi()
+    const { relay, answered } = makeFakeRelay({ telegramMessageId: 5 })
+    const ui = createPermissionGateUi({ config, log, telegramApi: api, relay })
+    await ui.handlePgateCallback({
+      callbackQuery: { data: 'pgate:allow:abcde', messageId: 5 },
+      from: { id: 164795011 },
+      answerCallbackQuery: async () => {},
+    })
+    expect(answered).toEqual([{ id: 'abcde', behavior: 'allow' }])
+  })
+
   test('unauthorized tap is rejected and does NOT resolve the relay', async () => {
     const { api } = makeTelegramApi()
     const { relay, answered } = makeFakeRelay({ telegramMessageId: 5 })

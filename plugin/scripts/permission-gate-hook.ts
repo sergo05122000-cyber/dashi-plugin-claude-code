@@ -234,7 +234,16 @@ export function decideLocal(args: {
   readonly scope: string
 }): LocalDecision {
   const { envelope, policy, scope } = args
-  if (envelope.hook_event_name !== 'PreToolUse') {
+  const event = envelope.hook_event_name
+  // The hook is registered for PreToolUse ONLY. A well-formed envelope for some
+  // OTHER known event (defensive — if an operator also wires it elsewhere) is a
+  // genuine passthrough. But a MISSING or non-string event is a malformed
+  // PreToolUse and must fail closed to deny (Codex Critical: a JSON object with
+  // no hook_event_name used to passthrough → the tool ran).
+  if (typeof event !== 'string' || event.length === 0) {
+    return { action: 'emit', stdout: renderDeny('malformed hook envelope: missing hook_event_name; fail-closed') }
+  }
+  if (event !== 'PreToolUse') {
     return { action: 'emit', stdout: '' }
   }
   const verdict = classifyToolCall({
@@ -318,6 +327,12 @@ async function runConfirm(req: ConfirmRequest): Promise<ConfirmDecision> {
 function failClosed(reason: string): void {
   warn(reason)
   emit(renderDeny(reason))
+  // Belt-and-suspenders (Codex Critical #1): also signal deny via exit code 2.
+  // Claude Code treats a PreToolUse hook exiting 2 as a block even if it can't
+  // parse the stdout JSON — so a partial-write / encoding mishap on the deny
+  // JSON still fails closed. Set exitCode (not process.exit) so any in-flight
+  // stdout flush completes first.
+  process.exitCode = 2
 }
 
 async function main(): Promise<void> {
