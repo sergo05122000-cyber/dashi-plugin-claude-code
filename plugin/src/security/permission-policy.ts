@@ -415,13 +415,83 @@ const GIT_HOOKS_WRITE_RE = /(\.git\/hooks\/|core\.hookspath)/i
 const GIT_ENV_INDIRECTION_RE =
   /\b(git_ssh|git_ssh_command|git_askpass|ssh_askpass|git_proxy_command|git_external_diff|git_config_global|git_config_system|git_config_count|git_config_key_[0-9]+|git_config_value_[0-9]+)\s*=/i
 
+/**
+ * Quote-aware split on top-level `|`/`&`/`;`/newline. Unlike segmentBash
+ * (which may over-segment inside quotes — fine for the catastrophic backstop),
+ * the git-exec-surface check needs BOTH directions safe:
+ *   - `git show X | grep -c "Y"` must split at the pipe (else grep's `-c` is
+ *     blamed on git — live false positive, 2026-06-09);
+ *   - `git --work-tree="a|b" -c evil push` must NOT split inside the quotes
+ *     (else the `-c` lands in a git-less segment and the check is evaded).
+ * Returns null on unbalanced quoting — caller falls back to the conservative
+ * whole-string scan (fail-closed).
+ */
+export function segmentBashQuoteAware(command: string): string[] | null {
+  const segs: string[] = []
+  let cur = ''
+  let quote: "'" | '"' | null = null
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i] as string
+    if (quote === "'") {
+      cur += ch
+      if (ch === "'") quote = null
+      continue
+    }
+    if (quote === '"') {
+      if (ch === '\\') {
+        cur += ch + (command[i + 1] ?? '')
+        i++
+        continue
+      }
+      cur += ch
+      if (ch === '"') quote = null
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      cur += ch
+      continue
+    }
+    if (ch === '\\') {
+      cur += ch + (command[i + 1] ?? '')
+      i++
+      continue
+    }
+    if (ch === '|' || ch === '&' || ch === ';' || ch === '\n') {
+      segs.push(cur)
+      cur = ''
+      continue
+    }
+    cur += ch
+  }
+  if (quote !== null) return null
+  segs.push(cur)
+  return segs.map((s) => s.trim()).filter((s) => s.length > 0)
+}
+
 function gitExecSurface(commandLower: string): boolean {
-  return (
-    GIT_DASH_C_RE.test(commandLower) ||
-    GIT_FLAG_RE.test(commandLower) ||
-    GIT_HOOKS_WRITE_RE.test(commandLower) ||
-    GIT_ENV_INDIRECTION_RE.test(commandLower)
-  )
+  // Hook-path writes and env indirection are segment-independent.
+  if (GIT_HOOKS_WRITE_RE.test(commandLower) || GIT_ENV_INDIRECTION_RE.test(commandLower)) return true
+  // Fast path: if no config/exec flag appears ANYWHERE, no segmentation can
+  // create one (segments are substrings) — definitively safe.
+  if (!GIT_DASH_C_RE.test(commandLower) && !GIT_FLAG_RE.test(commandLower)) return false
+  // A flag matched somewhere. We only narrow to per-segment scanning (to
+  // suppress a pipeline neighbour's flag, e.g. `git show X | grep -c Y`) when
+  // there is NO shell indirection. Indirection ($var, $(...), `...`, arrays,
+  // wrapper functions) can route argv INTO git from another segment (Codex
+  // Critical: `g(){ git "$@"; }; g -c core.sshCommand=evil fetch`), so we fall
+  // back to the whole-command scan — at least as strict as the pre-segment
+  // behaviour. (Residual, pre-existing in that behaviour too: a flag that
+  // appears textually BEFORE git via a variable — `c='-c …'; git $c` — is not
+  // caught here; closing that needs real argv resolution, out of scope.)
+  if (/[$`]/.test(commandLower)) {
+    return GIT_DASH_C_RE.test(commandLower) || GIT_FLAG_RE.test(commandLower)
+  }
+  const segs = segmentBashQuoteAware(commandLower)
+  if (segs === null) return true // unbalanced quotes → fail-closed
+  // Indirection-free, balanced: the flag can only belong to git if a
+  // git-bearing segment literally carries it.
+  return segs.some((s) => /\bgit\b/.test(s) && (GIT_DASH_C_RE.test(s) || GIT_FLAG_RE.test(s)))
 }
 
 const INTERPRETER_RE = /\b(sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php)\b/
@@ -486,6 +556,16 @@ function bashMatch(pattern: string, commandLower: string): boolean {
   const pat = pattern.toLowerCase()
   const hasMeta = pat.includes('*') || pat.includes('?')
   if (!hasMeta) {
+    // Token-start match, not bare substring: `kill ` must not fire inside
+    // `skill ` / `overkill ` (live false positive: a heredoc mentioning
+    // "material-builder skill + schema" raised a confirm card, 2026-06-09).
+    // A word-ish char right before the pattern means we are inside a longer
+    // token — applies only to patterns that start with a letter/digit, so
+    // operator patterns like `.env` or `-rf ` keep substring semantics.
+    if (/^[a-z0-9]/.test(pat)) {
+      const escaped = pat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      return new RegExp(`(?<![a-z0-9_-])${escaped}`).test(commandLower)
+    }
     return commandLower.includes(pat)
   }
   // Bash commands routinely contain slashes (paths, URLs), so `*` must cross

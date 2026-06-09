@@ -99,6 +99,61 @@ describe('built-in confirm bash (interpreter/exfil evasion)', () => {
     expect(v.tier).toBe('confirm')
     expect(v.matchedRule).toContain('builtin:confirm_bash')
   })
+  test('`kill ` does NOT fire inside `skill ` / `overkill ` (token-start, live FP 2026-06-09)', () => {
+    // A heredoc mentioning "material-builder skill + schema" raised a real
+    // confirm card; substring matching must not treat word tails as commands.
+    expect(classify('Bash', { command: 'echo "material-builder skill + schema" > notes.md' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'echo this gate is overkill sometimes' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'cat skills/material-builder.md' }, VARIANT1).tier).toBe('allow')
+  })
+  test('real kill / pkill / killall still confirm', () => {
+    expect(classify('Bash', { command: 'kill 1234' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'pkill -f gateway' }, VARIANT1).tier).toBe('confirm')
+    expect(classify('Bash', { command: 'cd /x && kill -9 99' }, VARIANT1).tier).toBe('confirm')
+  })
+  test('token-start applies to other word rules too: mydocker/unsudo do not confirm', () => {
+    expect(classify('Bash', { command: 'echo mydocker test' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'echo unsudo ish' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'docker ps' }, VARIANT1).tier).toBe('confirm')
+  })
+})
+
+describe('git-exec-surface is segment-scoped (live FP 2026-06-09)', () => {
+  test('`git show X | grep -c` does NOT confirm — the -c belongs to grep', () => {
+    const v = classify('Bash', { command: 'git show origin/main:file.ts | grep -c "MARKER"' }, VARIANT1)
+    expect(v.matchedRule ?? '').not.toContain('git-exec-surface')
+    expect(v.tier).toBe('allow')
+  })
+  test('`git log | wc -c` and `git diff; grep -c x f` do not confirm', () => {
+    expect(classify('Bash', { command: 'git log --oneline | wc -c' }, VARIANT1).tier).toBe('allow')
+    expect(classify('Bash', { command: 'git diff --stat; grep -c x file' }, VARIANT1).tier).toBe('allow')
+  })
+  test('real git -c still confirms, including -c hidden behind a quoted pipe (anti-evasion)', () => {
+    expect(classify('Bash', { command: 'git -c core.sshcommand=evil push origin main' }, VARIANT1).matchedRule).toContain('git-exec-surface')
+    // The quoted | must NOT split the segment — the -c stays attributed to git.
+    expect(classify('Bash', { command: 'git --work-tree="a|b" -c core.sshcommand=evil push' }, VARIANT1).matchedRule).toContain('git-exec-surface')
+  })
+  test('shell indirection → whole-command scan, wrapper-fn -c still confirms (Codex Critical)', () => {
+    // A wrapper routes argv into git; the per-segment narrowing must NOT apply
+    // when indirection is present — it falls back to the whole-command scan,
+    // which catches the git…-c ordering across the wrapper.
+    expect(classify('Bash', { command: 'g(){ git "$@"; }; g -c core.sshcommand=evil fetch origin' }, VARIANT1).matchedRule).toContain('git-exec-surface')
+  })
+  test('indirection does not over-block a benign $() with no config flag', () => {
+    expect(classify('Bash', { command: 'B=$(git rev-parse --abbrev-ref HEAD); echo $B' }, VARIANT1).tier).toBe('allow')
+  })
+  test('unbalanced quoting falls back to the conservative whole-string scan', () => {
+    const v = classify('Bash', { command: 'git show "unterminated | grep -c x' }, VARIANT1)
+    expect(v.matchedRule ?? '').toContain('git-exec-surface')
+  })
+  test('hooks-path writes and GIT_ env indirection confirm regardless of segmentation', () => {
+    expect(classify('Bash', { command: 'echo x > .git/hooks/pre-push | cat' }, VARIANT1).matchedRule).toContain('git-exec-surface')
+    // `git push` substring rule fires first here — what matters is it confirms.
+    expect(classify('Bash', { command: 'GIT_SSH_COMMAND=evil git push' }, VARIANT1).tier).toBe('confirm')
+    // With git push overridden, the env indirection must still confirm via the surface.
+    const overridden = { ...VARIANT1, confirm_overrides: { builtin_rules: ['git push'] } }
+    expect(classify('Bash', { command: 'GIT_SSH_COMMAND=evil git push' }, overridden).matchedRule).toContain('git-exec-surface')
+  })
 })
 
 describe('Variant 1 — smooth autonomy', () => {
