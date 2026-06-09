@@ -188,6 +188,23 @@ function stripAnsi(text: string): string {
   return text.replace(ANSI_RE, '').replace(CTRL_RE, '')
 }
 
+// Claude Code's pane decorates output with glyphs that iOS Telegram renders
+// with EMOJI presentation (⏺ U+23FA tool bullet, ⚠ U+26A0 warning). The
+// owner's style forbids emoji in any surface, so the mirror swaps them for
+// text-presentation equivalents and drops variation selectors entirely
+// (U+FE0E/U+FE0F would re-toggle presentation on some clients).
+const GLYPH_MAP: ReadonlyArray<readonly [RegExp, string]> = [
+  [/⏺/g, '●'], // ⏺ -> ● (BLACK CIRCLE renders as text)
+  [/⚠/g, '(!)'], // ⚠ -> (!)
+  [/[︎️]/g, ''], // variation selectors
+]
+
+function sanitizeTerminalGlyphs(text: string): string {
+  let out = text
+  for (const [re, repl] of GLYPH_MAP) out = out.replace(re, repl)
+  return out
+}
+
 function htmlEscape(text: string): string {
   return text
     .replace(/&/g, '&amp;')
@@ -325,7 +342,7 @@ export class TmuxMirror {
       const errMsg = `tmux unavailable: ${this.lastError.slice(0, 200)}`
       return renderBody('(no output)', errMsg, this.maxBodyChars)
     }
-    const cleaned = stripAnsi(result.stdout)
+    const cleaned = sanitizeTerminalGlyphs(stripAnsi(result.stdout))
     // Drop banner / warning / footer / input-box BEFORE redaction — the
     // filter's anchors look at the raw textual structure (box corners,
     // specific phrases, U+2500 separators) and must not be perturbed by
