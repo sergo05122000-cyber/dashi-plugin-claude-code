@@ -844,11 +844,29 @@ describe('checkSharedSettingsClean — invariant a outside --fleet', () => {
 describe('permission policy lint', () => {
   test('block-form confirm_overrides extracted', () => {
     const y = ['version: 1', 'confirm_overrides:', '  builtin_rules:', '    - "git push"', '    - sudo ', 'scopes: {}'].join('\n')
-    expect(extractConfirmOverrides(y)).toEqual(['git push', 'sudo'])
+    expect(extractConfirmOverrides(y)).toEqual({ rules: ['git push', 'sudo'], opaque: false })
   })
   test('inline-form confirm_overrides extracted', () => {
     const y = 'confirm_overrides:\n  builtin_rules: ["git push", "rm -rf "]\n'
-    expect(extractConfirmOverrides(y)).toEqual(['git push', 'rm -rf '])
+    expect(extractConfirmOverrides(y)).toEqual({ rules: ['git push', 'rm -rf '], opaque: false })
+  })
+  test('list items at the SAME indent as builtin_rules are read (review H1)', () => {
+    const y = 'confirm_overrides:\n  builtin_rules:\n  - "sudo "\n'
+    expect(extractConfirmOverrides(y).rules).toEqual(['sudo '])
+  })
+  test('trailing comment after an item does not corrupt the value (review H2)', () => {
+    const y = 'confirm_overrides:\n  builtin_rules:\n    - "sudo " # owner-approved?\n    - git push # narrow\n'
+    expect(extractConfirmOverrides(y).rules).toEqual(['sudo ', 'git push'])
+  })
+  test('inline list with a trailing comment still parses (review M1)', () => {
+    const y = 'confirm_overrides:\n  builtin_rules: ["sudo "] # note\n'
+    expect(extractConfirmOverrides(y).rules).toEqual(['sudo '])
+  })
+  test('flow-form confirm_overrides is OPAQUE → lint warns instead of passing (review M1)', () => {
+    const y = 'confirm_overrides: { builtin_rules: ["sudo "] }\n'
+    expect(extractConfirmOverrides(y).opaque).toBe(true)
+    const c = checkPermissionPolicy(y, '/p').find((x) => x.id === 'permission-policy-risky-override')
+    expect(c?.status).toBe('warn')
   })
   test('lifting sudo / rm -rf → FAIL; lifting only git push → pass', () => {
     const bad = 'confirm_overrides:\n  builtin_rules:\n    - "sudo "\n'
@@ -969,5 +987,83 @@ describe('matchAgentForPlugin', () => {
   })
   test('no match → null (no cross-agent false positive)', () => {
     expect(matchAgentForPlugin([agent('arthas', '/srv/a/plugin', '/srv/a/.claude')], '/srv/t/plugin')).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Review-round fixes (Codex + Fable double review, 2026-06-09)
+// ---------------------------------------------------------------------------
+
+describe('review fixes — bind, env mode, mirror, stop hook, envValue, redact', () => {
+  test('[::ffff:127.0.0.1] v4-mapped loopback PASSES webhook-bind (review M4)', () => {
+    expect(checkWebhookBind('8093', [{ addr: '[::ffff:127.0.0.1]', port: '8093' }]).status).toBe('pass')
+  })
+  test('env mode: other-write/other-exec FAIL, group-write FAIL (Codex High)', () => {
+    expect(checkEnvFileMode(0o100602, '/e').status).toBe('fail') // other-write
+    expect(checkEnvFileMode(0o100601, '/e').status).toBe('fail') // other-exec
+    expect(checkEnvFileMode(0o100620, '/e').status).toBe('fail') // group-write
+    expect(checkEnvFileMode(0o100640, '/e').status).toBe('warn') // group-read only
+    expect(checkEnvFileMode(0o100600, '/e').status).toBe('pass')
+  })
+  test('group chat (negative id) with mirror and NO explicit private mode → FAIL (Codex M)', () => {
+    expect(checkMultichatMirror([{ id: '-100123', mode: null, tmuxMirror: true }]).status).toBe('fail')
+    expect(checkMultichatMirror([{ id: '-100123', mode: 'privte', tmuxMirror: true }]).status).toBe('fail') // typo ≠ private
+    expect(checkMultichatMirror([{ id: '164795011', mode: null, tmuxMirror: true }]).status).toBe('pass') // positive id = DM
+  })
+  test('mirror profile: fallback-only Stop does NOT satisfy the primary Stop hook (Codex M)', () => {
+    const fallbackOnly = { hooks: { Stop: [hookEntry('dashi-channel-fallback-reply')] } }
+    const c = checkSettingsHooks(fallbackOnly, 'mirror').find((x) => x.id === 'hook-Stop')
+    expect(c?.status).toBe('warn')
+    expect(c?.detail).toContain('fallback')
+  })
+  test('envValue strips quotes, export and trailing comments (review M3)', () => {
+    expect(envValue('TELEGRAM_WEBHOOK_PORT="8093"', 'TELEGRAM_WEBHOOK_PORT')).toBe('8093')
+    expect(envValue("export TELEGRAM_STATE_DIR='/srv/state' # note", 'TELEGRAM_STATE_DIR')).toBe('/srv/state')
+  })
+  test('redact keeps 0.0.0.0 and 127.0.0.1 visible (interface literals, review L3)', () => {
+    expect(redact('port 8091 bound to 0.0.0.0')).toContain('0.0.0.0')
+    expect(redact('bound to 127.0.0.1')).toContain('127.0.0.1')
+    expect(redact('server at 100.104.191.127')).toContain('<ip>')
+  })
+  test('shared-settings markers: generic post-hook.ts alone no longer FAILS (review L2)', () => {
+    expect(checkSharedSettingsClean('{"hooks":{"Stop":[{"command":"bun my-post-hook.ts"}]}}', false).status).toBe('pass')
+    expect(checkSharedSettingsClean('{"hooks":{"Stop":[{"marker":"dashi-channel-fallback-reply"}]}}', false).status).toBe('fail')
+  })
+  test('spawn-chat-shell: TMUX_PANE only in a comment does NOT pass (Codex M)', () => {
+    expect(checkSpawnChatShell('# we forward TMUX_PANE here\nenv -i bash').status).toBe('fail')
+    expect(checkSpawnChatShell('env -i TMUX_PANE="${TMUX_PANE:-}" bash').status).toBe('pass')
+  })
+})
+
+describe('extractChatPolicies — bleed hardening (review M2)', () => {
+  test('block scalar content cannot rewrite the chat policy', () => {
+    const y = [
+      'chats:',
+      '  "-100200":',
+      '    mode: public',
+      '    tmux_mirror: false',
+      '    system_reminder: |',
+      '      mode: private',
+      '      tmux_mirror: true',
+    ].join('\n')
+    expect(extractChatPolicies(y)).toEqual([{ id: '-100200', mode: 'public', tmuxMirror: false }])
+  })
+  test('non-numeric sibling key (default template) closes the chat — no attribution bleed', () => {
+    const y = [
+      'chats:',
+      '  "-100200":',
+      '    mode: public',
+      '    tmux_mirror: false',
+      '  default:',
+      '    mode: private',
+      '    tmux_mirror: true',
+    ].join('\n')
+    expect(extractChatPolicies(y)).toEqual([{ id: '-100200', mode: 'public', tmuxMirror: false }])
+  })
+  test('deeper-nested mode under a sub-map is ignored (exact property indent only)', () => {
+    const y = ['chats:', '  "-100200":', '    delivery: final_only', '    sub:', '      mode: private', '    tmux_mirror: false'].join('\n')
+    const p = extractChatPolicies(y)
+    expect(p[0]?.mode).toBeNull()
+    expect(p[0]?.tmuxMirror).toBe(false)
   })
 })

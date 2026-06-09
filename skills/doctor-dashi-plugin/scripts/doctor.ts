@@ -117,8 +117,10 @@ export function redact(input: string): string {
   return redactSecretsStrict(input)
     // Privacy-only masking (NOT a secret): server IPs in output shown to
     // public groups. Kept out of redactSecretsStrict so the leak check
-    // doesn't false-positive on the loopback webhook URL.
-    .replace(/\b(\d{1,3}\.){3}\d{1,3}\b/g, '<ip>')
+    // doesn't false-positive on the loopback webhook URL. 0.0.0.0 and
+    // 127.0.0.0/8 are exempt — they identify interfaces, not servers, and
+    // masking them strips the actionable part of the webhook-bind FAIL.
+    .replace(/\b(?!0\.0\.0\.0\b)(?!127\.)(\d{1,3}\.){3}\d{1,3}\b/g, '<ip>')
 }
 
 /** Redact every string field of a check — the single boundary for safe output. */
@@ -345,7 +347,10 @@ export function checkSettingsHooks(settings: unknown, profile: HookProfile = 'un
   } else {
     // mirror / none profile: feeder hooks are NOT required — the tmux mirror
     // (or nothing) carries progress. Only the Stop delivery hook matters.
-    const stopWorking = hasWorkingHook(stopEntries, HOOK_MARKER) || hasWorkingHook(stopEntries, FALLBACK_MARKER)
+    // The fallback hook is a separate safety net and must NOT mask a missing
+    // primary Stop hook (it has its own check below).
+    const stopWorking = hasWorkingHook(stopEntries, HOOK_MARKER)
+    const fallbackOnly = !stopWorking && hasWorkingHook(stopEntries, FALLBACK_MARKER)
     out.push({
       id: 'hook-profile',
       title: `Hook profile: ${profile} (feeder hooks not required)`,
@@ -359,7 +364,7 @@ export function checkSettingsHooks(settings: unknown, profile: HookProfile = 'un
             id: 'hook-Stop',
             title: 'Hook registered: Stop (final-reply delivery)',
             status: 'warn',
-            detail: 'no Stop hook — read receipts and the silent-turn fallback never fire',
+            detail: fallbackOnly ? 'only the fallback-reply Stop hook is registered — the primary Stop delivery (read receipt) hook is missing' : 'no Stop hook — read receipts and the silent-turn fallback never fire',
             fix: 'run plugin/scripts/install-hooks.sh to register the Stop hook',
           },
     )
@@ -704,7 +709,10 @@ export function parseListeners(text: string): Listener[] {
   return out
 }
 
-const LOOPBACK_ADDR_RE = /^(127\.|\[::1\]$)/
+// 127.0.0.0/8, [::1], and the v4-mapped loopback form ([::ffff:127.0.0.1])
+// that ss/lsof emit for dual-stack sockets — a false security FAIL on a
+// legitimate loopback bind trains operators to ignore the check.
+const LOOPBACK_ADDR_RE = /^(127\.|\[::1\]$|\[::ffff:127\.)/
 
 /**
  * The plugin's hook webhook must listen on loopback ONLY. A 0.0.0.0 / public
@@ -743,8 +751,14 @@ export function checkEnvFileMode(mode: number | null, path: string): Check {
   const title = 'Channel env file is private (token inside)'
   if (mode === null) return { id, title, status: 'skip', detail: `cannot stat ${path}` }
   const bits = mode & 0o777
-  if (bits & 0o004) {
-    return { id, title, status: 'fail', detail: `${path} is world-readable (mode ${bits.toString(8)})`, fix: 'chmod 600 the env file — it holds the bot token' }
+  // ANY other-access fails (write is config injection on the next restart,
+  // read is token theft), and group-WRITE fails too — only group-read is a
+  // warn (sometimes a deliberate ops-group share).
+  if (bits & 0o007) {
+    return { id, title, status: 'fail', detail: `${path} is world-accessible (mode ${bits.toString(8)})`, fix: 'chmod 600 the env file — it holds the bot token and is sourced by the service' }
+  }
+  if (bits & 0o020) {
+    return { id, title, status: 'fail', detail: `${path} is group-writable (mode ${bits.toString(8)})`, fix: 'chmod 600 — a group member can inject config the service loads on restart' }
   }
   if (bits & 0o040) {
     return { id, title, status: 'warn', detail: `${path} is group-readable (mode ${bits.toString(8)})`, fix: 'chmod 600 unless the group share is deliberate' }
@@ -752,7 +766,9 @@ export function checkEnvFileMode(mode: number | null, path: string): Check {
   return { id, title, status: 'pass', detail: `mode ${bits.toString(8)}` }
 }
 
-const CHANNEL_HOOK_MARKERS_RE = /dashi-channel-hook|dashi-permission-gate-hook|dashi-ask-user-question-hook|post-hook\.ts|read-receipt-hook\.ts|fallback-reply-hook\.ts|permission-gate-hook\.ts/
+// Dashi-specific markers only: generic filenames like `post-hook.ts` belong
+// to anybody and made an unrelated tool's hook a hard FAIL (review L2).
+const CHANNEL_HOOK_MARKERS_RE = /dashi-channel-hook|dashi-permission-gate-hook|dashi-ask-user-question-hook|dashi-channel-fallback-reply/
 
 /**
  * Channel hooks in the USER-level ~/.claude/settings.json fire in EVERY
@@ -786,25 +802,47 @@ export function checkSharedSettingsClean(homeRaw: string | null, selectedIsHome:
 /** Built-in confirm rules that must NEVER be lifted via confirm_overrides. */
 export const DANGEROUS_OVERRIDE_RULES: readonly string[] = ['sudo ', 'rm -rf ', 'rm -fr ']
 
+/**
+ * One YAML scalar item: quoted → cut at the closing quote (a `#` inside quotes
+ * is data); bare → strip the ` # comment` tail. A trailing comment used to
+ * corrupt the value (`"sudo " # note` ≠ 'sudo ') and silently pass the lint.
+ */
+function yamlScalar(raw: string): string {
+  const s = raw.trim()
+  const quoted = s.match(/^(["'])(.*?)\1/)
+  if (quoted?.[2] !== undefined) return quoted[2]
+  return s.replace(/\s+#.*$/, '').trim()
+}
+
+export interface OverridesExtract {
+  rules: string[]
+  /** confirm_overrides present but in a form the extractor cannot read (flow map etc.). */
+  opaque: boolean
+}
+
 /** Items of `confirm_overrides: { builtin_rules: [...] }` — block or inline form. */
-export function extractConfirmOverrides(policyText: string): string[] {
+export function extractConfirmOverrides(policyText: string): OverridesExtract {
   const lines = policyText.split('\n')
-  const out: string[] = []
+  const rules: string[] = []
+  let opaque = false
   let inOverrides = false
   let inRules = false
   let rulesIndent = 0
   for (const line of lines) {
     if (/^\s*#/.test(line)) continue
-    const overrides = line.match(/^(\s*)confirm_overrides:\s*$/)
+    const overrides = line.match(/^(\s*)confirm_overrides:\s*(\S.*)?$/)
     if (overrides) {
-      inOverrides = true
+      // `confirm_overrides: { ... }` (flow form) — the line-based extractor
+      // cannot read it; a silent pass would invert the lint, so mark opaque.
+      if (overrides[2] !== undefined && overrides[2].trim() !== '') opaque = true
+      inOverrides = overrides[2] === undefined || overrides[2].trim() === ''
       inRules = false
       continue
     }
     if (inOverrides) {
-      const inline = line.match(/^\s*builtin_rules:\s*\[(.*)\]\s*$/)
+      const inline = line.match(/^\s*builtin_rules:\s*\[(.*)\]\s*(#.*)?$/)
       if (inline?.[1] !== undefined) {
-        out.push(...inline[1].split(',').map((s) => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean))
+        rules.push(...inline[1].split(',').map(yamlScalar).filter(Boolean))
         inOverrides = false
         continue
       }
@@ -814,10 +852,20 @@ export function extractConfirmOverrides(policyText: string): string[] {
         rulesIndent = (block[1] ?? '').length
         continue
       }
+      // builtin_rules with an unreadable payload on the same line.
+      if (/^\s*builtin_rules:/.test(line)) {
+        opaque = true
+        inOverrides = false
+        continue
+      }
       if (inRules) {
         const item = line.match(/^(\s*)-\s*(.+?)\s*$/)
-        if (item && (item[1] ?? '').length > rulesIndent) {
-          out.push((item[2] ?? '').replace(/^["']|["']$/g, ''))
+        // YAML allows list items at the key's OWN indent (`builtin_rules:` /
+        // `- "sudo "` at the same column) — `>` missed them and the sudo lint
+        // silently passed. A sibling key cannot match the `- ` regex, so >= is safe.
+        if (item && (item[1] ?? '').length >= rulesIndent) {
+          const v = yamlScalar(item[2] ?? '')
+          if (v) rules.push(v)
           continue
         }
         if (line.trim() !== '') {
@@ -829,7 +877,7 @@ export function extractConfirmOverrides(policyText: string): string[] {
       }
     }
   }
-  return out
+  return { rules, opaque }
 }
 
 /** First top-level `key: value` scalar in the policy text. */
@@ -846,19 +894,27 @@ export function checkPermissionPolicy(policyText: string | null, policyPath: str
   if (policyText.trim() === '') {
     return [{ id: 'permission-policy', title: 'Permission policy lint', status: 'warn', detail: `${policyPath} is empty — the gate falls back to confirm-everything`, fix: 'write a policy or remove the env override' }]
   }
-  const overrides = extractConfirmOverrides(policyText)
+  const { rules: overrides, opaque } = extractConfirmOverrides(policyText)
   const dangerous = overrides.filter((o) => DANGEROUS_OVERRIDE_RULES.some((d) => o === d || o === d.trim()))
-  out.push(
-    dangerous.length > 0
-      ? {
-          id: 'permission-policy-risky-override',
-          title: 'confirm_overrides does not lift sudo / rm -rf',
-          status: 'fail',
-          detail: `confirm_overrides lifts catastrophic rule(s): ${dangerous.join(', ')} — these must always reach the owner`,
-          fix: 'remove sudo / rm -rf from confirm_overrides.builtin_rules; override only narrow rules like git push',
-        }
-      : { id: 'permission-policy-risky-override', title: 'confirm_overrides does not lift sudo / rm -rf', status: 'pass', detail: overrides.length > 0 ? `overrides: ${overrides.join(', ')}` : 'no confirm_overrides' },
-  )
+  if (dangerous.length > 0) {
+    out.push({
+      id: 'permission-policy-risky-override',
+      title: 'confirm_overrides does not lift sudo / rm -rf',
+      status: 'fail',
+      detail: `confirm_overrides lifts catastrophic rule(s): ${dangerous.join(', ')} — these must always reach the owner`,
+      fix: 'remove sudo / rm -rf from confirm_overrides.builtin_rules; override only narrow rules like git push',
+    })
+  } else if (opaque) {
+    out.push({
+      id: 'permission-policy-risky-override',
+      title: 'confirm_overrides does not lift sudo / rm -rf',
+      status: 'warn',
+      detail: 'confirm_overrides is present in a form this lint cannot read (flow/one-line YAML) — review it by hand',
+      fix: 'use the block form (confirm_overrides: / builtin_rules: / - "rule") so the doctor can lint it',
+    })
+  } else {
+    out.push({ id: 'permission-policy-risky-override', title: 'confirm_overrides does not lift sudo / rm -rf', status: 'pass', detail: overrides.length > 0 ? `overrides: ${overrides.join(', ')}` : 'no confirm_overrides' })
+  }
   const tier = extractTopLevelScalar(policyText, 'default_tier')
   out.push(
     tier === 'allow'
@@ -883,7 +939,16 @@ export interface ChatPolicy {
   tmuxMirror: boolean | null
 }
 
-/** Extract per-chat `mode:` and `tmux_mirror:` from the chats: block. */
+/**
+ * Extract per-chat `mode:` and `tmux_mirror:` from the chats: block.
+ * Hardened against two bleed bugs (review M2):
+ *   - block scalars (`system_reminder: |`) — their content lines could parse
+ *     as `mode:`/`tmux_mirror:` and rewrite the chat's policy;
+ *   - non-numeric sibling keys (`default:` templates) — their properties were
+ *     attributed to the PREVIOUS numeric chat.
+ * Properties are accepted only at the exact indent of the chat's first
+ * property, and only while no block scalar is open.
+ */
 export function extractChatPolicies(policyText: string): ChatPolicy[] {
   const lines = policyText.split('\n')
   const out: ChatPolicy[] = []
@@ -891,9 +956,18 @@ export function extractChatPolicies(policyText: string): ChatPolicy[] {
   let chatsIndent = 0
   let current: ChatPolicy | null = null
   let currentIndent = 0
+  /** Indent of the current chat's first property; -1 = not seen yet. */
+  let propIndent = -1
+  /** When >= 0, we are inside a block scalar opened at this key indent. */
+  let scalarIndent = -1
   for (const line of lines) {
     if (/^\s*#/.test(line) || line.trim() === '') continue
     const indent = (line.match(/^(\s*)/)?.[1] ?? '').length
+    // Inside a block scalar: skip every deeper-indented content line.
+    if (scalarIndent >= 0) {
+      if (indent > scalarIndent) continue
+      scalarIndent = -1
+    }
     // Leaving the current block? The very same line may OPEN the real
     // top-level chats: block (allowlist.chats: came first in the file), so
     // fall through to the open-check instead of consuming the line.
@@ -915,26 +989,46 @@ export function extractChatPolicies(policyText: string): ChatPolicy[] {
       if (current) out.push(current)
       current = { id: chatKey[2] ?? '', mode: null, tmuxMirror: null }
       currentIndent = (chatKey[1] ?? '').length
+      propIndent = -1
+      continue
+    }
+    // A non-numeric sibling key at chat level (e.g. a `default:` template)
+    // closes the current chat — its properties are NOT the chat's.
+    if (current && indent <= currentIndent && /^\s*\S+:\s*/.test(line)) {
+      out.push(current)
+      current = null
       continue
     }
     if (current) {
-      const mode = line.match(/^\s*mode:\s*["']?(\w+)["']?/)
-      if (mode) current.mode = mode[1] ?? null
-      const mirror = line.match(/^\s*tmux_mirror:\s*(true|false)/)
-      if (mirror) current.tmuxMirror = mirror[1] === 'true'
+      if (propIndent === -1) propIndent = indent
+      if (indent === propIndent) {
+        const mode = line.match(/^\s*mode:\s*["']?(\w+)["']?\s*(#.*)?$/)
+        if (mode) current.mode = mode[1] ?? null
+        const mirror = line.match(/^\s*tmux_mirror:\s*(true|false)\s*(#.*)?$/)
+        if (mirror) current.tmuxMirror = mirror[1] === 'true'
+      }
+      // A key opening a block scalar (`reminder: |` / `note: >-`): skip its body.
+      if (/:\s*[|>][+-]?\s*$/.test(line)) scalarIndent = indent
     }
   }
   if (current) out.push(current)
   return out
 }
 
-/** Mirror is DM-only: a public chat with tmux_mirror=true leaks the terminal. */
+/**
+ * Mirror is DM-only: a public chat with tmux_mirror=true leaks the terminal.
+ * A NEGATIVE chat id is a group/channel by Telegram convention — mirror on a
+ * group fails even when `mode:` is missing or misspelled (a typo must not
+ * disable a security invariant); only an explicit `mode: private` is trusted.
+ */
 export function checkMultichatMirror(policies: ChatPolicy[]): Check {
   const id = 'multichat-dm-mirror'
   const title = 'Terminal mirror is DM-only (public chats: no mirror)'
-  const leaking = policies.filter((p) => p.mode === 'public' && p.tmuxMirror === true)
+  const leaking = policies.filter(
+    (p) => p.tmuxMirror === true && (p.mode === 'public' || (p.id.startsWith('-') && p.mode !== 'private')),
+  )
   if (leaking.length > 0) {
-    return { id, title, status: 'fail', detail: `public chat(s) with tmux_mirror=true: ${leaking.map((p) => p.id).join(', ')} — the terminal (paths, repos, tool output) streams into a group`, fix: 'set tmux_mirror: false for every mode: public chat' }
+    return { id, title, status: 'fail', detail: `group/public chat(s) with tmux_mirror=true: ${leaking.map((p) => p.id).join(', ')} — the terminal (paths, repos, tool output) streams into a group`, fix: 'set tmux_mirror: false for every group/public chat' }
   }
   return { id, title, status: 'pass', detail: `${policies.length} chat polic(ies), no public mirror` }
 }
@@ -951,14 +1045,19 @@ export function checkMultichatDirs(policyIds: string[], dirIds: string[]): Check
   return { id, title, status: 'pass', detail: `${dirIds.length} chat dir(s), all covered` }
 }
 
-/** PR #32 regression guard: spawn-chat-shell must forward TMUX_PANE through env -i. */
+/**
+ * PR #32 regression guard: spawn-chat-shell must FORWARD TMUX_PANE through the
+ * env -i wipe. Require an actual assignment (`TMUX_PANE=...`) outside a
+ * comment — a mention in prose must not satisfy a regression guard.
+ */
 export function checkSpawnChatShell(scriptText: string | null): Check {
   const id = 'spawn-chat-shell-tmux-pane'
   const title = 'spawn-chat-shell forwards TMUX_PANE'
   if (scriptText === null) return { id, title, status: 'skip', detail: 'spawn-chat-shell.sh not found (multichat shells not in use)' }
-  return /TMUX_PANE/.test(scriptText)
+  const forwards = scriptText.split('\n').some((l) => /TMUX_PANE=/.test(l.replace(/#.*$/, '')))
+  return forwards
     ? { id, title, status: 'pass', detail: 'TMUX_PANE forwarding present' }
-    : { id, title, status: 'fail', detail: 'no TMUX_PANE in spawn-chat-shell.sh — the per-chat inbox watcher silently dies (PR #32 regression)', fix: 'forward TMUX and TMUX_PANE through the env -i wipe' }
+    : { id, title, status: 'fail', detail: 'no TMUX_PANE= assignment in spawn-chat-shell.sh — the per-chat inbox watcher silently dies (PR #32 regression)', fix: 'forward TMUX and TMUX_PANE through the env -i wipe' }
 }
 
 /**
@@ -1186,11 +1285,21 @@ export function parseUnitFile(text: string): ParsedUnit {
   return { envPath, sockets: [...sockets], workingDirectory, sessionName, bypassPermissions }
 }
 
-/** First value of KEY=... in env-file text. Pure. */
+/**
+ * First value of KEY=... in env-file text. Pure. Strips `export `, surrounding
+ * quotes and trailing ` # comments` the same way parseEnvList does — systemd's
+ * EnvironmentFile accepts `KEY="value"`, and the raw quotes broke the
+ * webhook-port and state-dir lookups (false "nothing listens" / profile=unknown).
+ */
 export function envValue(envText: string, key: string): string | null {
   for (const line of envText.split('\n')) {
-    const m = line.match(new RegExp(`^\\s*${key}=(.*)$`))
-    if (m) return (m[1] ?? '').trim() || null
+    const m = line.match(new RegExp(`^\\s*(?:export\\s+)?${key}=(.*)$`))
+    if (m) {
+      let v = (m[1] ?? '').trim()
+      v = v.replace(/\s+#.*$/, '').trim()
+      v = v.replace(/^["']|["']$/g, '')
+      return v || null
+    }
   }
   return null
 }
@@ -1288,7 +1397,7 @@ export function checkFleet(agents: FleetAgent[], sharedSettingsRaw: string | nul
     out.push({ id: 'fleet-sockets', title: 'Dedicated tmux socket per unit', status: 'pass', detail: agents.map((a) => `${a.name}:${socketOf(a) === '' ? '<default>' : socketOf(a)}`).join(', ') })
   }
 
-  const sharedDirty = sharedSettingsRaw != null && /dashi-channel-hook|post-hook\.ts|read-receipt-hook\.ts|fallback-reply-hook\.ts/.test(sharedSettingsRaw)
+  const sharedDirty = sharedSettingsRaw != null && CHANNEL_HOOK_MARKERS_RE.test(sharedSettingsRaw)
   out.push(
     sharedDirty
       ? { id: 'fleet-shared-settings', title: 'Shared ~/.claude/settings.json free of channel hooks', status: 'fail', detail: 'channel hooks found in the user-level settings — they fire in EVERY agent session and route through one agent\'s bot/port', fix: 'move channel hooks into each agent\'s <workspace>/.claude/settings.json (invariant a)' }
@@ -1648,6 +1757,19 @@ function gatherChecks(opts: Options): Check[] {
   // host (fleet invariant a) — checked always now, not only under --fleet.
   checks.push(checkSharedSettingsClean(readFileSafe(join(homedir(), '.claude', 'settings.json')), selectedIsHome))
 
+  // No env source at all (launchd host, no matching unit, no --env): the
+  // env-dependent checks below (webhook bind, env mode, allowlist, profile)
+  // silently don't run — leave a breadcrumb instead of false confidence.
+  if (!opts.envPath) {
+    checks.push({
+      id: 'env-unknown',
+      title: 'Channel env located',
+      status: 'skip',
+      detail: 'no channel.env found (no --env, no matching systemd unit — launchd hosts are not autodetected yet) — webhook bind, env-file mode, allowlist and hook profile are NOT checked',
+      fix: 'pass --env <channel.env path> to enable the env-dependent checks',
+    })
+  }
+
   // Hook profile: read the state config (env → TELEGRAM_STATE_DIR → config.json)
   // BEFORE judging hook registration, so a mirror-only setup is not punished
   // for the feeder hooks it deliberately does not have.
@@ -1801,8 +1923,17 @@ function gatherChecks(opts: Options): Check[] {
     // fails, retry on the convention socket before declaring the session dead.
     let cap = probe('tmux', ['capture-pane', '-t', opts.tmuxSession, '-p', '-S', '-200'])
     if (cap.code !== 0) {
-      const socketCap = probe('tmux', ['-L', opts.tmuxSession, 'capture-pane', '-t', opts.tmuxSession, '-p', '-S', '-200'])
-      if (socketCap.code === 0) cap = socketCap
+      // Prefer the REAL socket parsed from the matched unit (socket name and
+      // session name can differ — `-L channel-arthas … -s main` gave a false
+      // "session not found" when we only retried the convention socket).
+      const socketNames = [...new Set([unitAgent?.sockets[0], opts.tmuxSession].filter((s): s is string => !!s))]
+      for (const sock of socketNames) {
+        const socketCap = probe('tmux', ['-L', sock, 'capture-pane', '-t', opts.tmuxSession, '-p', '-S', '-200'])
+        if (socketCap.code === 0) {
+          cap = socketCap
+          break
+        }
+      }
     }
     const text = `${cap.stdout}\n${cap.stderr}`
     if (cap.code !== 0 || detectCrashLoop(text)) {
