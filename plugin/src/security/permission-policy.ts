@@ -392,6 +392,38 @@ function bashReferencesSecret(command: string): boolean {
  *  prefixes (`| env bash`, `| sudo bash`), process/command substitution
  *  (`bash <(curl …)`, `sh -c "$(curl …)"`) and base64-decode-to-interpreter
  *  (Codex high — the old detector missed all of these). */
+// Git execution-surface evasion (Codex High, 2026-06-09): a downgraded
+// `git push` must not become a code-exec primitive. `git -c core.sshCommand=`,
+// `-c credential.helper=`, `-c core.hooksPath=`, `-c core.fsmonitor=`,
+// `--config-env=`, `--upload-pack`/`--receive-pack`, and writes that install
+// or repoint git hooks all run attacker-controlled local programs while the
+// visible command is still just "git push". These ALWAYS confirm and can
+// never appear in confirm_overrides (separate matcher, not in the built-in
+// substring list).
+// ANY `git -c <...>` (or its long form `--config`/`--config-env`) confirms:
+// quoting and include.path indirection make per-key matching leaky, and the
+// owner has accepted that only a clean `git push` auto-allows (Codex High
+// round 3 — tokenizing the shell is overkill; confirm-on-any-`-c` is the
+// minimal safe patch).
+const GIT_DASH_C_RE = /\bgit\b[^\n]*?(\s-c(\s|=|["'])|--config(\s|=|-env))/i
+const GIT_FLAG_RE =
+  /\bgit\b[^\n]*?(--config-env|--upload-pack|--receive-pack|--exec)\b/i
+const GIT_HOOKS_WRITE_RE = /(\.git\/hooks\/|core\.hookspath)/i
+// Git config/exec indirection via environment variables — these reroute how
+// git push authenticates or which local program it runs, so a downgraded
+// push must still confirm when any is set (Codex High round 2).
+const GIT_ENV_INDIRECTION_RE =
+  /\b(git_ssh|git_ssh_command|git_askpass|ssh_askpass|git_proxy_command|git_external_diff|git_config_global|git_config_system|git_config_count|git_config_key_[0-9]+|git_config_value_[0-9]+)\s*=/i
+
+function gitExecSurface(commandLower: string): boolean {
+  return (
+    GIT_DASH_C_RE.test(commandLower) ||
+    GIT_FLAG_RE.test(commandLower) ||
+    GIT_HOOKS_WRITE_RE.test(commandLower) ||
+    GIT_ENV_INDIRECTION_RE.test(commandLower)
+  )
+}
+
 const INTERPRETER_RE = /\b(sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php)\b/
 const DOWNLOADER_RE = /\b(curl|wget|fetch)\b/
 
@@ -694,6 +726,11 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     }
     if (bashConfirmEvasion(commandLower)) {
       return { tier: 'confirm', reason: 'pipe-to-interpreter download needs confirmation', matchedRule: 'builtin:confirm_bash:pipe-interpreter' }
+    }
+    // Non-overridable: git config/hook execution surfaces (a downgraded
+    // `git push` must never become arbitrary local code execution).
+    if (gitExecSurface(commandLower)) {
+      return { tier: 'confirm', reason: 'git config/hook execution surface needs confirmation', matchedRule: 'builtin:confirm_bash:git-exec-surface' }
     }
   }
 
