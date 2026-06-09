@@ -121,6 +121,18 @@ describe('loadPolicy', () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+  test('shipped example policy (carries version: 1) validates and loads', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pgh-'))
+    try {
+      const p = join(dir, 'permission-policy.yaml')
+      writeFileSync(p, 'version: 1\ndefault_tier: allow\nconfirm:\n  bash_patterns:\n    - deploy.sh\n')
+      const { policy, warning } = loadPolicy(p)
+      expect(warning).toBeUndefined()
+      expect(policy.default_tier).toBe('allow')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
   test('schema-invalid policy (wrong type) → confirm fallback', () => {
     const dir = mkdtempSync(join(tmpdir(), 'pgh-'))
     try {

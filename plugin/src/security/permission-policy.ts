@@ -88,6 +88,10 @@ const PolicyScopeSchema = z
 
 export const PermissionPolicySchema = z
   .object({
+    // Optional doc/version marker — accepted and ignored so the shipped
+    // example policy (which carries `version: 1`) passes strict validation
+    // instead of being discarded into the confirm-everything fallback.
+    version: z.number().optional(),
     default_tier: z.enum(['allow', 'confirm']).optional(),
     deny: PolicyRulesSchema.optional(),
     confirm: PolicyRulesSchema.optional(),

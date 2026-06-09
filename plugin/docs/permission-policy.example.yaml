@@ -47,11 +47,15 @@ deny:
   read_paths:
     - "**/secrets/**"
 
-# Operator allow — explicit forms that should run silently even though a
-# built-in confirm would otherwise catch them. Keep this list tight.
+# Operator allow — explicit forms that should run silently. NOTE: the built-in
+# confirm tier is UNCONDITIONAL — it CANNOT be overridden by an allow rule
+# (sudo / git push / rm -rf / curl|sh always reach you as a Telegram confirm).
+# So an allow rule only takes effect for commands NOT caught by a built-in
+# confirm/deny. Keep this list tight.
 allow:
   bash_patterns:
-    - "git push origin feature/"   # feature-branch pushes are routine, PR-gated
+    - "gh pr view"     # read-only gh subcommands you want silent
+    - "bun test"
 
 # Per-scope overrides (keyed by CHAT_ID; "main" = the owner's DM session).
 # Scope rules are ADDITIVE to the globals above. Example: make the main
