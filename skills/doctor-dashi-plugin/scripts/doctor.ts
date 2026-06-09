@@ -529,7 +529,7 @@ export function checkProgressSurfaces(stateConfig: unknown): Check {
     return { id, title, status: 'warn', detail: `${enabled.length} surfaces enabled together (${enabled.join(' + ')}) — the owner gets duplicate Telegram windows`, fix: 'keep exactly one: tmux_mirror for a terminal view, or one hook-driven reporter. Disable the rest in the state config.json' }
   }
   const detail = enabled.length === 1 ? `exactly one surface enabled (${enabled[0]})` : 'no surface explicitly enabled (defaults are all-off)'
-  return { id, title, status: 'ok', detail }
+  return { id, title, status: 'pass', detail }
 }
 
 /**
