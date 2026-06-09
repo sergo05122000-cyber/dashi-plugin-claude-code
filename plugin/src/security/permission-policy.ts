@@ -97,6 +97,27 @@ export const PermissionPolicySchema = z
     confirm: PolicyRulesSchema.optional(),
     allow: PolicyRulesSchema.optional(),
     scopes: z.record(z.string(), PolicyScopeSchema).optional(),
+    // Operator downgrade of SPECIFIC built-in confirm rules (owner autonomy
+    // policy 2026-06-09: cards only for what cannot be automated, e.g. sudo).
+    // Entries must name exact BUILTIN_CONFIRM_BASH rules — a typo fails
+    // validation loudly instead of silently disabling nothing.
+    confirm_overrides: z
+      .object({
+        builtin_rules: z
+          .array(z.string())
+          .superRefine((rules, ctx) => {
+            for (const r of rules) {
+              if (!BUILTIN_CONFIRM_BASH.includes(r)) {
+                ctx.addIssue({
+                  code: z.ZodIssueCode.custom,
+                  message: `unknown built-in confirm rule: ${JSON.stringify(r)} (must be one of: ${BUILTIN_CONFIRM_BASH.join(', ')})`,
+                })
+              }
+            }
+          }),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
 
@@ -116,6 +137,14 @@ export interface PermissionPolicy {
   readonly allow?: PolicyRules
   /** Per-scope (per-chat / "main") overrides, unioned with the globals. */
   readonly scopes?: Readonly<Record<string, PolicyScope>>
+  /**
+   * Built-in confirm rules the operator explicitly downgrades to the normal
+   * policy flow (confirm -> allow -> default). Deny tiers and the
+   * pipe-to-interpreter evasion confirm are NEVER overridable. A compound
+   * command matching an overridden AND a non-overridden built-in rule still
+   * confirms.
+   */
+  readonly confirm_overrides?: { readonly builtin_rules?: readonly string[] }
 }
 
 // Tools that cannot mutate state or exfiltrate data. Under default_tier
@@ -363,6 +392,38 @@ function bashReferencesSecret(command: string): boolean {
  *  prefixes (`| env bash`, `| sudo bash`), process/command substitution
  *  (`bash <(curl …)`, `sh -c "$(curl …)"`) and base64-decode-to-interpreter
  *  (Codex high — the old detector missed all of these). */
+// Git execution-surface evasion (Codex High, 2026-06-09): a downgraded
+// `git push` must not become a code-exec primitive. `git -c core.sshCommand=`,
+// `-c credential.helper=`, `-c core.hooksPath=`, `-c core.fsmonitor=`,
+// `--config-env=`, `--upload-pack`/`--receive-pack`, and writes that install
+// or repoint git hooks all run attacker-controlled local programs while the
+// visible command is still just "git push". These ALWAYS confirm and can
+// never appear in confirm_overrides (separate matcher, not in the built-in
+// substring list).
+// ANY `git -c <...>` (or its long form `--config`/`--config-env`) confirms:
+// quoting and include.path indirection make per-key matching leaky, and the
+// owner has accepted that only a clean `git push` auto-allows (Codex High
+// round 3 — tokenizing the shell is overkill; confirm-on-any-`-c` is the
+// minimal safe patch).
+const GIT_DASH_C_RE = /\bgit\b[^\n]*?(\s-c(\s|=|["'])|--config(\s|=|-env))/i
+const GIT_FLAG_RE =
+  /\bgit\b[^\n]*?(--config-env|--upload-pack|--receive-pack|--exec)\b/i
+const GIT_HOOKS_WRITE_RE = /(\.git\/hooks\/|core\.hookspath)/i
+// Git config/exec indirection via environment variables — these reroute how
+// git push authenticates or which local program it runs, so a downgraded
+// push must still confirm when any is set (Codex High round 2).
+const GIT_ENV_INDIRECTION_RE =
+  /\b(git_ssh|git_ssh_command|git_askpass|ssh_askpass|git_proxy_command|git_external_diff|git_config_global|git_config_system|git_config_count|git_config_key_[0-9]+|git_config_value_[0-9]+)\s*=/i
+
+function gitExecSurface(commandLower: string): boolean {
+  return (
+    GIT_DASH_C_RE.test(commandLower) ||
+    GIT_FLAG_RE.test(commandLower) ||
+    GIT_HOOKS_WRITE_RE.test(commandLower) ||
+    GIT_ENV_INDIRECTION_RE.test(commandLower)
+  )
+}
+
 const INTERPRETER_RE = /\b(sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php)\b/
 const DOWNLOADER_RE = /\b(curl|wget|fetch)\b/
 
@@ -486,6 +547,17 @@ function matchBashRules(rules: readonly string[] | undefined, commandLower: stri
     if (typeof rule === 'string' && bashMatch(rule, commandLower)) return rule
   }
   return undefined
+}
+
+/** All rules from the list that match — used by the built-in confirm tier so
+ * an operator override of one rule cannot mask a sibling hit (e.g.
+ * `git push; kill 1234` overriding only `git push` must still confirm). */
+function matchAllBashRules(rules: readonly string[], commandLower: string): string[] {
+  const hits: string[] = []
+  for (const rule of rules) {
+    if (bashMatch(rule, commandLower)) hits.push(rule)
+  }
+  return hits
 }
 
 /** Merge global + scope rules for one tier (scope rules are additive). */
@@ -641,15 +713,24 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     return { tier: 'deny', reason: `policy deny (${denyHit})`, matchedRule: `deny:${denyHit}` }
   }
 
-  // 4. Built-in confirm bash — UNCONDITIONAL (no operator-allow short-circuit).
-  // Substring list + spacing-tolerant interpreter/exfil evasion detection.
+  // 4. Built-in confirm bash — no operator-ALLOW short-circuit (Codex
+  // Critical #3); the only relaxation is the explicit, validated
+  // confirm_overrides list, and a command matching ANY non-overridden rule
+  // still confirms. The evasion detector below is never overridable.
   if (commandLower !== undefined) {
-    const hit = matchBashRules(BUILTIN_CONFIRM_BASH, commandLower)
-    if (hit) {
-      return { tier: 'confirm', reason: `risky command needs confirmation: ${hit}`, matchedRule: `builtin:confirm_bash:${hit}` }
+    const overridden = policy.confirm_overrides?.builtin_rules ?? []
+    const hits = matchAllBashRules(BUILTIN_CONFIRM_BASH, commandLower)
+    const standing = hits.filter((h) => !overridden.includes(h))
+    if (standing.length > 0) {
+      return { tier: 'confirm', reason: `risky command needs confirmation: ${standing[0]}`, matchedRule: `builtin:confirm_bash:${standing[0]}` }
     }
     if (bashConfirmEvasion(commandLower)) {
       return { tier: 'confirm', reason: 'pipe-to-interpreter download needs confirmation', matchedRule: 'builtin:confirm_bash:pipe-interpreter' }
+    }
+    // Non-overridable: git config/hook execution surfaces (a downgraded
+    // `git push` must never become arbitrary local code execution).
+    if (gitExecSurface(commandLower)) {
+      return { tier: 'confirm', reason: 'git config/hook execution surface needs confirmation', matchedRule: 'builtin:confirm_bash:git-exec-surface' }
     }
   }
 
