@@ -634,47 +634,780 @@ function systemctlMutation(commandLower: string): boolean {
   return false
 }
 
-const INTERPRETER_RE = /\b(sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php)\b/
-// Network/exfil source tokens. `fetch` is deliberately EXCLUDED: Linux has no
-// `fetch` downloader CLI, so including it only false-positives on `git fetch`.
-// (macOS `fetch(1)` exists — flag for Mac-resident agents if they share this.)
-const DOWNLOADER_RE = /\b(curl|wget|nc|ncat|socat)\b|\/dev\/tcp/
-// Pipe chain ending in an interpreter (sudo/env wrappers + absolute paths ok).
-const PIPE_TO_INTERPRETER_RE = /\|\s*(?:sudo\s+|env\s+)*(?:\/\S+\/)?(?:sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php)\b/
-// An untrusted NETWORK source appears to the LEFT of a pipe-to-interpreter.
-// `[^|]*` keeps the source in the same pipe stage as (or upstream of) the
-// interpreter without crossing into the interpreter's own segment.
-const SOURCE_TO_INTERPRETER_RE = new RegExp(
-  `(?:\\b(?:curl|wget|nc|ncat|socat)\\b|\\/dev\\/tcp)[^|]*${PIPE_TO_INTERPRETER_RE.source}`,
-)
-
-// The RCE primitive is UNTRUSTED (network) bytes reaching an interpreter — NOT
-// any pipe-to-interpreter (2026-06-10 ultra-autonomy FP, Codex + Fable double
-// audit). A LOCAL command piped to an interpreter (`git show X|python3 -c`,
-// `cat f|python3`, `jq …|python3`) is the agent's own code over its own data,
-// exactly as trusted as the agent typing `python3 -c …` directly (already
-// allowed) — so it must run SILENTLY under ultra-autonomy.
+// ── pipe-to-interpreter: STRUCTURAL network-source → exec detection ──────
 //
-// Accepted residuals under the agent-mistake threat model (mirrors the
-// gitExecSurface posture): `ssh host 'cmd' | bash` flows (ssh is omitted from
-// the source set — ssh|grep/ssh|python parsing is constant benign ops work, and
-// the malicious case needs the agent to have already chosen a hostile remote);
-// two-step download-then-exec (`curl -o x; sh x`) is never caught by a single-
-// command detector (same as `python3 downloaded.py`, allowed today); deep
-// obfuscation is out of scope (env -i isolation + fail-closed default backstop).
-function bashConfirmEvasion(commandLower: string): boolean {
-  // (A) Untrusted network source piped to an interpreter (`curl … | sh`,
-  //     `nc host port | bash`, `cat /dev/tcp/… | bash`). A LOCAL command piped
-  //     to an interpreter is NOT a network source and flows silently.
-  if (SOURCE_TO_INTERPRETER_RE.test(commandLower)) return true
-  // (B) Downloader + interpreter present anywhere — covers process substitution
-  //     `bash <(curl …)` and command substitution `sh -c "$(curl …)"`.
-  if (DOWNLOADER_RE.test(commandLower) && INTERPRETER_RE.test(commandLower)) return true
-  // (C) base64 decode feeding an interpreter.
-  if (/\bbase64\s+(-d|--decode)\b/.test(commandLower) && INTERPRETER_RE.test(commandLower)) return true
-  // (D) Pipe to sudo (privilege escalation of piped data).
-  if (/\|\s*sudo\b/.test(commandLower)) return true
+// The RCE primitive we card is UNTRUSTED (network/decode) bytes reaching an
+// interpreter as CODE — NOT mere token co-presence of a downloader and an
+// interpreter name (2026-06-10 round 2: the old `DOWNLOADER && INTERPRETER`
+// rule fired on grep PATTERNS (`grep "curl.*sh"`), heredoc/file CONTENT,
+// two-step download-then-parse, `curl … | grep node`, and downloads fed to a
+// fixed inline script — all benign ops work, Codex + Fable double audit).
+//
+// Detection runs on a quote/heredoc-masked, escape-aware copy of the command
+// (a small shell-shaped scanner, NOT a full lexer), split into pipeline stages:
+//   (R1) a NETWORK/decode source stage feeding an EXECUTOR in a LATER stage —
+//        an interpreter HEAD (`curl … | sh`, `wget … | jq | bash`) or a
+//        `>(sh)` / `<(sh)` process-substitution sink (`curl … | tee >(bash)`).
+//        Exempt non-shell DATA sinks (`python3 -c '<literal>'`, `node -e …`):
+//        downloaded stdin is then mere data, as trusted as
+//        `python3 script.py < downloaded.json` — unless the inline literal
+//        itself reads AND executes stdin (anti-bypass).
+//   (R2) a substitution carrying a network source in CODE position inside an
+//        exec sink: `eval/source/.` + any `$(curl)`/`<(curl)`/backtick;
+//        a shell interpreter + any network substitution (`sh -c "$(curl)"`,
+//        `bash <<<"$(curl)"`, `bash <(curl)`); a non-shell interpreter whose
+//        SCRIPT argument is a network process-substitution (`python3 <(curl)`).
+//        A network `$(curl)` passed as plain DATA argv to `python3 -c '<lit>'`
+//        does NOT card.
+//   (R3) `base64 -d` is folded into the source set (decoded bytes → interp).
+//   (R4) any pipe to sudo (privilege escalation of piped data).
+//
+// Accepted residuals under the agent-mistake / prompt-injection threat model
+// (NOT an adversarial operator hand-crafting bash — env -i isolation and the
+// fail-closed default tier backstop that): `ssh host 'cmd' | bash` flows (ssh
+// omitted from the source set); two-step download-then-exec (`curl -o x; sh x`);
+// unquoted-heredoc bodies; a download-exec hidden as the CONTENT of a quoted
+// literal (`echo "curl x | sh" | bash`); OBFUSCATED stdin-exec that dodges the
+// marker set (`getattr(builtins,'ex'+'ec')(sys.stdin.read())`) — the identical
+// hole exists for a plain local `python3 -c '<obfuscated>'`, which is allowed
+// anyway, so the curl-fed variant adds no new exposure; exotic wrapper chains
+// (`sudo -u u -g g …`) beyond the common sudo/env flag set.
+
+const NET_SOURCE_RE = /\b(?:curl|wget|nc|ncat|socat)\b|\/dev\/tcp|\bbase64\s+(?:-d|--decode)\b/i
+const INTERP_NAMES = 'sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php'
+const INTERP_HEAD_RE = new RegExp(`^(?:${INTERP_NAMES})$`, 'i')
+const EVAL_SOURCE_RE = /^(?:eval|source|\.)$/i
+const EXEC_SINK_HEAD_RE = new RegExp(`^(?:${INTERP_NAMES}|eval|source|\\.)$`, 'i')
+/** Network/decode source present in a substitution's inner text — its own
+ *  quoted literals masked first, so `$(printf 'echo curl')` is NOT a source. */
+function innerHasNetSource(inner: string): boolean {
+  return NET_SOURCE_RE.test(maskQuotedLiterals(inner) ?? inner)
+}
+
+/** Length-preserving mask: quoted-delimiter heredoc BODIES become blanks (pure
+ *  literal data — `<<'EOF' … EOF`). Newlines preserved so offsets stay aligned
+ *  with the raw command. Unquoted heredocs are left intact (expansion applies;
+ *  out of scope). */
+function maskHeredocBodies(raw: string): string {
+  return raw.replace(
+    /(<<-?\s*)(['"])([\w.-]+)\2([^\n]*\n)([\s\S]*?\n)([ \t]*)(\3)(?=\s|$)/g,
+    (_full, op, q, delim, openTail, body, indent, close) =>
+      `${op}${q}${delim}${q}${openTail}${body.replace(/[^\n]/g, ' ')}${indent}${close}`,
+  )
+}
+
+/** Index just past a balanced `$(…)`/`<(…)`/`>(…)` (when `s[i]` opens one) or a
+ *  backtick run — quote- and escape-aware so a `)` inside a nested quote does
+ *  not close the substitution early. If `s[i]` opens nothing, returns i+1. */
+function skipSubstitution(s: string, i: number): number {
+  const two = s.slice(i, i + 2)
+  if (two === '$(' || two === '<(' || two === '>(') {
+    let depth = 1
+    let k = i + 2
+    while (k < s.length && depth > 0) {
+      const c = s[k]
+      if (c === '\\') {
+        k += 2
+        continue
+      }
+      if (c === "'") {
+        k++
+        while (k < s.length && s[k] !== "'") k++
+        k++
+        continue
+      }
+      if (c === '"') {
+        k++
+        while (k < s.length && s[k] !== '"') k += s[k] === '\\' ? 2 : 1
+        k++
+        continue
+      }
+      if (c === '`') {
+        k++
+        while (k < s.length && s[k] !== '`') k++
+        k++
+        continue
+      }
+      if (c === '(') depth++
+      else if (c === ')') depth--
+      k++
+    }
+    return k
+  }
+  if (s[i] === '`') {
+    let k = i + 1
+    while (k < s.length && s[k] !== '`') k++
+    return k + 1
+  }
+  return i + 1
+}
+
+/** Length-preserving mask of single/double-quoted literals → blanks, so a
+ *  downloader/interpreter token that only appears inside a quoted string (a
+ *  grep pattern, a here-string, file content) is NOT seen by the detector.
+ *  Live `$(…)` and backtick substitutions inside double quotes are PRESERVED
+ *  (the shell executes them — `sh -c "$(curl …)"` must stay visible to R2).
+ *  Returns null on unbalanced quotes (caller falls back to the raw command). */
+function maskQuotedLiterals(s: string): string | null {
+  const out = s.split('')
+  const n = s.length
+  let i = 0
+  while (i < n) {
+    const ch = s[i]
+    if (ch === '\\') {
+      i += 2
+      continue
+    }
+    if (ch === "'") {
+      let j = i + 1
+      while (j < n && s[j] !== "'") {
+        out[j] = ' '
+        j++
+      }
+      if (j >= n) return null
+      i = j + 1
+      continue
+    }
+    if (ch === '"') {
+      let j = i + 1
+      while (j < n && s[j] !== '"') {
+        if (s[j] === '\\') {
+          out[j] = ' '
+          if (j + 1 < n) out[j + 1] = ' '
+          j += 2
+          continue
+        }
+        if (s[j] === '$' && s[j + 1] === '(') {
+          j = skipSubstitution(s, j) // preserve the live substitution verbatim
+          continue
+        }
+        if (s[j] === '`') {
+          j = skipSubstitution(s, j)
+          continue
+        }
+        out[j] = ' '
+        j++
+      }
+      if (j >= n) return null
+      i = j + 1
+      continue
+    }
+    i++
+  }
+  return out.join('')
+}
+
+interface BashStage {
+  raw: string
+  masked: string
+}
+
+/** Quote-aware split of a masked command into pipelines (list elements broken
+ *  on `;`/`&&`/`||`/`&`/newline) and stages within each pipeline (broken on a
+ *  single `|`/`|&`). Separators inside `$(…)`/`(…)`/backticks or behind a
+ *  backslash are NOT split on. Raw slices are taken at the same offsets (the
+ *  mask is length-preserving). */
+function splitPipelines(raw: string, masked: string): BashStage[][] {
+  const pipelines: BashStage[][] = []
+  let pipe: BashStage[] = []
+  let stageStart = 0
+  let depth = 0
+  const n = masked.length
+  const endStage = (end: number): void => {
+    const m = masked.slice(stageStart, end)
+    if (m.trim().length > 0) pipe.push({ raw: raw.slice(stageStart, end), masked: m })
+  }
+  const endPipe = (end: number): void => {
+    endStage(end)
+    if (pipe.length > 0) pipelines.push(pipe)
+    pipe = []
+  }
+  let i = 0
+  while (i < n) {
+    const c = masked[i]
+    if (c === '\\') {
+      i += 2
+      continue
+    }
+    if (c === '`' || ((c === '$' || c === '<' || c === '>') && masked[i + 1] === '(')) {
+      i = skipSubstitution(masked, i)
+      continue
+    }
+    if (c === '(') {
+      depth++
+      i++
+      continue
+    }
+    if (c === ')' && depth > 0) {
+      depth--
+      i++
+      continue
+    }
+    if (depth > 0) {
+      i++
+      continue
+    }
+    if (c === '\n' || c === ';') {
+      endPipe(i)
+      stageStart = i + 1
+      i++
+      continue
+    }
+    if (c === '&') {
+      // fd redirections (`2>&1`, `>&2`, `<&0`, `&>file`) are NOT separators.
+      if (masked[i - 1] === '>' || masked[i - 1] === '<' || masked[i + 1] === '>') {
+        i++
+        continue
+      }
+      // `&&` boundary or a bare background `&` — both end the pipeline.
+      endPipe(i)
+      stageStart = masked[i + 1] === '&' ? i + 2 : i + 1
+      i = stageStart
+      continue
+    }
+    if (c === '|') {
+      if (masked[i + 1] === '|') {
+        endPipe(i)
+        stageStart = i + 2
+        i += 2
+        continue
+      }
+      endStage(i)
+      stageStart = masked[i + 1] === '&' ? i + 2 : i + 1
+      i = stageStart
+      continue
+    }
+    i++
+  }
+  endPipe(n)
+  return pipelines
+}
+
+interface BashWord {
+  masked: string
+  raw: string
+}
+
+const ASSIGN_RE = /^[A-Za-z_]\w*=/
+// Operands that name stdin as the program source — the downloaded bytes that
+// reach fd 0 become the program (`bash /dev/stdin`, `python3 -`).
+const STDIN_DEVICE_RE = /^(?:-|\/dev\/stdin|\/dev\/fd\/0|\/proc\/self\/fd\/0)$/
+
+/** Remove shell quoting (surrounding/embedded quotes and quoting backslashes)
+ *  from a single command word so `'bash'`, `"bash"`, `b'a'sh`, `\bash` all read
+ *  as `bash`. Substitutions are left intact. */
+function dequoteWord(word: string): string {
+  let out = ''
+  for (let i = 0; i < word.length; i += 1) {
+    const c = word.charAt(i)
+    if (c === '\\') {
+      out += word.charAt(i + 1)
+      i += 1
+      continue
+    }
+    if (c === "'" || c === '"') continue
+    out += c
+  }
+  return out
+}
+
+/** Split a stage into whitespace-separated WORDS, treating quoted runs and
+ *  `$()`/`<()`/`>()`/backtick substitutions as atomic (embedded whitespace does
+ *  not break a word). Operates on the masked text; each word's raw slice is
+ *  taken at the same offsets (the mask is length-preserving). */
+function tokenizeStage(st: BashStage): BashWord[] {
+  const toks: BashWord[] = []
+  const m = st.masked
+  const n = m.length
+  let i = 0
+  while (i < n) {
+    while (i < n && /\s/.test(m.charAt(i))) i += 1
+    if (i >= n) break
+    const start = i
+    while (i < n && !/\s/.test(m.charAt(i))) {
+      const c = m.charAt(i)
+      if (c === '\\') {
+        i += 2
+        continue
+      }
+      if (c === "'") {
+        i += 1
+        while (i < n && m.charAt(i) !== "'") i += 1
+        i += 1
+        continue
+      }
+      if (c === '"') {
+        i += 1
+        while (i < n && m.charAt(i) !== '"') i += m.charAt(i) === '\\' ? 2 : 1
+        i += 1
+        continue
+      }
+      if (c === '`' || ((c === '$' || c === '<' || c === '>') && m.charAt(i + 1) === '(')) {
+        i = skipSubstitution(m, i)
+        continue
+      }
+      i += 1
+    }
+    toks.push({ masked: m.slice(start, i), raw: st.raw.slice(start, i) })
+  }
+  return toks
+}
+
+// Wrappers that take a leading positional value (a duration/interval) before
+// the wrapped command — must skip it to reach the real interpreter head.
+const DURATION_WRAPPERS = new Set(['timeout', 'watch'])
+// Wrapper option flags that consume a SEPARATE value word (`nice -n 10`,
+// `timeout -s TERM`, `ionice -c 3`, `stdbuf -o L`, `doas -u root`) — skip the
+// value too so the interpreter head is not read as `10`/`TERM`/`root`.
+const WRAPPER_VALUE_FLAG_RE = /^-(?:n|s|k|c|i|o|e|u|g|p|R)$/
+
+/** A stage's words plus the index of the command head, after skipping `VAR=val`
+ *  assignments and command wrappers (`sudo`/`env`/`nohup`/`command`/`exec`/
+ *  `timeout`/… — the same set the catastrophe path strips, so a wrapped
+ *  interpreter like `timeout 30 bash` / `exec bash` / `command bash` is exposed)
+ *  with their flags/values. Exotic wrapper combos are an accepted residual. */
+function stageWords(st: BashStage): { toks: BashWord[]; headIdx: number } {
+  const toks = tokenizeStage(st)
+  let k = 0
+  while (k < toks.length && ASSIGN_RE.test((toks[k] as BashWord).masked)) k += 1
+  for (let guard = 0; guard < 8 && k < toks.length; guard += 1) {
+    const name = dequoteWord((toks[k] as BashWord).raw).replace(/^.*\//, '').toLowerCase()
+    if (name === 'sudo') {
+      k += 1
+      while (k < toks.length && /^-/.test((toks[k] as BashWord).masked)) {
+        const takesValue = /^(?:-[ug]|--user|--group)$/.test((toks[k] as BashWord).masked)
+        k += 1
+        if (takesValue && k < toks.length) k += 1
+      }
+      continue
+    }
+    if (name === 'env') {
+      k += 1
+      while (k < toks.length && (/^-/.test((toks[k] as BashWord).masked) || ASSIGN_RE.test((toks[k] as BashWord).masked))) {
+        const takesValue = /^-u$/.test((toks[k] as BashWord).masked)
+        k += 1
+        if (takesValue && k < toks.length) k += 1
+      }
+      continue
+    }
+    if (DURATION_WRAPPERS.has(name)) {
+      k += 1
+      while (k < toks.length && /^-/.test((toks[k] as BashWord).masked)) {
+        const takesValue = WRAPPER_VALUE_FLAG_RE.test((toks[k] as BashWord).masked)
+        k += 1
+        if (takesValue && k < toks.length) k += 1
+      }
+      if (k < toks.length && /^[0-9.]+[smhd]?$/i.test(dequoteWord((toks[k] as BashWord).raw))) k += 1
+      continue
+    }
+    if (COMMAND_WRAPPERS.has(name)) {
+      k += 1
+      while (k < toks.length && (/^-/.test((toks[k] as BashWord).masked) || ASSIGN_RE.test((toks[k] as BashWord).masked))) {
+        const takesValue = WRAPPER_VALUE_FLAG_RE.test((toks[k] as BashWord).masked)
+        k += 1
+        if (takesValue && k < toks.length) k += 1
+      }
+      continue
+    }
+    break
+  }
+  return { toks, headIdx: k }
+}
+
+/** The command word at the head of a stage (wrappers stripped, dequoted, path
+ *  removed — `'bash'`/`/bin/bash` → `bash`). `''` if there is no command word. */
+function stageHead(st: BashStage): string {
+  const { toks, headIdx } = stageWords(st)
+  if (headIdx >= toks.length) return ''
+  return dequoteWord((toks[headIdx] as BashWord).raw).replace(/^.*\//, '')
+}
+
+/** Substitutions (`$()`/`<()`/`>()`/backtick) in a masked string, paired with
+ *  their RAW inner text (offsets align — the mask is length-preserving). */
+function stageSubstitutions(masked: string, raw: string): { kind: string; rawInner: string }[] {
+  const subs: { kind: string; rawInner: string }[] = []
+  let i = 0
+  const n = masked.length
+  while (i < n) {
+    if (masked[i] === '\\') {
+      i += 2
+      continue
+    }
+    const isParenSub = (masked[i] === '$' || masked[i] === '<' || masked[i] === '>') && masked[i + 1] === '('
+    if (isParenSub || masked[i] === '`') {
+      const end = skipSubstitution(masked, i)
+      const kind = masked[i] === '`' ? '`' : masked.slice(i, i + 2)
+      const innerStart = kind === '`' ? i + 1 : i + 2
+      subs.push({ kind, rawInner: raw.slice(innerStart, end - 1) })
+      i = end
+      continue
+    }
+    i++
+  }
+  return subs
+}
+
+/** Does a word begin (after an optional opening quote) with a NETWORK
+ *  substitution — `"$(curl)"`, `<(curl)`, `` `curl` ``? */
+function wordOpensNetSub(word: BashWord): boolean {
+  let p = 0
+  if (word.masked.charAt(p) === '"' || word.masked.charAt(p) === "'") p += 1
+  const opens = ((word.masked.charAt(p) === '$' || word.masked.charAt(p) === '<') && word.masked.charAt(p + 1) === '(') || word.masked.charAt(p) === '`'
+  if (!opens) return false
+  const end = skipSubstitution(word.masked, p)
+  const innerStart = word.masked.charAt(p) === '`' ? p + 1 : p + 2
+  return innerHasNetSource(word.raw.slice(innerStart, end - 1))
+}
+
+/** Per-interpreter flag spec (`null` if the head is not a known interpreter).
+ *  `inlineShort`/`inlineLong` introduce inline program code; `valueShort`/
+ *  `valueLong` consume the next word as an option value (NOT the program — so a
+ *  following path is not mistaken for a script); `moduleShort` names a flag that
+ *  itself supplies a local program (`python -m mod`). Keeps `node -r`(require) /
+ *  `python -E`(env) / `perl -I`(incdir) from being read as inline code. */
+interface InterpSpec {
+  inlineShort: string
+  inlineLong: string[]
+  valueShort: string
+  valueLong: string[]
+  moduleShort: string
+  isShell: boolean
+}
+function interpreterSpec(head: string): InterpSpec | null {
+  const h = head.toLowerCase()
+  if (/^(?:sh|bash|zsh|ksh|dash|fish)$/.test(h)) {
+    return { inlineShort: 'c', inlineLong: [], valueShort: 'o', valueLong: ['rcfile', 'init-file'], moduleShort: '', isShell: true }
+  }
+  if (/^python[0-9.]*$/.test(h)) {
+    return { inlineShort: 'c', inlineLong: [], valueShort: 'WXQ', valueLong: [], moduleShort: 'm', isShell: false }
+  }
+  if (h === 'perl') return { inlineShort: 'eE', inlineLong: [], valueShort: 'ImM', valueLong: [], moduleShort: '', isShell: false }
+  if (h === 'ruby') return { inlineShort: 'e', inlineLong: [], valueShort: 'Ir', valueLong: ['require'], moduleShort: '', isShell: false }
+  if (h === 'node') return { inlineShort: 'ep', inlineLong: ['eval', 'print'], valueShort: 'r', valueLong: ['require'], moduleShort: '', isShell: false }
+  if (h === 'php') return { inlineShort: 'r', inlineLong: [], valueShort: 'd', valueLong: [], moduleShort: '', isShell: false }
+  return null
+}
+
+/** The argument carried by an inline-code flag at operand `k`, given the
+ *  interpreter `spec` — the attached remainder (`-c"$(x)"`, `--eval=…`, bundled
+ *  `-xc…`) or the next word — when operand `k` IS such a flag; otherwise null. */
+function inlineCodeArg(operands: BashWord[], k: number, spec: InterpSpec): BashWord | null {
+  const w = operands[k] as BashWord
+  const long = w.masked.match(/^--([A-Za-z][\w-]*)(=?)(.*)$/s)
+  if (long) {
+    if (!spec.inlineLong.includes((long[1] as string).toLowerCase())) return null
+    const rest = long[3] as string
+    if ((long[2] as string).length > 0 || rest.length > 0) {
+      return { masked: rest, raw: w.raw.slice(w.masked.length - rest.length) }
+    }
+    return operands[k + 1] ?? null
+  }
+  const cluster = w.masked.match(/^-([A-Za-z]+)(.*)$/)
+  if (!cluster) return null
+  const letters = cluster[1] as string
+  if (![...letters].some((ch) => spec.inlineShort.includes(ch))) return null
+  const rest = cluster[2] as string
+  if (rest.length > 0) {
+    return { masked: rest, raw: w.raw.slice(w.masked.length - rest.length) }
+  }
+  return operands[k + 1] ?? null
+}
+
+/** Does the stage carry an inline-code flag (program supplied inline)? */
+function hasInlineFlag(operands: BashWord[], spec: InterpSpec): boolean {
+  return operands.some((_w, k) => inlineCodeArg(operands, k, spec) !== null)
+}
+
+/** Is ANY inline-code argument a NETWORK substitution? `python3 -c "$(curl)"`,
+ *  `node -pe "$(curl)"`, `bash -o pipefail -c "$(curl)"` run the download AS
+ *  code → card. A net sub passed as later argv (`python3 -c "<lit>" "$(curl)"`)
+ *  is data → no match. Scans ALL operands (an option value before the real flag
+ *  must not stop the search) and checks EACH inline flag's argument. */
+function inlineCodeArgIsNet(operands: BashWord[], spec: InterpSpec): boolean {
+  for (let k = 0; k < operands.length; k += 1) {
+    const arg = inlineCodeArg(operands, k, spec)
+    if (arg !== null && wordOpensNetSub(arg)) return true
+  }
   return false
+}
+
+/** When an interpreter has NO inline-code flag, its PROGRAM comes from the first
+ *  script operand or from stdin. Returns true when that program is network-
+ *  sourced: a `<(net)` script-position operand (`bash <(curl)`), or stdin fed by
+ *  a net here-string / input redirection when the program is read from stdin
+ *  (`bash <<<"$(curl)"`, `bash < <(curl)`, `bash /dev/stdin < <(curl)`). A local
+ *  script operand (`python3 app.py …`) means the program is local → false. */
+function interpreterProgramFromNet(operands: BashWord[]): boolean {
+  let stdinIsNet = false
+  for (let k = 0; k < operands.length; k += 1) {
+    const w = operands[k] as BashWord
+    const m = w.masked
+    // A process substitution in operand position is the script file.
+    if (m.startsWith('<(')) return wordOpensNetSub(w)
+    if (m.startsWith('>(')) continue
+    // A redirection operator (attached target, or target in the next word).
+    const rm = m.match(/^([0-9]*(?:<<<|<<|<|>>|>|&>|<&|>&))(.*)$/)
+    if (rm) {
+      const op = rm[1] as string
+      const rest = rm[2] as string
+      const isStdin = op === '<' || op === '<<<' || op === '0<'
+      let target: BashWord | undefined
+      if (rest.length > 0) {
+        target = { masked: rest, raw: w.raw.slice(m.length - rest.length) }
+      } else {
+        target = operands[k + 1]
+        if (target !== undefined) k += 1
+      }
+      if (isStdin && target !== undefined && wordOpensNetSub(target)) stdinIsNet = true
+      continue
+    }
+    if (/^-/.test(m)) continue // a flag (non-inline — those are handled by the caller)
+    // A stdin-device operand keeps the program on fd 0 (scan on for its source);
+    // any other operand is a local script path → program is local.
+    if (STDIN_DEVICE_RE.test(dequoteWord(w.raw))) continue
+    return false
+  }
+  return stdinIsNet
+}
+
+/** Where does an interpreter stage read its PROGRAM from? `inline` (a `-c`/`-e`/…
+ *  argument), `localscript` (a local file operand or `python -m mod`), or `stdin`
+ *  (bare interpreter, a stdin-device operand, or `-`). Spec-aware so option
+ *  VALUES (`node -r mod`, `python -W ignore`) are not mistaken for the script. */
+function interpreterProgramKind(st: BashStage): 'inline' | 'localscript' | 'stdin' {
+  const { toks, headIdx } = stageWords(st)
+  if (headIdx >= toks.length) return 'stdin'
+  const head = dequoteWord((toks[headIdx] as BashWord).raw).replace(/^.*\//, '')
+  const spec = interpreterSpec(head)
+  const operands = toks.slice(headIdx + 1)
+  if (spec && hasInlineFlag(operands, spec)) return 'inline'
+  for (let k = 0; k < operands.length; k += 1) {
+    const w = operands[k] as BashWord
+    const m = w.masked
+    if (m.startsWith('<(') || m.startsWith('>(')) return 'localscript'
+    const rm = m.match(/^([0-9]*(?:<<<|<<|<|>>|>|&>|<&|>&))(.*)$/)
+    if (rm) {
+      if ((rm[2] as string).length === 0) k += 1 // separate-word redirect target
+      continue
+    }
+    const long = m.match(/^--([A-Za-z][\w-]*)(=?)/)
+    if (long) {
+      if (spec && spec.valueLong.includes((long[1] as string).toLowerCase()) && (long[2] as string).length === 0) k += 1
+      continue
+    }
+    if (/^-/.test(m)) {
+      const cm = m.match(/^-([A-Za-z]+)(.*)$/)
+      if (cm && spec) {
+        const letters = cm[1] as string
+        if ([...letters].some((c) => spec.moduleShort.includes(c))) return 'localscript' // `-m mod` = local program
+        const last = letters.charAt(letters.length - 1)
+        if (spec.valueShort.includes(last) && (cm[2] as string).length === 0) k += 1 // value is the next word
+      }
+      continue
+    }
+    return STDIN_DEVICE_RE.test(dequoteWord(w.raw)) ? 'stdin' : 'localscript'
+  }
+  return 'stdin'
+}
+
+// An exec/eval marker applied DIRECTLY to stdin within the same call — the
+// canonical `python3 -c "exec(sys.stdin.read())"`, `os.system(open(0).read())`,
+// `node -e "eval(readFileSync(0))"`, `pickle.loads(sys.stdin…)`, `exec(input())`.
+// The marker must PRECEDE the stdin reference within a short window so a benign
+// JSON parse that merely references a key named `"system"` does not trip it.
+const STDIN_REF_ALT =
+  '(?:sys\\.stdin|process\\.stdin|\\bstdin\\b|\\binput\\s*\\(|\\bread(?:File)?(?:Sync)?\\s*\\(\\s*0|\\bopen\\s*\\(\\s*0|\\bfdopen\\s*\\(\\s*0|\\bos\\.read\\s*\\(\\s*0|/dev/stdin|<&?\\s*0\\b)'
+const STDIN_EXEC_CI_RE = new RegExp(
+  `\\b(?:eval|exec\\w*|execfile|system|popen|spawn\\w*|compile|__import__|importlib|runpy|pickle|marshal|runInThisContext|child_process)\\b[\\s\\S]{0,80}?${STDIN_REF_ALT}`,
+  'i',
+)
+// The JS `Function` CONSTRUCTOR — case-SENSITIVE so the ordinary `function`
+// keyword (`function p(x){…}`) is NOT read as a stdin-exec sink.
+const STDIN_EXEC_FUNCTION_RE = new RegExp(`\\bFunction\\s*\\([\\s\\S]{0,80}?${STDIN_REF_ALT}`)
+// Shell-level stdin execution inside a `-c` literal: `source`/`.` of a stdin
+// device, or a nested interpreter reading its program from stdin
+// (`bash /dev/stdin`, `sh -s`, `python3 -`). These run piped network bytes as
+// code without any of the function-call markers above.
+const STDIN_EXEC_SHELL_RE =
+  /(?:\bsource\b|(?:^|[;|&(]|\b(?:then|do|else|elif)\s)\s*\.)\s+[^\n;|&]{0,40}(?:\/dev\/stdin|\/dev\/fd\/0|\/proc\/self\/fd\/0|<&?\s*0\b)|\b(?:sh|bash|zsh|ksh|dash|fish|python[0-9.]*|perl|ruby|node|php)\s+(?:[^\n;|&]{0,30}\s)?(?:-s\b|-\s|-$|\/dev\/stdin|\/dev\/fd\/0|\/proc\/self\/fd\/0)/i
+
+/** Strip a single outer matching quote pair (the shell quoting of an inline-code
+ *  argument), PRESERVING inner quotes so a printed string literal stays quoted
+ *  (`'printf "%s" "curl|sh"'` → `printf "%s" "curl|sh"`, not bare code). */
+function stripOuterQuotes(s: string): string {
+  if (s.length >= 2) {
+    const f = s.charAt(0)
+    if ((f === "'" || f === '"') && s.charAt(s.length - 1) === f) return s.slice(1, -1)
+  }
+  return s
+}
+
+/** Does a single inline-code program read AND execute stdin? */
+function codeExecsStdin(code: string): boolean {
+  return STDIN_EXEC_CI_RE.test(code) || STDIN_EXEC_FUNCTION_RE.test(code) || STDIN_EXEC_SHELL_RE.test(code)
+}
+
+/** A shell inline literal that, parsed as shell, contains a stage whose head is
+ *  an interpreter reading its PROGRAM from stdin — `bash -c 'bash'`,
+ *  `bash -c 'exec bash'`, `bash -c 'bash <&0'`. That nested interpreter inherits
+ *  the outer stage's (piped, network) fd 0 and runs it as code. */
+function shellLiteralReadsStdin(code: string, depth: number): boolean {
+  if (depth >= 3) return true // recursion cap → fail closed
+  const masked = maskQuotedLiterals(maskHeredocBodies(code)) ?? code
+  for (const stages of splitPipelines(code, masked)) {
+    for (const st of stages) {
+      if (st === undefined) continue
+      if (INTERP_HEAD_RE.test(stageHead(st)) && interpreterProgramKind(st) === 'stdin') return true
+    }
+  }
+  return false
+}
+
+/** An inline-code literal that itself reads AND executes stdin
+ *  (`python3 -c "exec(sys.stdin.read())"`, `bash -c 'source /dev/stdin'`,
+ *  `bash -c 'bash'`) — the piped download becomes code. Tested on the inline
+ *  ARGUMENT (not the whole stage) so the outer `bash -c` prefix can't itself
+ *  match; for shell interpreters the literal is also parsed as shell. */
+function inlineExecsStdin(st: BashStage, depth = 0): boolean {
+  const { toks, headIdx } = stageWords(st)
+  if (headIdx >= toks.length) return false
+  const head = dequoteWord((toks[headIdx] as BashWord).raw).replace(/^.*\//, '')
+  const spec = interpreterSpec(head)
+  if (spec === null) return false
+  const operands = toks.slice(headIdx + 1)
+  for (let k = 0; k < operands.length; k += 1) {
+    const arg = inlineCodeArg(operands, k, spec)
+    if (arg === null) continue
+    const code = stripOuterQuotes(arg.raw)
+    if (codeExecsStdin(code)) return true
+    if (spec.isShell && shellLiteralReadsStdin(code, depth + 1)) return true
+  }
+  return false
+}
+
+/** Does an interpreter/eval stage execute a NETWORK substitution that sits in
+ *  CODE position (R2)? Code position = eval/source argument; the inline-code
+ *  argument (`python3 -c "$(curl)"`); a `<(net)` script operand; or stdin fed by
+ *  a net here-string / input redirection when the program is read from stdin. A
+ *  net sub passed as plain argv (`python3 -c "<lit>" "$(curl)"`) or as a data
+ *  filename after a local script (`python3 app.py <(curl)`, `bash app.sh
+ *  <<<"$(curl)"`) is DATA → no card. */
+function stageExecutesNetSubstitution(st: BashStage): boolean {
+  const { toks, headIdx } = stageWords(st)
+  if (headIdx >= toks.length) return false
+  const head = dequoteWord((toks[headIdx] as BashWord).raw).replace(/^.*\//, '')
+  if (!EXEC_SINK_HEAD_RE.test(head)) return false
+  const netSubs = stageSubstitutions(st.masked, st.raw).filter((s) => innerHasNetSource(s.rawInner))
+  if (netSubs.length === 0) return false
+  // eval / source / . execute every substitution argument.
+  if (EVAL_SOURCE_RE.test(head)) return true
+  const spec = interpreterSpec(head)
+  if (spec === null) return false
+  const operands = toks.slice(headIdx + 1)
+  // With an inline-code flag the program is that argument; everything else is
+  // data — card only if an inline argument itself is a network substitution.
+  if (hasInlineFlag(operands, spec)) return inlineCodeArgIsNet(operands, spec)
+  // No inline flag: program comes from a script operand or stdin.
+  return interpreterProgramFromNet(operands)
+}
+
+/** Does a stage execute piped (network-sourced) bytes (R1)? Its head is an
+ *  interpreter that reads its program from stdin (the pipe IS the program) or
+ *  whose inline literal exec()s stdin; or it tees the stream into a `>(…)` /
+ *  `<(…)` process substitution whose inner pipeline ends in an interpreter
+ *  (`tee >(bash)`, `tee >(cat | bash)`). An interpreter running a LOCAL script
+ *  or a benign inline literal treats the pipe as DATA → not an executor.
+ *  Depth-guarded, failing CLOSED on an uninspected process sub at the cap. */
+function stageExecutesPipedData(st: BashStage, depth = 0): boolean {
+  if (INTERP_HEAD_RE.test(stageHead(st))) {
+    const kind = interpreterProgramKind(st)
+    if (kind === 'stdin') return true // the piped download is the program
+    if (kind === 'inline' && inlineExecsStdin(st)) return true // -c literal exec()s stdin
+  }
+  const procSubs = stageSubstitutions(st.masked, st.raw).filter((s) => s.kind === '>(' || s.kind === '<(')
+  if (procSubs.length === 0) return false
+  if (depth >= 4) return true // uninspected process substitution at max depth → fail closed
+  for (const sub of procSubs) {
+    if (pipelineExecutesData(sub.rawInner, depth + 1)) return true
+  }
+  return false
+}
+
+/** Any stage of a (sub-)command executes piped data — used to recurse into
+ *  process-substitution bodies. Depth cap fails safe to card. */
+function pipelineExecutesData(text: string, depth: number): boolean {
+  if (depth >= 5) return true
+  const masked = maskQuotedLiterals(maskHeredocBodies(text)) ?? text
+  for (const stages of splitPipelines(text, masked)) {
+    for (const st of stages) {
+      if (stageExecutesPipedData(st, depth)) return true
+    }
+  }
+  return false
+}
+
+/** The first command word of a stage WITHOUT stripping a `sudo` wrapper — so a
+ *  pipe INTO sudo (`echo x | sudo tee …`) is detectable (R4). */
+function stageCommandWord(st: BashStage): string {
+  const toks = tokenizeStage(st)
+  let k = 0
+  while (k < toks.length && ASSIGN_RE.test((toks[k] as BashWord).masked)) k += 1
+  if (k >= toks.length) return ''
+  return dequoteWord((toks[k] as BashWord).raw).replace(/^.*\//, '').toLowerCase()
+}
+
+/** A shell interpreter's `-c '<literal>'` argument is itself shell code — scan
+ *  it recursively so `bash -c 'curl … | sh'` cards. (A net-substitution
+ *  `-c "$(curl)"` is already caught by stageExecutesNetSubstitution.) */
+function shellInlineExecutesEvasion(st: BashStage, depth: number): boolean {
+  const { toks, headIdx } = stageWords(st)
+  if (headIdx >= toks.length) return false
+  const head = dequoteWord((toks[headIdx] as BashWord).raw).replace(/^.*\//, '')
+  const spec = interpreterSpec(head)
+  if (spec === null || !spec.isShell) return false
+  const operands = toks.slice(headIdx + 1)
+  for (let k = 0; k < operands.length; k += 1) {
+    const arg = inlineCodeArg(operands, k, spec)
+    // Strip only the OUTER shell quote — inner quotes stay so a printed string
+    // literal (`printf "%s" "curl | sh"`) is not rescanned as bare code.
+    if (arg !== null && bashEvasion(stripOuterQuotes(arg.raw), depth + 1)) return true
+  }
+  return false
+}
+
+function bashEvasion(rawCommand: string, depth: number): boolean {
+  if (depth >= 3) return true // shell `-c` recursion cap → fail closed
+  const masked = maskQuotedLiterals(maskHeredocBodies(rawCommand))
+  // Unbalanced quotes → fail-closed: scan the raw command conservatively.
+  const safe = masked ?? rawCommand
+  for (const stages of splitPipelines(rawCommand, safe)) {
+    // (R4) a non-first pipeline stage piped into sudo.
+    for (let j = 1; j < stages.length; j++) {
+      const st = stages[j]
+      if (st !== undefined && stageCommandWord(st) === 'sudo') return true
+    }
+    // (R2) a network substitution executed in code position; (recursion) a shell
+    //      `-c` literal that itself contains a download-exec.
+    for (const st of stages) {
+      if (st === undefined) continue
+      if (stageExecutesNetSubstitution(st)) return true
+      if (shellInlineExecutesEvasion(st, depth)) return true
+    }
+    // (R1) network/decode source reaching an executor in a LATER stage.
+    for (let i = 0; i < stages.length; i++) {
+      const src = stages[i]
+      if (src === undefined || !NET_SOURCE_RE.test(src.masked)) continue
+      for (let j = i + 1; j < stages.length; j++) {
+        const sink = stages[j]
+        if (sink !== undefined && stageExecutesPipedData(sink)) return true
+      }
+    }
+  }
+  return false
+}
+
+function bashConfirmEvasion(rawCommand: string): boolean {
+  return bashEvasion(rawCommand, 0)
 }
 
 /**
@@ -969,7 +1702,11 @@ export function classifyToolCall(input: ClassifyInput): PermissionVerdict {
     if (standing.length > 0) {
       return { tier: 'confirm', reason: `risky command needs confirmation: ${standing[0]}`, matchedRule: `builtin:confirm_bash:${standing[0]}` }
     }
-    if (bashConfirmEvasion(commandLower)) {
+    // Pass the RAW command (commandLower !== undefined ⇒ rawCommand defined):
+    // the detector is quote/heredoc-aware and matches command names case-
+    // insensitively itself, so lowercasing here would only re-introduce the
+    // flag-case collapse (`-C`/`-c`) that bit gitExecSurface.
+    if (bashConfirmEvasion(rawCommand!)) {
       return { tier: 'confirm', reason: 'pipe-to-interpreter download needs confirmation', matchedRule: 'builtin:confirm_bash:pipe-interpreter' }
     }
     // Non-overridable: git config/hook execution surfaces (a downgraded
