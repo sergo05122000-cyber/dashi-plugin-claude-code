@@ -34,6 +34,7 @@ import {
   // 2026-06-09 deep checks (multi-agent / multichat / gate / bind / hygiene)
   selectHookProfile,
   resolveSettingsPath,
+  resolveEffectivePluginDir,
   findMatchingRuntime,
   extractEnvAssignment,
   parseListeners,
@@ -882,9 +883,14 @@ describe('permission policy lint', () => {
     const c = checkPermissionPolicy(y, '/p').find((x) => x.id === 'permission-policy-risky-override')
     expect(c?.status).toBe('warn')
   })
-  test('lifting sudo / rm -rf → FAIL; lifting only git push → pass', () => {
+  test('lifting sudo / rm -rf → WARN (ultra-autonomy, deliberate); lifting only git push → pass', () => {
+    // 2026-06-10: warchief ultra-autonomy order downgraded this from FAIL to
+    // WARN — sudo/rm-rf are overridable BUILTIN_CONFIRM rules (not hard-deny),
+    // so lifting them is an eyes-open owner choice, still surfaced as a WARN.
     const bad = 'confirm_overrides:\n  builtin_rules:\n    - "sudo "\n'
-    expect(checkPermissionPolicy(bad, '/p').find((c) => c.id === 'permission-policy-risky-override')?.status).toBe('fail')
+    const badCheck = checkPermissionPolicy(bad, '/p').find((c) => c.id === 'permission-policy-risky-override')
+    expect(badCheck?.status).toBe('warn')
+    expect(badCheck?.detail).toContain('sudo ')
     const ok = 'confirm_overrides:\n  builtin_rules:\n    - "git push"\n'
     expect(checkPermissionPolicy(ok, '/p').find((c) => c.id === 'permission-policy-risky-override')?.status).toBe('pass')
   })
@@ -1003,6 +1009,25 @@ describe('matchAgentForPlugin', () => {
   })
   test('no match → null (no cross-agent false positive)', () => {
     expect(matchAgentForPlugin([agent('arthas', '/srv/a/plugin', '/srv/a/.claude')], '/srv/t/plugin')).toBeNull()
+  })
+})
+
+describe('resolveEffectivePluginDir — autodetect adopts the unit WorkingDirectory (2026-06-10 self-FP)', () => {
+  // Running doctor from the repo root (cwd != the plugin/ the session runs in)
+  // resolved settings to user-level and false-FAILed the gate. When autodetect
+  // matched a unit whose WorkingDirectory is the real plugin checkout, trust it.
+  const hasDotClaude = (p: string) => p === join('/srv/t/jc/plugin', '.claude')
+  test('non-explicit + unit WorkingDirectory with .claude/ → adopt the unit dir', () => {
+    expect(resolveEffectivePluginDir('/srv/t/jc', false, '/srv/t/jc/plugin', hasDotClaude)).toBe('/srv/t/jc/plugin')
+  })
+  test('explicit --plugin-dir is never overridden', () => {
+    expect(resolveEffectivePluginDir('/srv/t/jc', true, '/srv/t/jc/plugin', hasDotClaude)).toBe('/srv/t/jc')
+  })
+  test('unit dir without a .claude/ is not adopted (not a real checkout)', () => {
+    expect(resolveEffectivePluginDir('/srv/t/jc', false, '/srv/t/other', hasDotClaude)).toBe('/srv/t/jc')
+  })
+  test('no unit WorkingDirectory → keep the cwd plugin dir', () => {
+    expect(resolveEffectivePluginDir('/srv/t/jc', false, null, hasDotClaude)).toBe('/srv/t/jc')
   })
 })
 
