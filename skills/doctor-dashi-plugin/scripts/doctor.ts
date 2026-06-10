@@ -801,6 +801,30 @@ export function resolveSettingsPath(
   return { path: homeSettingsPath, source: 'home' }
 }
 
+/**
+ * The effective plugin dir to inspect. Running the doctor from the repo root
+ * (cwd ≠ the plugin/ the live session runs in) made settings resolve to
+ * user-level → a FALSE gate FAIL (2026-06-10 self-FP, found running the new
+ * permission-gate checks on Thrall). When autodetect matched a systemd unit
+ * whose WorkingDirectory IS a real plugin checkout (has a .claude/), trust the
+ * unit: that is the dir the live session actually runs from, so its
+ * .claude/settings.json is the one that fires. An explicit --plugin-dir always
+ * wins (the operator asked for a specific dir).
+ */
+export function resolveEffectivePluginDir(
+  cwdPluginDir: string,
+  pluginDirExplicit: boolean,
+  unitWorkingDir: string | null,
+  // Must test for a `.claude/` DIRECTORY, not just any node (Codex Low
+  // 2026-06-10) — a stray `.claude` file must not trigger adoption.
+  dirExists: (p: string) => boolean = (p) => { try { return statSync(p).isDirectory() } catch { return false } },
+): string {
+  if (!pluginDirExplicit && unitWorkingDir && dirExists(join(unitWorkingDir, '.claude'))) {
+    return resolve(unitWorkingDir)
+  }
+  return cwdPluginDir
+}
+
 export interface RuntimeCandidate {
   pid: string
   cwd: string
@@ -1028,12 +1052,18 @@ export function checkPermissionPolicy(policyText: string | null, policyPath: str
   const { rules: overrides, opaque } = extractConfirmOverrides(policyText)
   const dangerous = overrides.filter((o) => DANGEROUS_OVERRIDE_RULES.some((d) => o === d || o === d.trim()))
   if (dangerous.length > 0) {
+    // WARN, not FAIL (warchief ultra-autonomy order 2026-06-10): sudo / rm -rf
+    // are BUILTIN_CONFIRM rules (overridable by design), not hard-deny — lifting
+    // them is a legitimate, deliberate owner choice. The genuinely catastrophic
+    // forms (rm -rf /, fork bomb, dd-to-disk) and secret reads stay hard-denied
+    // in code regardless of this list, so this is "eyes-open elevation", not a
+    // safety hole. We still surface it so an UNINTENDED lift is visible.
     out.push({
       id: 'permission-policy-risky-override',
-      title: 'confirm_overrides does not lift sudo / rm -rf',
-      status: 'fail',
-      detail: `confirm_overrides lifts catastrophic rule(s): ${dangerous.join(', ')} — these must always reach the owner`,
-      fix: 'remove sudo / rm -rf from confirm_overrides.builtin_rules; override only narrow rules like git push',
+      title: 'confirm_overrides lifts sudo / rm -rf (ultra-autonomy)',
+      status: 'warn',
+      detail: `confirm_overrides lifts ${dangerous.join(', ')} to run silently — deliberate under ultra-autonomy; catastrophic forms (rm -rf /, secrets) stay hard-denied in code regardless`,
+      fix: 'intended? leave it. If not, remove these from confirm_overrides.builtin_rules',
     })
   } else if (opaque) {
     out.push({
@@ -1721,6 +1751,8 @@ interface Options {
   json: boolean
   os: OS
   pluginDir: string
+  /** True when --plugin-dir was given explicitly (autodetect must not override it). */
+  pluginDirExplicit: boolean
   settingsPath: string
   /** True when --settings was given explicitly (never overridden by resolution). */
   settingsExplicit: boolean
@@ -1741,6 +1773,7 @@ function parseArgs(argv: string[]): Options | { error: string } {
     json: false,
     os: detectOS(),
     pluginDir: process.cwd(),
+    pluginDirExplicit: false,
     settingsPath: join(homedir(), '.claude', 'settings.json'),
     settingsExplicit: false,
   }
@@ -1767,6 +1800,7 @@ function parseArgs(argv: string[]): Options | { error: string } {
         // detection, unit matching) assumes an absolute path; a relative
         // `--plugin-dir plugin` broke two checks (fleet sweep, 2026-06-09).
         opts.pluginDir = resolve(next())
+        opts.pluginDirExplicit = true
         break
       case '--settings':
         opts.settingsPath = next()
@@ -1884,6 +1918,16 @@ function gatherChecks(opts: Options): Check[] {
     const agents = scanFleet(unitDir)
     unitAgent = matchAgentForPlugin(agents, opts.pluginDir)
     if (unitAgent) {
+      // Adopt the unit's WorkingDirectory as the plugin dir (unless --plugin-dir
+      // was explicit): running from the repo root otherwise resolves settings to
+      // user-level and false-FAILs the gate (2026-06-10 self-FP). Must happen
+      // BEFORE settings resolution below. NOTE (Codex Medium 2026-06-10): systemd
+      // WorkingDirectory is the INITIAL cwd; if the live process cd'd elsewhere
+      // the adopted dir could differ from the running copy. The `dev-vs-runtime`
+      // check below independently compares this pluginDir against the actual
+      // pgrep'd server cwd and WARNs on a mismatch, so an adopted-but-wrong dir
+      // cannot silently pass as healthy.
+      opts.pluginDir = resolveEffectivePluginDir(opts.pluginDir, opts.pluginDirExplicit, unitAgent.workingDirectory)
       const inferred: string[] = []
       if (!opts.envPath && unitAgent.envPath) {
         opts.envPath = unitAgent.envPath
