@@ -65,6 +65,11 @@ export type InboundMessage = {
   user: string
   reply_context?: string
   media_paths?: string[]
+  // Rendered `<media ... />` descriptor tags (one physical line each —
+  // renderMediaDescriptor guarantees it). This is how voice transcripts
+  // reach the per-chat session: parity with the DM path, where
+  // buildChannelContent puts the same strings above the user text.
+  media_descriptors?: string[]
   timestamp: string
   // Telegram message_id (stringified) of the triggering message — the one
   // that summoned the bot (an @mention or reply-to-bot in a group). The

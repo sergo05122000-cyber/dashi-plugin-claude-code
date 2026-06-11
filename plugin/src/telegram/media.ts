@@ -186,7 +186,13 @@ export function renderMediaDescriptor(media: MediaDescriptor): string {
   }
 
   parts.push(' />')
-  return parts.join('')
+  // Single-physical-line invariant: escapeHtmlAttr neutralizes quotes/<>
+  // but passes CR/LF/tabs through, and a Groq transcript can contain
+  // them. The multichat watcher pastes prompts line-oriented into a tmux
+  // composer and fingerprints the first line — a descriptor split across
+  // lines would corrupt both. Collapse all control chars to one space.
+  // eslint-disable-next-line no-control-regex
+  return parts.join('').replace(/[\u0000-\u001f]+/g, ' ')
 }
 
 // ─────────────────────────────────────────────────────────────────────
