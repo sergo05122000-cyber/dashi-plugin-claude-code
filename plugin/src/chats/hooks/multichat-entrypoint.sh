@@ -107,11 +107,36 @@ wait_claude_ready() {
 prompt_fingerprint() {
   printf '%s' "$1" | python3 -c '
 import sys
-for line in sys.stdin.read().splitlines():
-    line = line.strip()
-    if len(line) >= 4:
-        sys.stdout.write(line[:60])
-        break
+lines = [l.strip() for l in sys.stdin.read().splitlines()]
+# Selection order (build_prompt renders reply_context -> descriptors ->
+# speaker line -> media paths):
+#   1. The LAST "[from @" line, if long enough to be distinctive. Last,
+#      not first: reply_context precedes the current message and a
+#      quoted body may itself contain a "[from @old]" line — picking it
+#      would verify the wrong text (false submit confirmation).
+#   2. A "<media " descriptor line. Its head carries the per-message
+#      file_id, so a caption-less voice note (bare attribution shorter
+#      than the threshold — identical across every voice note from the
+#      same user) still gets a unique fingerprint. The first 60 chars
+#      sit on one visual pane row even after tmux wraps the long tail.
+#   3. The bare speaker line, then any line >= 4 chars (legacy fallback).
+speaker = next(
+    (l for l in reversed(lines) if l.startswith("[from @") and len(l) >= 4),
+    None,
+)
+if speaker is not None and len(speaker) >= 20:
+    sys.stdout.write(speaker[:60])
+else:
+    descriptor = next((l for l in lines if l.startswith("<media ")), None)
+    if descriptor is not None:
+        sys.stdout.write(descriptor[:60])
+    elif speaker is not None:
+        sys.stdout.write(speaker[:60])
+    else:
+        for line in lines:
+            if len(line) >= 4:
+                sys.stdout.write(line[:60])
+                break
 ' || true
 }
 
@@ -186,6 +211,8 @@ submit_prompt() {
 
 # Parse one JSON file into a single prompt string. Reads the file path
 # from $INBOX_FILE so nothing user-controlled is interpolated into shell.
+# Exit codes: 0 = prompt on stdout; 1 = parse failure; 3 = nothing to
+# deliver (no text, no media, no reply context) — caller must NOT submit.
 build_prompt() {
   INBOX_FILE="$1" python3 - <<'PYEOF'
 import json
@@ -206,27 +233,57 @@ if not isinstance(d, dict):
           file=sys.stderr)
     sys.exit(1)
 
-parts = []
-
-reply_context = d.get('reply_context')
-if isinstance(reply_context, str) and reply_context:
-    parts.append(reply_context)
-
 text = d.get('text', '') or ''
 user = d.get('user', '') or ''
-if user:
-    parts.append(f'[from @{user}] {text}')
-else:
-    parts.append(text)
 
-media_paths = d.get('media_paths') or []
-if isinstance(media_paths, list):
-    for p in media_paths:
-        if isinstance(p, str) and p:
-            parts.append(f'[media: {p}]')
+reply_context = d.get('reply_context')
+if isinstance(reply_context, str):
+    # strip() so whitespace-only context cannot defeat the skip-empty
+    # contract below (Codex review, 2026-06-11).
+    reply_context = reply_context.strip() or None
+else:
+    reply_context = None
+
+raw_descriptors = d.get('media_descriptors') or []
+descriptors = [m for m in raw_descriptors
+               if isinstance(m, str) and m.strip()] \
+    if isinstance(raw_descriptors, list) else []
+
+raw_paths = d.get('media_paths') or []
+media_paths = [p for p in raw_paths if isinstance(p, str) and p] \
+    if isinstance(raw_paths, list) else []
+
+# Skip-empty contract: with no payload on ANY channel there is nothing
+# for the model to act on — submitting would paste an attribution-only
+# prompt the verify loop may never confirm (the 2026-06-11 incident:
+# voice messages arrived with empty text before transcripts were
+# carried, and the watcher burned 5 attempts on a no-op submit).
+if not text.strip() and reply_context is None \
+        and not descriptors and not media_paths:
+    sys.exit(3)
+
+parts = []
+
+if reply_context is not None:
+    parts.append(reply_context)
+
+# Media descriptors go ABOVE the speaker line, matching the DM path
+# (buildChannelContent renders media before text). Note the residual
+# divergence: DM puts reply metadata LAST, this path renders
+# reply_context FIRST (pre-existing ordering, kept as-is).
+parts.extend(descriptors)
+
+if user:
+    parts.append(f'[from @{user}] {text}' if text else f'[from @{user}]')
+else:
+    if text:
+        parts.append(text)
+
+for p in media_paths:
+    parts.append(f'[media: {p}]')
 
 # Two-newline join so the model sees explicit paragraph breaks between
-# the reply context, the main text, and the media descriptors.
+# the reply context, the media descriptors, and the main text.
 sys.stdout.write('\n\n'.join(parts))
 PYEOF
 }
@@ -235,11 +292,17 @@ PYEOF
 # NOTE: We deliberately do NOT recurse into .processed/ — `find -maxdepth 1`
 # plus the leading-dot exclusion handled by the *.json glob keeps us safe.
 process_inbox() {
-  local f msg_text
+  local f msg_text rc
   while IFS= read -r -d '' f; do
     [[ -f "$f" ]] || continue
-    msg_text="$(build_prompt "$f" || true)"
-    if [[ -n "$msg_text" ]]; then
+    rc=0
+    msg_text="$(build_prompt "$f")" || rc=$?
+    if [[ "$rc" -eq 3 ]]; then
+      # Nothing to deliver (no text / media / reply context) — never
+      # paste an empty prompt into the composer. Keep the file for
+      # triage under a distinct prefix.
+      mv "$f" "${PROCESSED}/skipped-empty-$(basename "$f")"
+    elif [[ "$rc" -eq 0 && -n "$msg_text" ]]; then
       if submit_prompt "$msg_text"; then
         mv "$f" "${PROCESSED}/$(basename "$f")"
       else

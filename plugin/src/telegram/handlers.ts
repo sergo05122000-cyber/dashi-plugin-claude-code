@@ -502,6 +502,10 @@ async function gateAndNotify(
       timestamp: new Date().toISOString(),
       ...(replyContext !== undefined ? { reply_context: replyContext } : {}),
       ...(mediaPaths.length > 0 ? { media_paths: mediaPaths } : {}),
+      // Rendered descriptors carry what `text` cannot — notably the voice
+      // transcript. Dropping them here was the 2026-06-11 bug: group voice
+      // messages reached the per-chat session as empty text.
+      ...(renderedMedia.length > 0 ? { media_descriptors: renderedMedia } : {}),
       ...(ctx.message?.message_id !== undefined
         ? { message_id: String(ctx.message.message_id) }
         : {}),
