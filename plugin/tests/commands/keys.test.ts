@@ -155,3 +155,12 @@ describe('sendNamedKey', () => {
     expect(calls).toEqual([['-L', 'sk', 'send-keys', '-t', '%3', 'Escape']])
   })
 })
+
+describe('parseCcCommand newline guard', () => {
+  test('any carriage return or newline is rejected', () => {
+    for (const bad of ['compact\n; rm', 'compact\nrm -rf /', 'a\rb', 'model\nopus']) {
+      const r = parseCcCommand(bad)
+      expect('error' in r).toBe(true)
+    }
+  })
+})

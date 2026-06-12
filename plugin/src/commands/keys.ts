@@ -151,6 +151,12 @@ export function parseCcCommand(args: string): ParsedCc | { error: string } {
   if (trimmed.length === 0) {
     return { error: 'usage: /cc <команда> [аргументы] — напр. /cc compact, /cc model opus' }
   }
+  // Explicit newline reject (Codex/Fable review): the charset already excludes
+  // \r\n, but a bare-anchored regex CAN match before a trailing newline in JS,
+  // so reject up front to make the single-line invariant obvious and robust.
+  if (/[\r\n]/.test(trimmed)) {
+    return { error: 'аргументы не должны содержать переводов строки' }
+  }
   const wsIdx = trimmed.search(/\s/)
   const rawName = wsIdx === -1 ? trimmed : trimmed.slice(0, wsIdx)
   const name = rawName.toLowerCase().replace(/^\//, '')
