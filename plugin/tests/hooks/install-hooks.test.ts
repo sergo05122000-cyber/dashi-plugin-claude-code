@@ -360,3 +360,45 @@ function countPluginEntries(parsed: Record<string, unknown>): number {
   }
   return total
 }
+
+describe('applyPatch (pure) — channel reminder', () => {
+  test('registers the reminder hook on UserPromptSubmit only when reminderHelperPath set', () => {
+    const out = applyPatch({}, {
+      settingsPath: '/tmp/x',
+      chatId: '164795011',
+      webhookUrl: 'http://127.0.0.1:8093/hooks/agent',
+      helperPath: '/p/scripts/post-hook.ts',
+      reminderHelperPath: '/p/scripts/channel-reminder.ts',
+    }) as { hooks: Record<string, Array<{ marker?: string; hooks?: Array<{ command?: string }> }>> }
+    const ups = out.hooks.UserPromptSubmit ?? []
+    const reminder = ups.find((e) => e.marker === 'dashi-channel-reminder-hook')
+    expect(reminder).toBeDefined()
+    expect(reminder!.hooks?.[0]?.command).toContain('channel-reminder.ts')
+    expect(reminder!.hooks?.[0]?.command).toContain("CHAT_ID='164795011'")
+    // Reminder must NOT appear on other events.
+    for (const ev of ['SessionStart', 'PreToolUse', 'PostToolUse', 'Stop']) {
+      expect((out.hooks[ev] ?? []).find((e) => e.marker === 'dashi-channel-reminder-hook')).toBeUndefined()
+    }
+  })
+
+  test('absent reminderHelperPath → no reminder entry (back-compat)', () => {
+    const out = applyPatch({}, {
+      settingsPath: '/tmp/x',
+      chatId: '1',
+      webhookUrl: 'http://x',
+      helperPath: '/p/post-hook.ts',
+    }) as { hooks: Record<string, Array<{ marker?: string }>> }
+    expect((out.hooks.UserPromptSubmit ?? []).find((e) => e.marker === 'dashi-channel-reminder-hook')).toBeUndefined()
+  })
+
+  test('re-run replaces the reminder entry rather than duplicating', () => {
+    const opts = {
+      settingsPath: '/tmp/x', chatId: '1', webhookUrl: 'http://x',
+      helperPath: '/p/post-hook.ts', reminderHelperPath: '/p/channel-reminder.ts',
+    }
+    let s: Record<string, unknown> = applyPatch({}, opts)
+    s = applyPatch(s, opts)
+    const ups = (s as { hooks: Record<string, Array<{ marker?: string }>> }).hooks.UserPromptSubmit ?? []
+    expect(ups.filter((e) => e.marker === 'dashi-channel-reminder-hook').length).toBe(1)
+  })
+})

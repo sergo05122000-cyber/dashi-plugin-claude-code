@@ -28,6 +28,13 @@ const MARKER = 'dashi-channel-hook'
 // installs/updates alongside the notification-mirror hook without either
 // clobbering the other. Only added when --permission-gate-helper is given.
 const GATE_MARKER = 'dashi-permission-gate-hook'
+// Channel-reminder UserPromptSubmit hook (2026-06-12). Distinct marker so it
+// installs/updates alongside the notification-mirror hook. Re-injects the
+// Telegram-bridge reply discipline on every turn (the MCP server states it
+// only once at session start; agents forget over a long session). On-by-
+// default: parseArgs defaults --reminder-helper to the sibling script, so a
+// plain install wires it without an opt-in flag.
+const REMINDER_MARKER = 'dashi-channel-reminder-hook'
 // Substring of the dashi helper script path used to identify *markerless*
 // legacy entries — re-running install over a settings file that was
 // hand-edited (no marker but pointing at our post-hook.ts) used to leave
@@ -60,6 +67,9 @@ export interface PatchOptions {
   readonly permissionGateHelperPath?: string
   /** Optional explicit policy path for the gate hook (TELEGRAM_PERMISSION_POLICY_PATH). */
   readonly policyPath?: string
+  /** When set, register the channel-reminder UserPromptSubmit hook pointing at
+   *  this helper (scripts/channel-reminder.ts). Defaulted by the CLI. */
+  readonly reminderHelperPath?: string
 }
 
 interface HookEntry {
@@ -137,6 +147,20 @@ function buildGateEntry(opts: PatchOptions): HookEntry {
   }
 }
 
+// UserPromptSubmit command for the channel-reminder hook. The hook reads
+// CHAT_ID from env to pick the DM vs group reminder. No token, no webhook —
+// it emits additionalContext to stdout and never makes a network call.
+function buildReminderCommand(opts: PatchOptions): string {
+  return `CHAT_ID=${sq(opts.chatId)} bun ${sq(opts.reminderHelperPath!)}`
+}
+
+function buildReminderEntry(opts: PatchOptions): HookEntry {
+  return {
+    marker: REMINDER_MARKER,
+    hooks: [{ type: 'command', command: buildReminderCommand(opts) }],
+  }
+}
+
 // True if an entry's command string points at our helper script, even if
 // the marker was hand-stripped or never present. Survives different
 // absolute prefixes (e.g. user moved the plugin between dirs) by matching
@@ -162,13 +186,24 @@ export function applyPatch(settings: SettingsShape, opts: PatchOptions): Setting
     // markerless notification entry, OR the gate marker (re-added below for
     // PreToolUse). Unrelated entries survive untouched.
     const filtered = existing.filter(
-      (e) => !e || (e.marker !== MARKER && e.marker !== GATE_MARKER && !isLegacyDashiEntry(e)),
+      (e) =>
+        !e ||
+        (e.marker !== MARKER &&
+          e.marker !== GATE_MARKER &&
+          e.marker !== REMINDER_MARKER &&
+          !isLegacyDashiEntry(e)),
     )
     const rebuilt = [...filtered, next]
     // The gate hook lives on PreToolUse only, and is registered FIRST so its
     // deny verdict is evaluated before the notification mirror runs.
     if (event === 'PreToolUse' && withGate) {
       rebuilt.unshift(buildGateEntry(opts))
+    }
+    // The channel-reminder hook lives on UserPromptSubmit only. Appended after
+    // the mirror entry — both run; the mirror emits no stdout, the reminder
+    // emits additionalContext, so order is immaterial.
+    if (event === 'UserPromptSubmit' && opts.reminderHelperPath !== undefined) {
+      rebuilt.push(buildReminderEntry(opts))
     }
     hooks[event] = rebuilt
   }
@@ -183,6 +218,8 @@ function parseArgs(argv: ReadonlyArray<string>): PatchOptions {
   let helperPath = ''
   let permissionGateHelperPath: string | undefined
   let policyPath: string | undefined
+  let reminderHelperPath: string | undefined
+  let noReminder = false
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     const next = argv[i + 1]
@@ -193,6 +230,8 @@ function parseArgs(argv: ReadonlyArray<string>): PatchOptions {
     if (a === '--helper' && next) { helperPath = next; i++; continue }
     if (a === '--permission-gate-helper' && next) { permissionGateHelperPath = next; i++; continue }
     if (a === '--policy-path' && next) { policyPath = next; i++; continue }
+    if (a === '--reminder-helper' && next) { reminderHelperPath = next; i++; continue }
+    if (a === '--no-reminder') { noReminder = true; continue }
   }
   if (!settingsPath || !chatId || !webhookUrl) {
     process.stderr.write(
@@ -200,12 +239,19 @@ function parseArgs(argv: ReadonlyArray<string>): PatchOptions {
     )
     process.exit(2)
   }
+  const scriptDir = dirname(fileURLToPath(import.meta.url))
   if (!helperPath) {
     // Default to sibling post-hook.ts. `import.meta.dir` is a Bun extension;
     // resolve via `fileURLToPath(import.meta.url)` so the script also works
     // when invoked under plain Node (review M5).
-    const scriptDir = dirname(fileURLToPath(import.meta.url))
     helperPath = pathResolve(scriptDir, 'post-hook.ts')
+  }
+  // Channel reminder is on by default (sibling channel-reminder.ts) unless
+  // explicitly disabled with --no-reminder. This keeps the durable invariant
+  // in plugin/CLAUDE.md ("a hook re-states this every turn") true on every
+  // agent without a manual settings.json edit.
+  if (!noReminder && !reminderHelperPath) {
+    reminderHelperPath = pathResolve(scriptDir, 'channel-reminder.ts')
   }
   const opts: PatchOptions = {
     settingsPath,
@@ -215,6 +261,7 @@ function parseArgs(argv: ReadonlyArray<string>): PatchOptions {
     ...(agentId ? { agentId } : {}),
     ...(permissionGateHelperPath ? { permissionGateHelperPath } : {}),
     ...(policyPath ? { policyPath } : {}),
+    ...(reminderHelperPath ? { reminderHelperPath } : {}),
   }
   return opts
 }
