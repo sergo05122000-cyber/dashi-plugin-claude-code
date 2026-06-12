@@ -873,6 +873,17 @@ function resolveTmuxKeysTarget():
 const tmuxKeysTarget = resolveTmuxKeysTarget()
 if (tmuxKeysTarget === undefined) {
   log.warn('/key disabled: no tmux pane resolvable (no config, no $TMUX env)')
+} else {
+  // Log the resolved target + how we got it (Codex review #79 Medium): the
+  // $TMUX env fallback could point at the wrong pane if the plugin is ever
+  // launched outside the agent session. Startup visibility makes a stale-env
+  // mis-target diagnosable rather than silent.
+  const via = config.tmux_mirror.pane_target ? 'config' : 'env'
+  log.info('/key enabled', {
+    pane: tmuxKeysTarget.paneTarget,
+    socket: tmuxKeysTarget.socketPath ?? tmuxKeysTarget.socketName ?? 'default',
+    via,
+  })
 }
 
 const handlerDeps: HandlerDeps = {
