@@ -27,23 +27,45 @@ const execFileAsync = promisify(execFile)
 // Literal characters are sent with `send-keys -l` (no name lookup);
 // named keys are sent without -l so tmux resolves Enter/Escape/arrows.
 // Exported so the /keys inline-button panel (telegram/keys-panel-ui.ts)
-// derives its accepted token set from THIS list — a single whitelist
+// derives its accepted token set from THESE structures — a single whitelist
 // shared by the `/key` text command and the tap keypad.
 //
-// The canonical lists are frozen and the live `Set`/`Record` are built from
-// them, then themselves frozen, so a future importer can't mutate at runtime
-// what `/key` (and the kkey panel) accept. A `Set` would otherwise expose
-// .add/.delete and a plain `Record` is mutable by reference — both would let
-// imported code widen the keystroke whitelist (a pane-injection security
-// surface). `parseKeyTokens` and the panel resolve the EXACT same token set.
+// RUNTIME TAMPER-RESISTANCE (the whole point — this is a pane-injection
+// security surface):
+//   - `LITERAL_TOKEN_LIST` is a `Object.freeze`d array. Freezing an ARRAY
+//     genuinely blocks `push`/index-assignment/`length` mutation at runtime,
+//     so its `.includes()` membership cannot be widened — this is the single
+//     source of truth literal-token validation checks against.
+//   - `NAMED_TOKENS` is a `Object.freeze`d plain object. Freezing an object
+//     blocks adding/reassigning own properties at runtime, so `t in
+//     NAMED_TOKENS` cannot be widened either.
+//   - We deliberately do NOT export a `Set` of literal tokens. A `Set`'s
+//     contents live in internal slots, so `Object.freeze(new Set(...))` does
+//     NOT stop `.add('rm')` — an importer could cast the `ReadonlySet` back to
+//     `Set` and widen the injectable keystroke set. The frozen array + the
+//     `isLiteralToken` predicate below close that hole.
 
-// Canonical literal-token list (readonly tuple, frozen). Digits 0-9 + y/n.
-const LITERAL_TOKEN_LIST = Object.freeze([
+// Canonical literal-token list (readonly tuple, frozen at runtime). Digits
+// 0-9 + y/n. SINGLE SOURCE OF TRUTH — literal-token validation and the panel
+// both derive from this exact frozen array.
+export const LITERAL_TOKEN_LIST = Object.freeze([
   '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 'y', 'n',
 ] as const)
 
-// Canonical named-token map (frozen). lower-case token → tmux key name.
-const NAMED_TOKEN_ENTRIES = Object.freeze({
+// Immutable literal-token predicate. Membership is checked against the FROZEN
+// `LITERAL_TOKEN_LIST` (whose `.includes` cannot be widened at runtime), so
+// there is no mutable `Set` an importer could cast-and-`.add()` to inject a
+// new keystroke. The function itself is frozen so it cannot be monkey-patched.
+export const isLiteralToken: (t: string) => boolean = Object.freeze(
+  (t: string): boolean => (LITERAL_TOKEN_LIST as readonly string[]).includes(t),
+)
+
+// Canonical named-token map (frozen at runtime). lower-case token → tmux key
+// name. `esc` and `escape` are intentional ALIASES for the same Escape key —
+// the /keys panel surfaces `esc` only (both parse identically). Freezing a
+// plain object hard-stops adding/reassigning own properties, so `t in
+// NAMED_TOKENS` is genuinely immutable at runtime.
+export const NAMED_TOKENS: Readonly<Record<string, string>> = Object.freeze({
   enter: 'Enter',
   esc: 'Escape',
   escape: 'Escape',
@@ -54,16 +76,6 @@ const NAMED_TOKEN_ENTRIES = Object.freeze({
   left: 'Left',
   right: 'Right',
 } as const)
-
-// Immutable Set: a `ReadonlySet` view forbids .add/.delete at the type level,
-// and freezing the underlying object hard-stops mutation at runtime.
-export const LITERAL_TOKENS: ReadonlySet<string> = Object.freeze(
-  new Set<string>(LITERAL_TOKEN_LIST),
-)
-// Immutable Record: Readonly at the type level, frozen at runtime so an
-// importer can neither reassign nor add named tokens.
-export const NAMED_TOKENS: Readonly<Record<string, string>> =
-  Object.freeze({ ...NAMED_TOKEN_ENTRIES })
 
 export const MAX_KEY_TOKENS = 5
 
@@ -84,7 +96,9 @@ export function parseKeyTokens(args: string): ParsedKeys | { error: string } {
   }
   const steps: ParsedKeys['steps'] = []
   for (const t of tokens) {
-    if (LITERAL_TOKENS.has(t)) {
+    // Validate against the FROZEN list (not a mutable Set) so a runtime
+    // `(structure as Set).add('rm')` cannot widen the injectable keystrokes.
+    if (isLiteralToken(t)) {
       steps.push({ literal: true, key: t })
     } else if (t in NAMED_TOKENS) {
       steps.push({ literal: false, key: NAMED_TOKENS[t]! })

@@ -20,7 +20,7 @@
 // run a command). See server.ts bot.on('callback_query:data') for the wiring.
 
 import {
-  LITERAL_TOKENS,
+  LITERAL_TOKEN_LIST,
   NAMED_TOKENS,
   parseKeyTokens,
   sendKeys,
@@ -35,10 +35,20 @@ export const KKEY_PREFIX = 'kkey:'
 
 // The closed set of tokens a `kkey:` callback may carry === the keys.ts
 // whitelist (digits 0-9, y, n, enter, esc/escape, tab, space, arrows).
-// Reusing keys.ts's sets keeps a single source of truth: extending the
-// whitelist there extends what the panel accepts, no duplicate list.
+// Derived from keys.ts's FROZEN canonical structures (the literal array +
+// the frozen named-token map) so there is a single source of truth: extending
+// the whitelist there extends what the panel accepts, no duplicate list. We
+// build this local lookup from the frozen sources rather than importing a
+// mutable Set — keys.ts no longer exports one (a cast-and-`.add` Set would be
+// a runtime pane-injection hole).
+//
+// NOTE on `esc`/`escape`: NAMED_TOKENS maps BOTH to the Escape key — they are
+// intentional aliases. parseKkeyCallback therefore accepts a `kkey:escape`
+// callback too, but the rendered keypad (buildKeysKeyboard) intentionally
+// surfaces `esc` ONLY: one Escape button is the complete capability, a second
+// `escape` button would be redundant.
 const ALLOWED_TOKENS: ReadonlySet<string> = new Set<string>([
-  ...LITERAL_TOKENS,
+  ...LITERAL_TOKEN_LIST,
   ...Object.keys(NAMED_TOKENS),
 ])
 

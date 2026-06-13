@@ -10,8 +10,10 @@ import {
   type KkeyCallbackDeps,
 } from '../../src/telegram/keys-panel-ui.js'
 import {
-  LITERAL_TOKENS,
+  LITERAL_TOKEN_LIST,
   NAMED_TOKENS,
+  isLiteralToken,
+  parseKeyTokens,
   type KeysExec,
   type TmuxKeysTarget,
 } from '../../src/commands/keys.js'
@@ -65,6 +67,61 @@ describe('parseKkeyCallback', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────
+// Runtime tamper-resistance of the literal-token whitelist (LOW #1).
+// A malicious in-process import must NOT be able to widen the set of
+// keystrokes /key (and the kkey panel) will inject into the tmux pane.
+// ─────────────────────────────────────────────────────────────────────
+
+describe('literal-token whitelist is tamper-proof at runtime', () => {
+  test('frozen LITERAL_TOKEN_LIST cannot be widened, and validation stays closed', () => {
+    // Sanity: the canonical structure is frozen.
+    expect(Object.isFrozen(LITERAL_TOKEN_LIST)).toBe(true)
+    expect(Object.isFrozen(isLiteralToken)).toBe(true)
+
+    // Baseline behaviour BEFORE any mutation attempt.
+    expect(isLiteralToken('1')).toBe(true)
+    expect(isLiteralToken('rm')).toBe(false)
+    expect('error' in parseKeyTokens('1')).toBe(false)
+    expect('error' in parseKeyTokens('rm')).toBe(true)
+
+    // Attempt every plausible runtime widening of the literal whitelist.
+    // (a) cast the readonly array to a mutable array and push.
+    try {
+      ;(LITERAL_TOKEN_LIST as unknown as string[]).push('rm')
+    } catch {
+      /* frozen array throws in strict mode — that is the point */
+    }
+    // (b) index-assign past the end.
+    try {
+      ;(LITERAL_TOKEN_LIST as unknown as string[])[100] = 'rm'
+    } catch {
+      /* frozen array index write is rejected */
+    }
+    // (c) cast the predicate to a Set-like and try .add — there is no Set,
+    //     so this is a no-op; the predicate stays frozen.
+    try {
+      ;(isLiteralToken as unknown as { add?: (t: string) => void }).add?.('rm')
+    } catch {
+      /* no-op / rejected */
+    }
+
+    // PROOF: a malicious mutation could not widen the injectable keystroke
+    // set. `rm` is STILL rejected, and a legitimate literal is STILL accepted.
+    expect(isLiteralToken('rm')).toBe(false)
+    expect(isLiteralToken('1')).toBe(true)
+    expect((LITERAL_TOKEN_LIST as readonly string[]).includes('rm')).toBe(false)
+
+    const rejected = parseKeyTokens('rm')
+    expect('error' in rejected).toBe(true)
+    const accepted = parseKeyTokens('1')
+    expect('error' in accepted).toBe(false)
+    if (!('error' in accepted)) {
+      expect(accepted.steps).toEqual([{ literal: true, key: '1' }])
+    }
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────
 // buildKeysKeyboard
 // ─────────────────────────────────────────────────────────────────────
 
@@ -87,7 +144,7 @@ describe('buildKeysKeyboard', () => {
       kb.inline_keyboard.flat().map((b) => b.callback_data!.slice(KKEY_PREFIX.length)),
     )
     const whitelist = new Set([
-      ...LITERAL_TOKENS,
+      ...LITERAL_TOKEN_LIST,
       ...Object.keys(NAMED_TOKENS),
     ])
     // 'escape' is an alias of 'esc' — the panel exposes 'esc' only. Every
