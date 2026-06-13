@@ -29,10 +29,21 @@ const execFileAsync = promisify(execFile)
 // Exported so the /keys inline-button panel (telegram/keys-panel-ui.ts)
 // derives its accepted token set from THIS list — a single whitelist
 // shared by the `/key` text command and the tap keypad.
-export const LITERAL_TOKENS = new Set([
+//
+// The canonical lists are frozen and the live `Set`/`Record` are built from
+// them, then themselves frozen, so a future importer can't mutate at runtime
+// what `/key` (and the kkey panel) accept. A `Set` would otherwise expose
+// .add/.delete and a plain `Record` is mutable by reference — both would let
+// imported code widen the keystroke whitelist (a pane-injection security
+// surface). `parseKeyTokens` and the panel resolve the EXACT same token set.
+
+// Canonical literal-token list (readonly tuple, frozen). Digits 0-9 + y/n.
+const LITERAL_TOKEN_LIST = Object.freeze([
   '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 'y', 'n',
-])
-export const NAMED_TOKENS: Record<string, string> = {
+] as const)
+
+// Canonical named-token map (frozen). lower-case token → tmux key name.
+const NAMED_TOKEN_ENTRIES = Object.freeze({
   enter: 'Enter',
   esc: 'Escape',
   escape: 'Escape',
@@ -42,7 +53,17 @@ export const NAMED_TOKENS: Record<string, string> = {
   down: 'Down',
   left: 'Left',
   right: 'Right',
-}
+} as const)
+
+// Immutable Set: a `ReadonlySet` view forbids .add/.delete at the type level,
+// and freezing the underlying object hard-stops mutation at runtime.
+export const LITERAL_TOKENS: ReadonlySet<string> = Object.freeze(
+  new Set<string>(LITERAL_TOKEN_LIST),
+)
+// Immutable Record: Readonly at the type level, frozen at runtime so an
+// importer can neither reassign nor add named tokens.
+export const NAMED_TOKENS: Readonly<Record<string, string>> =
+  Object.freeze({ ...NAMED_TOKEN_ENTRIES })
 
 export const MAX_KEY_TOKENS = 5
 

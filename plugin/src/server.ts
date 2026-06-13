@@ -695,7 +695,10 @@ bot.on('callback_query:data', async ctx => {
       await handleKkeyCallback(
         {
           callbackQuery: { data },
-          from: { id: ctx.from.id },
+          // Pass the id straight through (may be undefined for a malformed
+          // update). The handler treats a missing/non-number id as
+          // unauthorized — fail-closed, never trusts the caller's identity.
+          from: { id: ctx.from?.id },
           answerCallbackQuery: async arg => {
             await ctx.answerCallbackQuery(arg)
           },
@@ -710,6 +713,16 @@ bot.on('callback_query:data', async ctx => {
       log.error('kkey callback_query handler threw', {
         error: err instanceof Error ? err.message : String(err),
       })
+      // Best-effort: clear the Telegram spinner even when the handler threw
+      // before it could answer (otherwise the user sees a hanging spinner).
+      // A failure of THIS call is itself swallowed — never rethrow.
+      try {
+        await ctx.answerCallbackQuery({ text: 'ошибка' })
+      } catch (ackErr) {
+        log.warn('kkey error-ack answerCallbackQuery failed', {
+          error: ackErr instanceof Error ? ackErr.message : String(ackErr),
+        })
+      }
     }
     return
   }

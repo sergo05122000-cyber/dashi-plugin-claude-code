@@ -9,7 +9,12 @@ import {
   type KkeyCallbackContext,
   type KkeyCallbackDeps,
 } from '../../src/telegram/keys-panel-ui.js'
-import type { KeysExec, TmuxKeysTarget } from '../../src/commands/keys.js'
+import {
+  LITERAL_TOKENS,
+  NAMED_TOKENS,
+  type KeysExec,
+  type TmuxKeysTarget,
+} from '../../src/commands/keys.js'
 import type { Logger } from '../../src/log.js'
 
 function makeLogger(): Logger {
@@ -64,14 +69,37 @@ describe('parseKkeyCallback', () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe('buildKeysKeyboard', () => {
-  test('produces 3 rows with the expected callback_data values', () => {
+  test('produces the full 5-row layout with all whitelisted tokens', () => {
     const kb = buildKeysKeyboard()
-    expect(kb.inline_keyboard.length).toBe(3)
+    expect(kb.inline_keyboard.length).toBe(5)
 
     const cb = (row: number) => kb.inline_keyboard[row]!.map((b) => b.callback_data)
     expect(cb(0)).toEqual(['kkey:1', 'kkey:2', 'kkey:3', 'kkey:4', 'kkey:5'])
-    expect(cb(1)).toEqual(['kkey:y', 'kkey:n', 'kkey:enter', 'kkey:esc'])
-    expect(cb(2)).toEqual(['kkey:up', 'kkey:down', 'kkey:left', 'kkey:right'])
+    expect(cb(1)).toEqual(['kkey:6', 'kkey:7', 'kkey:8', 'kkey:9', 'kkey:0'])
+    expect(cb(2)).toEqual(['kkey:y', 'kkey:n', 'kkey:enter', 'kkey:esc'])
+    expect(cb(3)).toEqual(['kkey:up', 'kkey:down', 'kkey:left', 'kkey:right'])
+    expect(cb(4)).toEqual(['kkey:tab', 'kkey:space'])
+  })
+
+  test('panel coverage = full /key whitelist (no UI/parser mismatch)', () => {
+    const kb = buildKeysKeyboard()
+    const panelTokens = new Set(
+      kb.inline_keyboard.flat().map((b) => b.callback_data!.slice(KKEY_PREFIX.length)),
+    )
+    const whitelist = new Set([
+      ...LITERAL_TOKENS,
+      ...Object.keys(NAMED_TOKENS),
+    ])
+    // 'escape' is an alias of 'esc' — the panel exposes 'esc' only. Every
+    // OTHER whitelisted token must have a button, and every button token must
+    // be in the whitelist.
+    for (const tok of whitelist) {
+      if (tok === 'escape') continue
+      expect(panelTokens.has(tok)).toBe(true)
+    }
+    for (const tok of panelTokens) {
+      expect(whitelist.has(tok)).toBe(true)
+    }
   })
 
   test('every callback_data parses back to a whitelisted token', () => {
@@ -206,5 +234,71 @@ describe('handleKkeyCallback — auth gate', () => {
     expect(calls.length).toBe(0)
     // A non-allowed user must not even learn whether a pane exists.
     expect(toasts).toEqual(['не авторизовано'])
+  })
+
+  test('AUTH FIRST: non-allowed + MALFORMED token (kkey:rm) → «не авторизовано» (NOT «неизвестная клавиша»), 0 sendKeys', async () => {
+    // The critical auth-first proof: a non-allowed caller replaying malformed
+    // callback data must NOT learn token validity. If parse ran first this
+    // would be «неизвестная клавиша», leaking that `rm` is not a valid token.
+    const { ctx, toasts } = makeCtx('kkey:rm', NON_ALLOWED_ID)
+    const { deps, calls } = makeDeps()
+    const consumed = await handleKkeyCallback(ctx, deps)
+    expect(consumed).toBe(true)
+    expect(toasts).toEqual(['не авторизовано'])
+    expect(calls.length).toBe(0)
+  })
+
+  test('missing/undefined from id → «не авторизовано», 0 sendKeys', async () => {
+    const toasts: string[] = []
+    // No `from` at all — a malformed/replayed update. Must fail-closed.
+    const ctx: KkeyCallbackContext = {
+      callbackQuery: { data: 'kkey:2' },
+      answerCallbackQuery: async (arg) => {
+        toasts.push(arg.text)
+      },
+    }
+    const { deps, calls } = makeDeps()
+    const consumed = await handleKkeyCallback(ctx, deps)
+    expect(consumed).toBe(true)
+    expect(toasts).toEqual(['не авторизовано'])
+    expect(calls.length).toBe(0)
+  })
+
+  test('from present but id undefined → «не авторизовано», 0 sendKeys', async () => {
+    const toasts: string[] = []
+    const ctx: KkeyCallbackContext = {
+      callbackQuery: { data: 'kkey:2' },
+      from: { id: undefined },
+      answerCallbackQuery: async (arg) => {
+        toasts.push(arg.text)
+      },
+    }
+    const { deps, calls } = makeDeps()
+    await handleKkeyCallback(ctx, deps)
+    expect(toasts).toEqual(['не авторизовано'])
+    expect(calls.length).toBe(0)
+  })
+
+  test('handler throw (exec throws unexpectedly) → spinner still cleared via the caller catch (no hanging spinner)', async () => {
+    // A raw-throwing exec propagates out of sendKeys/handleKkeyCallback (the
+    // handler does not swallow it). The server.ts kkey branch wraps the call
+    // in try/catch and answers «ошибка» so the Telegram spinner never hangs.
+    // We replicate that wrapper here to prove the end-to-end no-hanging-spinner
+    // invariant the security review required.
+    const { ctx, toasts } = makeCtx('kkey:2', ALLOWED_ID)
+    const throwingExec: KeysExec = async () => {
+      throw new Error('exec blew up')
+    }
+    const { deps } = makeDeps({ exec: throwingExec })
+    let threw = false
+    try {
+      await handleKkeyCallback(ctx, deps)
+    } catch {
+      threw = true
+      // Mirror server.ts: best-effort spinner clear on a handler throw.
+      await ctx.answerCallbackQuery({ text: 'ошибка' })
+    }
+    expect(threw).toBe(true)
+    expect(toasts).toEqual(['ошибка'])
   })
 })

@@ -474,7 +474,7 @@ describe('/keys command', () => {
     expect(res.replyToTelegram?.text).toContain('Управление сессией')
     const kb = res.replyToTelegram?.inlineKeyboard
     expect(kb).toBeDefined()
-    expect(kb!.inline_keyboard.length).toBe(3)
+    expect(kb!.inline_keyboard.length).toBe(5)
     expect(kb!.inline_keyboard[0]!.map((b) => b.callback_data)).toEqual([
       'kkey:1', 'kkey:2', 'kkey:3', 'kkey:4', 'kkey:5',
     ])

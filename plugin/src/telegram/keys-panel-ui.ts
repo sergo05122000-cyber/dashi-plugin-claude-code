@@ -58,12 +58,17 @@ export function parseKkeyCallback(data: string): string | null {
   return token
 }
 
-// Build the 3-row keypad. Labels are human-friendly (✓ y, ⏎ enter, arrows);
-// callback_data carries the raw whitelist token the handler injects.
+// Build the 5-row keypad. Labels are human-friendly (✓ y, ⏎ enter, arrows);
+// callback_data carries the raw whitelist token the handler injects. The
+// panel exposes the FULL /key whitelist (no UI/parser mismatch) — Claude Code
+// dialogs literally say "Tab to amend", so omitting tab/space/0/6-9 would
+// limit live recovery.
 //
 // Row1: dialog option selectors 1-5
-// Row2: yes/no + confirm/cancel
-// Row3: arrow navigation
+// Row2: dialog option selectors 6-9 + 0
+// Row3: yes/no + confirm/cancel
+// Row4: arrow navigation
+// Row5: tab / space (Claude Code "Tab to amend", whitespace)
 export function buildKeysKeyboard(): InlineKeyboardLike {
   return {
     inline_keyboard: [
@@ -73,6 +78,13 @@ export function buildKeysKeyboard(): InlineKeyboardLike {
         { text: '3', callback_data: `${KKEY_PREFIX}3` },
         { text: '4', callback_data: `${KKEY_PREFIX}4` },
         { text: '5', callback_data: `${KKEY_PREFIX}5` },
+      ],
+      [
+        { text: '6', callback_data: `${KKEY_PREFIX}6` },
+        { text: '7', callback_data: `${KKEY_PREFIX}7` },
+        { text: '8', callback_data: `${KKEY_PREFIX}8` },
+        { text: '9', callback_data: `${KKEY_PREFIX}9` },
+        { text: '0', callback_data: `${KKEY_PREFIX}0` },
       ],
       [
         { text: '✓ y', callback_data: `${KKEY_PREFIX}y` },
@@ -85,6 +97,10 @@ export function buildKeysKeyboard(): InlineKeyboardLike {
         { text: '↓ down', callback_data: `${KKEY_PREFIX}down` },
         { text: '← left', callback_data: `${KKEY_PREFIX}left` },
         { text: '→ right', callback_data: `${KKEY_PREFIX}right` },
+      ],
+      [
+        { text: '⇥ tab', callback_data: `${KKEY_PREFIX}tab` },
+        { text: '␣ space', callback_data: `${KKEY_PREFIX}space` },
       ],
     ],
   }
@@ -99,14 +115,23 @@ export const KEYS_PANEL_HEADER =
 // ─────────────────────────────────────────────────────────────────────
 // Callback handler (extracted from server.ts so it is unit-testable in
 // isolation, mirroring permission-gate-ui.ts's handlePgateCallback). The
-// security model is the same: parse → fail-closed auth → pane check →
-// inject. A reject at ANY step toasts and sends NO keystroke.
+// security model: fail-closed auth FIRST → parse token → pane check →
+// inject. A reject at ANY step toasts and sends NO keystroke. Auth precedes
+// parsing so a non-allowed caller can never learn token validity.
 // ─────────────────────────────────────────────────────────────────────
 
 // Structural subset of grammY's callback_query Context the handler needs.
+// `from` (and its `id`) is optional: grammY callback contexts almost always
+// carry a sender, but a malformed/replayed update can omit it. A missing or
+// non-number id is treated as unauthorized (fail-closed) — see
+// handleKkeyCallback's auth-first gate.
 export interface KkeyCallbackContext {
   callbackQuery: { data: string }
-  from: { id: number }
+  // `id?: number | undefined` (explicit `| undefined`) so a caller may pass
+  // `{ id: ctx.from?.id }` directly under exactOptionalPropertyTypes — a
+  // malformed update yields `undefined`, which the handler rejects as
+  // unauthorized.
+  from?: { id?: number | undefined }
   answerCallbackQuery(arg: { text: string }): Promise<void>
 }
 
@@ -133,15 +158,24 @@ export async function handleKkeyCallback(
   ctx: KkeyCallbackContext,
   deps: KkeyCallbackDeps,
 ): Promise<boolean> {
+  // AUTH FIRST — the strict first decision, before parsing the token or
+  // touching the pane. A non-allowed (or missing/non-number id) caller must
+  // get ONLY «не авторизовано» and learn nothing about token validity or
+  // pane state. Parsing first would leak which tokens are valid (a malformed
+  // `kkey:rm` would surface «неизвестная клавиша») and break uniform
+  // fail-closed behaviour. A missing id is treated as unauthorized.
+  const fromId = ctx.from?.id
+  if (typeof fromId !== 'number' || !deps.allowedUserIds.includes(fromId)) {
+    deps.log.warn('kkey unauthorized tap', {
+      user_id: fromId,
+      data: ctx.callbackQuery.data,
+    })
+    await ctx.answerCallbackQuery({ text: 'не авторизовано' })
+    return true
+  }
   const token = parseKkeyCallback(ctx.callbackQuery.data)
   if (token === null) {
     await ctx.answerCallbackQuery({ text: 'неизвестная клавиша' })
-    return true
-  }
-  // Fail-closed auth: only an allowed user id may drive the session.
-  if (!deps.allowedUserIds.includes(ctx.from.id)) {
-    deps.log.warn('kkey unauthorized tap', { user_id: ctx.from.id, token })
-    await ctx.answerCallbackQuery({ text: 'не авторизовано' })
     return true
   }
   if (deps.tmuxKeysTarget === undefined) {
