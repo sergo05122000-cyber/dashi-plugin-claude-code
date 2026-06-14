@@ -232,9 +232,9 @@ Both `/hooks/ask-user-question/*` endpoints accept **loopback only** (127.0.0.1 
 
 ### Channel control commands (OOB slash commands)
 
-These are "out-of-band" commands for driving the plugin and the live session from Telegram. The plugin intercepts them *before* they reach Claude as a normal prompt — so `/status` never wakes the model, and the keystroke commands (`/key`, `/keys`, `/cc`, `/stop`, `/reset`, `/new`) drive the agent's tmux pane directly. They're registered via `setMyCommands`, so they appear in Telegram's "/" menu (descriptions localized to Russian, PR #18).
+These are "out-of-band" commands for driving the plugin and the live session from Telegram. The plugin intercepts them *before* they reach Claude as a normal prompt — so `/status` never wakes the model, and the keystroke commands (`/keys`, `/cc`, `/stop`, `/reset`, `/new`) drive the agent's tmux pane directly. They're registered via `setMyCommands`, so they appear in Telegram's "/" menu (descriptions localized to Russian, PR #18).
 
-The full, authoritative list lives in the code: `plugin/src/commands/oob.ts` (`helpText()` + `BOT_COMMANDS` + the `OobCommandName` union) and `plugin/src/commands/keys.ts` (the `/key` token whitelist and `/cc` passthrough).
+The full, authoritative list lives in the code: `plugin/src/commands/oob.ts` (`helpText()` + `BOT_COMMANDS` + the `OobCommandName` union) and `plugin/src/commands/keys.ts` (the `/keys` keypad token whitelist and `/cc` passthrough).
 
 | Command | What it does | Usage / when to use |
 |---|---|---|
@@ -244,8 +244,7 @@ The full, authoritative list lives in the code: `plugin/src/commands/oob.ts` (`h
 | `/reset force` | Resets the session. With a pane resolvable it types Claude Code's own `/clear` into the session (fresh context); otherwise it relays the reset signal. Bare `/reset` only re-asks for confirmation. | `/reset force` — wipe context and start clean. |
 | `/new force` | Starts a "new session". Claude Code has no separate new-session primitive, so this is the same `/clear` action as `/reset force`. Bare `/new` only re-asks. | `/new force` |
 | `/mirror on\|off\|status` | Toggles the terminal mirror (section 6) at runtime — no plugin restart. `status` (or bare `/mirror`) prints enabled/off, message_id, last-poll age, last error. | `/mirror on` · `/mirror off` · `/mirror status` |
-| `/key <tokens>` | Presses one or more **whitelisted** keystrokes in the agent's tmux pane — the way you **answer a native Claude Code dialog** from Telegram. Up to 5 tokens per command. | `/key 1` · `/key 3` · `/key y` · `/key esc` · `/key 2 enter` |
-| `/keys` | Opens a one-tap inline-button keypad — the same keystrokes as `/key`, but tappable. One tap = one key into the session. | `/keys`, then tap a button. The easy way to answer a dialog. |
+| `/keys` | Opens a one-tap inline-button keypad of **whitelisted** keystrokes in the agent's tmux pane — the way you **answer a native Claude Code dialog** from Telegram. One tap = one key into the session; the panel isn't consumed (tap repeatedly across a multi-step dialog). Includes `⌫ backspace` and `🧹 clear`. | `/keys`, then tap a button. The easy way to answer a dialog. |
 | `/cc <command>` | Passes a command through to **Claude Code's own slash commands** by typing it into the session (`/compact`, `/model`, `/context`, custom skills, …). Narrow charset — no shell metacharacters, can't compose a shell command. | `/cc compact` · `/cc model opus` · `/cc context` |
 
 #### Answering native confirmation dialogs (the main use-case)
@@ -268,12 +267,11 @@ Permission rule Bash(rm:*) requires confirmation
   - Row 4: `[↑ up][↓ down][← left][→ right]`
   - Row 5: `[⇥ tab][␣ space]`
 
-  Tap the same keypad repeatedly across a multi-step dialog — it isn't consumed.
-- **`/key <tokens>`** → type the keystroke: `/key 1` to pick option 1, `/key 3` to pick "No", `/key esc` to cancel.
+  Tap the same keypad repeatedly across a multi-step dialog — it isn't consumed. Tapping `1` picks option 1, `3` picks "No", `⎋ esc` cancels.
 
-`/keys` is exactly `/key` as tappable buttons — both inject the same closed whitelist into the pane.
+Each tap injects exactly one keystroke from a closed whitelist into the pane — there is no free-text keystroke command, so a pane that dropped into a raw shell still can't be driven to run anything.
 
-**`/key` accepted tokens (the complete whitelist):**
+**`/keys` keypad keys (the complete whitelist):**
 
 | Group | Tokens |
 |---|---|
@@ -283,7 +281,7 @@ Permission rule Bash(rm:*) requires confirmation
 | Editing | `tab` · `space` |
 | Arrows | `up` · `down` · `left` · `right` |
 
-Anything outside this set is rejected; the limit is **5 tokens** per `/key` (it's a dialog answer, not a macro language). Because the set is a closed whitelist with no free text, a pane that dropped out of Claude into a raw shell still can't be driven to run a command.
+Anything outside this set is rejected. Because the set is a closed whitelist with no free text, a pane that dropped out of Claude into a raw shell still can't be driven to run a command.
 
 #### Behavior worth knowing
 
@@ -291,7 +289,7 @@ Anything outside this set is rejected; the limit is **5 tokens** per `/key` (it'
 - **`/reset` and `/new` require `force`.** Bare `/reset` / `/new` just return a hint ("add `force` to confirm") — protection against an accidental context wipe.
 - **The `@botname` suffix is stripped** — `/status@yourbot` in a group works the same as `/status`.
 - In multichat, `/mirror` availability is controlled by the per-chat `tmux_mirror` flag in `policy.yaml`.
-- `/key`, `/keys`, `/cc`, and the pane-driven branches of `/stop`/`/reset`/`/new` need a resolvable tmux pane. Without one (no tmux config / no `$TMUX`) the plugin replies that the pane is unavailable.
+- `/keys`, `/cc`, and the pane-driven branches of `/stop`/`/reset`/`/new` need a resolvable tmux pane. Without one (no tmux config / no `$TMUX`) the plugin replies that the pane is unavailable.
 
 > **Security (fail-closed).** Every control command — and every `/keys` button tap — is honored **only** in a **private chat**, from a Telegram **user id on the allow-list** (`allowed_user_ids`), in a chat on the **chat allow-list** (`allowed_chat_ids`). All three must hold (defence-in-depth — see `src/telegram/handlers.ts` and the `kkey:` auth in `src/telegram/keys-panel-ui.ts`). They **never** run in groups, and **never** from a non-allowed user — an outsider can't reset your session or press keys in your terminal. A non-allowed tap gets only a "not authorized" toast and no keystroke is sent.
 
