@@ -2,6 +2,9 @@ node_modules/
 bun.lockb
 bun.lock
 *.log
+__pycache__/
+*.pyc
+*.pyo
 .env
 # Light FTS local SQLite store (2026-05-29) + WAL/SHM sidecars. The DB can
 # contain the prince's chat history (demo content) and is local-recall state,
