@@ -12,6 +12,14 @@
 # Behavior:
 #   * Backs up each deployed file as <name>.bak.<timestamp> before overwrite.
 #   * Verifies the copy with diff and exits non-zero on any mismatch.
+#   * Restores per-chat skill discovery: symlinks <workspace>/chats/.claude/skills
+#     -> ../../skills so the multichat "project" sees the agent's real skills
+#     (a per-chat session's CWD is <workspace>/chats with its own .claude/, so
+#     Claude Code looks for skills under chats/.claude/skills, which otherwise
+#     does not exist — the agent loses every project skill in group chats).
+#   * Registers multichat-hot-memory.sh in chats/.claude/settings.json
+#     SessionStart (idempotent) so per-chat sessions get the hot memory layer
+#     (handoff/recent), not just the persona.
 #   * Takes effect immediately for Stop/PreToolUse (hooks exec from disk per
 #     event). SessionStart context (e.g. the file-marker capability note) only
 #     reaches a session at spawn — restart long-lived per-chat tmux sessions
@@ -37,6 +45,7 @@ HOOK_FILES=(
   session-start.sh
   pre-tool-use.sh
   multichat-entrypoint.sh
+  multichat-hot-memory.sh
 )
 
 if [[ ! -d "${REPO_HOOKS}" ]]; then
@@ -80,6 +89,51 @@ for f in "${HOOK_FILES[@]}"; do
     exit 1
   fi
 done
+
+# ── Per-chat project wiring ────────────────────────────────────────────────
+# DEPLOY_DIR is <workspace>/chats/hooks, so the multichat "project" config dir
+# is its sibling <workspace>/chats/.claude. Both steps below are idempotent.
+CHATS_CLAUDE="$(dirname "${DEPLOY_DIR}")/.claude"
+
+# 1. Skill discovery: symlink chats/.claude/skills -> ../../skills so the
+#    per-chat session (whose project root is chats/) finds the agent's real
+#    skills at <workspace>/skills instead of an empty/absent dir.
+if [[ -d "${CHATS_CLAUDE}" ]]; then
+  if [[ -e "${CHATS_CLAUDE}/skills" || -L "${CHATS_CLAUDE}/skills" ]]; then
+    echo "unchanged skills symlink (${CHATS_CLAUDE}/skills)"
+  elif [[ -d "$(dirname "${CHATS_CLAUDE}")/../skills" ]]; then
+    ln -s ../../skills "${CHATS_CLAUDE}/skills"
+    echo "linked    skills -> ../../skills (${CHATS_CLAUDE}/skills)"
+    CHANGED=1
+  else
+    echo "sync-multichat-hooks: no <workspace>/skills dir; skipping skills symlink" >&2
+  fi
+
+  # 2. Register multichat-hot-memory.sh in chats/.claude/settings.json
+  #    SessionStart (idempotent). The persona hook (session-start.sh) stays
+  #    untouched; this is an additive second SessionStart hook.
+  SETTINGS="${CHATS_CLAUDE}/settings.json"
+  if [[ -f "${SETTINGS}" ]] && command -v python3 >/dev/null 2>&1; then
+    if python3 - "${SETTINGS}" "${DEPLOY_DIR}/multichat-hot-memory.sh" <<'PY'
+import json, sys
+settings_path, hook_cmd = sys.argv[1], sys.argv[2]
+d = json.load(open(settings_path))
+ss = d.setdefault("hooks", {}).setdefault("SessionStart", [])
+if not ss:
+    ss.append({"matcher": "", "hooks": []})
+arr = ss[0].setdefault("hooks", [])
+if any(h.get("command", "").endswith("multichat-hot-memory.sh") for h in arr):
+    print("ALREADY")
+else:
+    arr.append({"type": "command", "command": hook_cmd, "timeout": 8000})
+    json.dump(d, open(settings_path, "w"), ensure_ascii=False, indent=2)
+    print("REGISTERED")
+PY
+    then :; fi
+  fi
+else
+  echo "sync-multichat-hooks: no ${CHATS_CLAUDE}; skipping skills symlink + hook registration" >&2
+fi
 
 if [[ "${CHANGED}" -eq 1 ]]; then
   echo "done: hooks synced. Restart long-lived per-chat sessions to pick up SessionStart changes."
