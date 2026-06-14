@@ -117,7 +117,12 @@ if [[ -d "${CHATS_CLAUDE}" ]]; then
     if python3 - "${SETTINGS}" "${DEPLOY_DIR}/multichat-hot-memory.sh" <<'PY'
 import json, sys
 settings_path, hook_cmd = sys.argv[1], sys.argv[2]
-d = json.load(open(settings_path))
+try:
+    d = json.load(open(settings_path))
+except Exception:
+    print("SKIPPED: settings.json unreadable/malformed — "
+          "register multichat-hot-memory.sh in SessionStart by hand")
+    raise SystemExit(0)
 ss = d.setdefault("hooks", {}).setdefault("SessionStart", [])
 if not ss:
     ss.append({"matcher": "", "hooks": []})
