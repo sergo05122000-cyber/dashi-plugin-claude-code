@@ -84,6 +84,19 @@ For tests 6/7, toggle by exporting `GROQ_API_KEY` before launch or leaving it un
 
 For test 15, only run if the canary launch includes `TELEGRAM_WEBHOOK_PORT` and `TELEGRAM_WEBHOOK_TOKEN`.
 
+### Keystroke commands smoke (PR #81 / #83: `/keys`, `/cc`)
+
+Rows K1–K4 cover the keystroke-injection commands. They require a resolvable tmux pane (a real agent session, not the test-bot canary launched without `$TMUX`). Run them against a live agent session in a private chat from an allow-listed user id.
+
+| # | Test | Send | Expected |
+|---|------|------|----------|
+| K1 | `/keys` panel renders | "/keys" | Inline keypad reply: digit rows `[1..5]` `[6..0]`, `[✓ y][✗ n][⏎ enter][⎋ esc]`, arrows, `[⇥ tab][␣ space]`, plus `⌫ backspace` and `🧹 clear` |
+| K2 | `/keys` tap injects one key | trigger a native Claude Code dialog, tap `1` | Exactly one keystroke lands in the pane (option 1 selected); panel is not consumed — still tappable |
+| K3 | `/keys` unauthorized tap | tap a `kkey:` button from a non-allow-listed user id | "not authorized" toast only; no keystroke sent (check `logs/permissions.jsonl`) |
+| K4 | `/cc` passthrough | "/cc compact" | `/compact` is typed into the session (Claude Code runs its own slash command); narrow charset rejects shell metacharacters |
+
+Note: the former `/key <tokens>` text command was removed in favor of the `/keys` panel — only `/keys` and `/cc` exist now (see `src/commands/oob.ts` `KNOWN_COMMANDS`).
+
 ### Multichat-era smoke (PR #13, #22, #26)
 
 Rows 16–25 cover features introduced after the initial canary baseline: the multichat router, per-chat tmux session pool, tmux mirror, task mirror, telegram-token redaction, and the HTML-by-default reply format. Each row depends on flags listed in the "Send" column — restart the tmux session after changing env. If the multichat router is not in your build, skip this entire section.

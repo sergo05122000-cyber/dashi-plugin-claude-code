@@ -233,6 +233,8 @@ Default-OFF — opt-in через config:
 
 OOB-управление: `/mirror on|off|status` (PR #17) — тогглит TmuxMirror runtime через Telegram-команду, без рестарта плагина. Регистрируется через `setMyCommands`, локализован на русский (PR #18). Доступность команды управляется `tmux_mirror` policy-флагом (в multichat-режиме — per chat).
 
+Keystroke-команды (PR #81/#83): `/keys` — инлайн-панель кнопок «в одно касание» для ответа на нативные диалоги Claude Code (тап = одна whitelisted-клавиша в tmux-pane; есть ⌫ backspace и 🧹 clear), `/cc <команда>` — прокидывает встроенные slash-команды Claude Code в сессию (`/cc compact`, `/cc model opus`). Обе требуют резолвимый tmux-pane и слушаются только в личке из allowlist. Полная таблица всех OOB-команд и whitelist клавиш — в корневом [`README.ru.md`](../README.ru.md) (§ «Команды управления каналом»); авторитетный источник — `src/commands/oob.ts` (`BOT_COMMANDS` + `OobCommandName`) и `src/commands/keys.ts`. Прежней текст-команды `/key <токены>` больше нет — её заменила панель `/keys`.
+
 ## WARNING
 
 - НЕ использовать production bot токены здесь без явного OK принца. Production боты:

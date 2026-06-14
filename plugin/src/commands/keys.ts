@@ -1,4 +1,4 @@
-// /key — deterministic keystrokes from Telegram into the agent's tmux pane.
+// /keys — deterministic keystrokes from Telegram into the agent's tmux pane.
 //
 // Problem (warchief, 2026-06-12): Claude Code's NATIVE interactive dialogs
 // (permission rules like `Bash(rm:*) requires confirmation`, model switch
@@ -6,18 +6,21 @@
 // in Telegram, but there was no way to ANSWER one remotely — the session sat
 // blocked until someone reached the real terminal.
 //
-// /key sends an explicit, WHITELISTED keystroke sequence to the pane:
-//   /key 2          → press «2» (select dialog option 2)
-//   /key 1 enter    → press «1», then Enter
-//   /key esc        → cancel the dialog
+// The /keys tap keypad sends an explicit, WHITELISTED keystroke to the pane:
+//   tap «2»            → press «2» (select dialog option 2)
+//   tap «1» then «⏎»   → press «1», then Enter
+//   tap «⎋ esc»        → cancel the dialog
+// (The earlier `/key <tokens>` text command was removed in favour of this
+// panel; the token parser below is the shared whitelist it taps into.)
 //
 // Security model:
-//   - Reaches this code only via the OOB gate in handlers.ts: private chat
-//     + allowed_user_ids + allowed_chat_ids. Group chats never get here.
+//   - Reaches this code only via the /keys panel's `kkey:` callback (auth in
+//     server.ts + keys-panel-ui.ts): private chat + allowed_user_ids +
+//     allowed_chat_ids. Group chats never get here.
 //   - Tokens are a closed whitelist (digits, y/n, enter/esc/tab/space,
-//     arrows). Arbitrary text is rejected, so /key cannot be used to type
+//     arrows). Arbitrary text is rejected, so the keypad cannot be used to type
 //     shell commands into a pane that dropped out of Claude into a shell.
-//   - Max 5 tokens per command — a dialog answer, not a macro language.
+//   - Max 5 tokens per parsed call — a dialog answer, not a macro language.
 
 import { execFile } from 'child_process'
 import { promisify } from 'util'
@@ -27,8 +30,8 @@ const execFileAsync = promisify(execFile)
 // Literal characters are sent with `send-keys -l` (no name lookup);
 // named keys are sent without -l so tmux resolves Enter/Escape/arrows.
 // Exported so the /keys inline-button panel (telegram/keys-panel-ui.ts)
-// derives its accepted token set from THESE structures — a single whitelist
-// shared by the `/key` text command and the tap keypad.
+// derives its accepted token set from THESE structures — the single whitelist
+// the tap keypad injects into the pane.
 //
 // RUNTIME TAMPER-RESISTANCE (the whole point — this is a pane-injection
 // security surface):
@@ -94,8 +97,8 @@ export interface ParsedKeys {
   steps: Array<{ literal: boolean; key: string }>
 }
 
-// Parse "/key 2 enter" args into validated steps. Returns an error string
-// (for the Telegram reply) when any token is outside the whitelist.
+// Parse keypad token args (e.g. "2 enter") into validated steps. Returns an
+// error string (for the Telegram reply) when any token is outside the whitelist.
 export function parseKeyTokens(args: string): ParsedKeys | { error: string } {
   const tokens = args.trim().toLowerCase().split(/\s+/).filter((t) => t.length > 0)
   if (tokens.length === 0) {

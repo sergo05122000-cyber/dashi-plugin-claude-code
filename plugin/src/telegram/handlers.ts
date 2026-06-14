@@ -148,7 +148,7 @@ export interface HandlerDeps {
   // when tmux_mirror.enabled=false at startup the mirror instance is
   // never created and the OOB handler replies «disabled in config».
   tmuxMirror?: TmuxMirrorControl
-  // /key target — resolved tmux pane of the agent session (server.ts wiring).
+  // /keys target — resolved tmux pane of the agent session (server.ts wiring).
   tmuxKeys?: { target: TmuxKeysTarget }
   // Multichat router. When present together with `policy`, all gated
   // inbound traffic is dispatched to the per-chat tmux session via

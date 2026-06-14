@@ -142,7 +142,7 @@ export interface OobContext {
   // /mirror control — undefined when tmux_mirror.enabled=false at startup.
   // The handler then replies «mirror disabled in config».
   tmuxMirror?: TmuxMirrorControl
-  // /key target — the pane of the agent's Claude session. Undefined when the
+  // /keys target — the pane of the agent's Claude session. Undefined when the
   // plugin can't resolve a pane (no tmux config); the handler then explains.
   tmuxKeys?: { target: TmuxKeysTarget; exec?: KeysExec }
   // Identity bits surfaced by /status.
@@ -486,10 +486,10 @@ export async function handleOobCommand(
     }
 
     case 'keys': {
-      // Render the one-tap keypad. The buttons inject the SAME whitelisted
-      // keystrokes /key does — their `kkey:` callbacks are dispatched in
-      // server.ts with the same fail-closed allowlist auth. We only need a
-      // resolvable pane to make the panel useful; if none, explain like /key.
+      // Render the one-tap keypad. Each button injects one whitelisted
+      // keystroke — their `kkey:` callbacks are dispatched in server.ts with
+      // the same fail-closed allowlist auth. We only need a resolvable pane to
+      // make the panel useful; if none, explain that the pane is unavailable.
       if (!ctx.tmuxKeys) {
         return {
           handled: true,
