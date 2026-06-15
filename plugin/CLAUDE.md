@@ -31,6 +31,23 @@ automatically — do not manually re-send it (that double-posts). The invariant
 still holds: terminal-only text is never visible to the user, so put anything
 they must see into the turn's delivered output.
 
+## Mid-turn messages (system-reminders with `<channel>` tags)
+
+When Telegram delivers a NEW message while you are still generating a response to
+the PREVIOUS message, Claude Code injects it as a `system-reminder` tagged
+**"IMPORTANT: This is NOT from your user"**. This is situational awareness only.
+
+**Rules for mid-turn `<channel>` system-reminders:**
+1. Do NOT respond to the new message in the current turn.
+2. Do NOT include any reference to or answer for the new message in your current
+   `reply()` call.
+3. Finish the current turn as if the new message did not exist.
+4. The new message will arrive as the next user prompt automatically — handle it then.
+
+Violating this causes duplicate responses: the user sees an answer to the old
+message that also contains an answer to the new message, and then another answer
+to the new message in the next turn.
+
 ## Reminders
 
 A UserPromptSubmit hook re-states this on every turn — heed it. This file and
