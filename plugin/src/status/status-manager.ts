@@ -527,8 +527,12 @@ export class StatusManager {
       }
     }
 
-    const suppressBubble =
-      this.config.status.suppress_typing_bubble && initialState.kind === 'typing'
+    // When suppress_typing_bubble is on, suppress ALL initial bubble creation
+    // (not just 'typing' kind). recordActivityByChatId() uses 'activity' kind
+    // on lazy-open, which previously bypassed this flag and sent a real message
+    // that Telegram notified then got deleted — the phantom notification.
+    // sendChatAction still fires regardless (see pulseChatAction call below).
+    const suppressBubble = this.config.status.suppress_typing_bubble
 
     const text = renderState(initialState, 0, this.now())
     let messageId = 0
@@ -692,6 +696,9 @@ export class StatusManager {
     if (entry.disabled) return
     if (!entry.bubbleSuppressed) return
     if (state.kind === 'typing') return
+    // When suppress_typing_bubble is on, never un-suppress the bubble on
+    // typing→activity transition. sendChatAction keeps firing via pulseChatAction.
+    if (this.config.status.suppress_typing_bubble) return
     if (entry.bubbleCreationPromise !== null) {
       // Another caller is creating the bubble right now — wait for them.
       // After the await we re-enter the suppress check: if the first

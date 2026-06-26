@@ -11,8 +11,12 @@
 //      with same token bails out cleanly instead of hitting 409 storms.
 //
 // Error policy:
-//   - 409 Conflict: backoff Math.min(1000*attempt, 15000); after 8 attempts
-//     give up (another consumer holds the token — operator action required).
+//   - 409 Conflict: backoff Math.min(1000*conflictAttempt, 15000); after 13
+//     attempts give up. The cumulative sleep across attempts 1..12 (1+2+…+12 =
+//     78s) must exceed the lifetime of a previous poller's outstanding
+//     getUpdates long-poll (25s timeout + ~25s Telegram-side hold ≈ 50s) so a
+//     legitimate restart can reclaim the token instead of crash-looping. Only
+//     after that budget is a true foreign consumer assumed — operator action.
 //   - 401 Unauthorized: backoff briefly, give up after 3 attempts (token
 //     revoked — no point retrying).
 //   - 429 Too Many Requests: honour Telegram's `parameters.retry_after`
@@ -80,7 +84,11 @@ type GetUpdatesFn = (params: {
 }) => Promise<Update[]>
 
 const LONG_POLL_TIMEOUT_SEC = 25
-const MAX_409_ATTEMPTS = 8
+// 13 attempts: cumulative 409 backoff across attempts 1..12 is
+// 1+2+…+12 = 78s (> the ~50s an old getUpdates long-poll lingers server-side
+// after a tmux restart). Lower values gave up before the stale poll released
+// the token, producing the 409 crash-loop.
+const MAX_409_ATTEMPTS = 13
 const MAX_401_ATTEMPTS = 3
 const BACKOFF_CAP_MS = 15_000
 // Reconnect backoff for transient errors (network drops, 5xx, 429 without
@@ -672,7 +680,10 @@ export class TelegramPoller {
               conflict401Counter,
             )
           }
-          const delay = Math.min(1000 * attempt, BACKOFF_CAP_MS)
+          // Back off on the conflict counter (not the shared `attempt`) so the
+          // cumulative budget is deterministic: 1+2+…+12 = 78s before giving
+          // up, which outlasts a stale poller's ~50s long-poll hold.
+          const delay = Math.min(1000 * conflict401Counter, BACKOFF_CAP_MS)
           log.warn('409 Conflict from getUpdates, backing off', {
             attempt: conflict401Counter,
             delay_ms: delay,
