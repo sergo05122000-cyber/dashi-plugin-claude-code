@@ -8,28 +8,28 @@
     },
     "dashi-gbrain-memory": {
       "type": "http",
-      "url": "https://mcp.orgrimmar.xyz/memory/mcp",
+      "url": "http://135.181.197.188:8767/mcp",
       "headers": {
         "Authorization": "Bearer ${GBRAIN_BEARER}"
       }
     },
     "dashi-gbrain-recall": {
       "type": "http",
-      "url": "https://mcp.orgrimmar.xyz/recall/mcp",
+      "url": "http://135.181.197.188:8768/mcp",
       "headers": {
         "Authorization": "Bearer ${GBRAIN_BEARER}"
       }
     },
     "dashi-gbrain-swarm": {
       "type": "http",
-      "url": "https://mcp.orgrimmar.xyz/swarm/mcp",
+      "url": "http://135.181.197.188:8766/mcp",
       "headers": {
         "Authorization": "Bearer ${GBRAIN_BEARER}"
       }
     },
     "dashi-gbrain-tasks": {
       "type": "http",
-      "url": "https://mcp.orgrimmar.xyz/task/mcp",
+      "url": "http://135.181.197.188:8769/mcp",
       "headers": {
         "Authorization": "Bearer ${GBRAIN_BEARER}"
       }
